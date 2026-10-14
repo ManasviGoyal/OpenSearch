@@ -82,7 +82,8 @@ public class TieredDirectoryTests extends TieredStorageBaseTestCase {
             fileCache,
             threadPool,
             getMockPrefetchSettingsSupplier(),
-            getMockWarmFullFileSettingsSupplier()
+            getMockWarmFullFileSettingsSupplier(),
+            null // manager not needed: feature off (empty extensions), nothing promotes
         );
         addFilesToDirectory(LOCAL_FILES);
     }
@@ -261,7 +262,8 @@ public class TieredDirectoryTests extends TieredStorageBaseTestCase {
     public void testTieredDirectoryFactory() throws IOException {
         TieredDirectoryFactory factory = new TieredDirectoryFactory(
             getMockPrefetchSettingsSupplier(),
-            getMockWarmFullFileSettingsSupplier()
+            getMockWarmFullFileSettingsSupplier(),
+            null // manager not needed: feature off
         );
         FSDirectory factoryLocalDir = FSDirectory.open(createTempDir());
         IndexStorePlugin.DirectoryFactory localDirFactory = mock(IndexStorePlugin.DirectoryFactory.class);

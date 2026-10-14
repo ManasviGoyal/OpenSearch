@@ -128,6 +128,7 @@ import org.opensearch.common.unit.TimeValue;
 import org.opensearch.common.util.BigArrays;
 import org.opensearch.common.util.FeatureFlags;
 import org.opensearch.common.util.PageCacheRecycler;
+import org.opensearch.common.util.concurrent.OpenSearchExecutors;
 import org.opensearch.common.util.io.IOUtils;
 import org.opensearch.core.Assertions;
 import org.opensearch.core.common.breaker.CircuitBreaker;
@@ -291,6 +292,7 @@ import org.opensearch.storage.directory.TieredDataFormatAwareStoreDirectoryFacto
 import org.opensearch.storage.directory.TieredDirectoryFactory;
 import org.opensearch.storage.metrics.TierActionMetrics;
 import org.opensearch.storage.prefetch.TieredStoragePrefetchSettings;
+import org.opensearch.storage.warmfullfile.WarmFullFileManager;
 import org.opensearch.storage.warmfullfile.WarmFullFileSettings;
 import org.opensearch.storage.tiering.HotToWarmTieringService;
 import org.opensearch.storage.tiering.WarmToHotTieringService;
@@ -980,16 +982,24 @@ public class Node implements Closeable {
             final Supplier<TieredStoragePrefetchSettings> tieredStoragePrefetchSettingsSupplier;
             final WarmFullFileSettings warmFullFileSettings;
             final Supplier<WarmFullFileSettings> warmFullFileSettingsSupplier;
+            final WarmFullFileManager warmFullFileManager;
             if (FeatureFlags.isEnabled(FeatureFlags.WRITABLE_WARM_INDEX_EXPERIMENTAL_FLAG)) {
                 tieredStoragePrefetchSettings = new TieredStoragePrefetchSettings(clusterService.getClusterSettings());
                 tieredStoragePrefetchSettingsSupplier = () -> tieredStoragePrefetchSettings;
                 warmFullFileSettings = new WarmFullFileSettings(clusterService.getClusterSettings());
                 warmFullFileSettingsSupplier = () -> warmFullFileSettings;
+                warmFullFileManager = new WarmFullFileManager(
+                    fileCache(),
+                    threadPool.executor(ThreadPool.Names.GENERIC),
+                    threadPool::relativeTimeInMillis,
+                    OpenSearchExecutors.allocatedProcessors(settings)
+                );
             } else {
                 tieredStoragePrefetchSettings = null;
                 tieredStoragePrefetchSettingsSupplier = () -> null;
                 warmFullFileSettings = null;
                 warmFullFileSettingsSupplier = () -> null;
+                warmFullFileManager = null;
             }
 
             final Map<String, IndexStorePlugin.DirectoryFactory> builtInDirectoryFactories = IndexModule.createBuiltInDirectoryFactories(
@@ -1033,7 +1043,7 @@ public class Node implements Closeable {
             if (FeatureFlags.isEnabled(FeatureFlags.WRITABLE_WARM_INDEX_EXPERIMENTAL_FLAG)) {
                 compositeDirectoryFactories.put(
                     TieringUtils.TIERED_COMPOSITE_INDEX_TYPE,
-                    new TieredDirectoryFactory(tieredStoragePrefetchSettingsSupplier, warmFullFileSettingsSupplier)
+                    new TieredDirectoryFactory(tieredStoragePrefetchSettingsSupplier, warmFullFileSettingsSupplier, warmFullFileManager)
                 );
             }
             final Map<String, org.opensearch.index.store.DataFormatAwareStoreDirectoryFactory> dataFormatAwareStoreDirectoryFactories =

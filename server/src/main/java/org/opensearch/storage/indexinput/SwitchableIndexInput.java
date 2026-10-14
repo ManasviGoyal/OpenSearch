@@ -408,7 +408,7 @@ public class SwitchableIndexInput extends IndexInput implements Runnable, Random
      * for a slice it is the parent's offset plus the slice offset. Used to cut whole-file views at the right position.
      * @return the absolute offset into the file
      */
-    public long offset() {
+    long offset() {
         return offset;
     }
 
@@ -416,7 +416,7 @@ public class SwitchableIndexInput extends IndexInput implements Runnable, Random
      * The logical length of this instance (the whole file length for the original, the slice length for a slice).
      * @return the length in bytes
      */
-    public long fileLength() {
+    long fileLength() {
         return fileLength;
     }
 

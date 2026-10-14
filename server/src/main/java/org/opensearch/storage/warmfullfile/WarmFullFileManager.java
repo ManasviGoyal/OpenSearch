@@ -1,0 +1,320 @@
+/*
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * The OpenSearch Contributors require contributions made to
+ * this file be licensed under the Apache-2.0 license or a
+ * compatible open source license.
+ */
+package org.opensearch.storage.warmfullfile;
+
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
+import org.apache.lucene.store.DataAccessHint;
+import org.apache.lucene.store.FSDirectory;
+import org.apache.lucene.store.IOContext;
+import org.apache.lucene.store.IndexInput;
+import org.apache.lucene.store.MMapDirectory;
+import org.opensearch.common.annotation.ExperimentalApi;
+import org.opensearch.index.store.remote.filecache.CachedIndexInput;
+import org.opensearch.index.store.remote.filecache.FileCache;
+import org.opensearch.index.store.remote.utils.BlobFetchRequest;
+import org.opensearch.index.store.remote.utils.TransferManager;
+
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.Executor;
+import java.util.concurrent.Semaphore;
+import java.util.concurrent.atomic.AtomicLongArray;
+
+/**
+ * Node-level coordinator for warm-tier whole-file promotion.
+ *
+ * <p>{@link #promote(FullFileState)} runs on a background executor (never the search thread). It admits a promotion
+ * only when a download slot is free and the per-segment whole-file budget allows it, downloads the whole file in
+ * hand-built 8 MiB parts via {@link TransferManager#fetchBlobAsync}, then opens the family's own memory mapping and
+ * flips the state to {@link FullFileState.State#FULL}. On any decline or failure the state returns to
+ * {@link FullFileState.State#BLOCK} with a retry time set.
+ *
+ * @opensearch.experimental
+ */
+@ExperimentalApi
+public class WarmFullFileManager {
+
+    private static final Logger logger = LogManager.getLogger(WarmFullFileManager.class);
+
+    /** Default download/read part size: one block (8 MiB), matching the block path. */
+    static final long DEFAULT_PART_SIZE = 8L * 1024 * 1024;
+    /** Retry delay after a decline or failure (constant, as in the design). */
+    static final long RETRY_DELAY_MILLIS = 60_000L;
+    /** Whole-file bytes admitted per cache segment must stay at or below this fraction of the segment's capacity. */
+    static final double DEFAULT_BUDGET_FRACTION = 0.5;
+
+    private final FileCache fileCache;
+    private final Executor executor;
+    private final LongSupplier clock;
+    private final Semaphore slots;
+    private final double budgetFraction;
+    private final int segments;
+    private final long perSegmentCapacity;
+    private final long partSize;
+    private final AtomicLongArray perSegmentWholeFileBytes;
+
+    /** A monotonic millisecond clock (injectable for tests). */
+    @FunctionalInterface
+    public interface LongSupplier {
+        long getAsLong();
+    }
+
+    /**
+     * Production constructor.
+     *
+     * @param fileCache            the node file cache
+     * @param executor             the pool to run promote() and the completion handler on (never the search thread)
+     * @param clock                a monotonic millis clock (e.g. {@code threadPool::relativeTimeInMillis})
+     * @param allocatedProcessors  the node's allocated processor count
+     */
+    public WarmFullFileManager(FileCache fileCache, Executor executor, LongSupplier clock, int allocatedProcessors) {
+        this(
+            fileCache,
+            executor,
+            clock,
+            Math.max(1, allocatedProcessors / 8),
+            DEFAULT_BUDGET_FRACTION,
+            ceilingNextPowerOfTwo(allocatedProcessors),
+            DEFAULT_PART_SIZE
+        );
+    }
+
+    /** Package-private constructor for tests (small slot count, budget fraction, segment count, and part size). */
+    WarmFullFileManager(
+        FileCache fileCache,
+        Executor executor,
+        LongSupplier clock,
+        int maxConcurrentDownloads,
+        double budgetFraction,
+        int segments,
+        long partSize
+    ) {
+        this.fileCache = fileCache;
+        this.executor = executor;
+        this.clock = clock;
+        this.slots = new Semaphore(Math.max(1, maxConcurrentDownloads));
+        this.budgetFraction = budgetFraction;
+        this.segments = Math.max(1, segments);
+        this.perSegmentCapacity = (fileCache.capacity() + this.segments - 1) / this.segments;
+        this.partSize = partSize > 0 ? partSize : DEFAULT_PART_SIZE;
+        this.perSegmentWholeFileBytes = new AtomicLongArray(this.segments);
+    }
+
+    /** @return the executor promote() must be submitted to (never the search thread) */
+    public Executor executor() {
+        return executor;
+    }
+
+    /** @return the current monotonic time in millis (for the wrapper's retryAt comparison) */
+    public long relativeTimeInMillis() {
+        return clock.getAsLong();
+    }
+
+    /**
+     * Attempts to promote the family whose state is given (already CAS'd to PROMOTING by the trigger). Runs on the
+     * background executor. On decline or failure, returns the state to BLOCK and sets retryAt.
+     */
+    public void promote(FullFileState st) {
+        final long length = st.fileLength();
+        final Path path = st.fullFilePath();
+        final int segment = segmentIndexFor(path);
+        final long cap = (long) (perSegmentCapacity * budgetFraction);
+
+        // Admission: a free slot AND the per-segment whole-file budget.
+        if (slots.tryAcquire() == false) {
+            decline(st, "no free download slot");
+            return;
+        }
+        boolean bytesReserved = false;
+        try {
+            if (reserveSegmentBytes(segment, length, cap) == false) {
+                decline(st, "per-segment whole-file budget exceeded");
+                return;
+            }
+            bytesReserved = true;
+
+            // Handle any pre-existing entry at the whole-file key before downloading. fetchBlobAsync can only drive
+            // its own in-flight placeholder (DelayedCreationCachedIndexInput, a private type); on any other live
+            // entry its asyncLoadIndexInput default returns null and leaks the compute ref. We cannot name that
+            // private type, so we remove any live entry of a KNOWN non-reusable type and leave anything else (the
+            // placeholder) for fetchBlobAsync to reuse.
+            CachedIndexInput existing = fileCache.get(path);
+            if (existing != null) {
+                boolean nonReusable = isKnownNonReusableEntry(existing);
+                fileCache.decRef(path);
+                if (nonReusable) {
+                    fileCache.remove(path);
+                }
+            } else if (Files.exists(path)) {
+                // Stray leftover file with no cache entry (e.g. crash leftover); remove and re-download.
+                Files.delete(path);
+            }
+
+            BlobFetchRequest request = buildRequest(st, length);
+            CompletableFuture<IndexInput> future = st.transferManager().fetchBlobAsync(request);
+            // Ownership of slot + reserved bytes passes to the completion handler; do not release them here.
+            bytesReserved = false;
+            // The future's value is the cache entry's own (non-clone) input; it must NOT be closed here (closing it
+            // would close the entry's master input). The family serves from its own mapping opened below.
+            future.whenComplete((indexInput, throwable) -> onDownloadComplete(st, segment, length, throwable));
+        } catch (Exception e) {
+            logger.warn("whole-file promotion failed to start for {}", path, e);
+            if (bytesReserved) {
+                releaseSegmentBytes(segment, length);
+            }
+            slots.release();
+            decline(st, "exception starting download: " + e.getMessage());
+        }
+    }
+
+    private void onDownloadComplete(FullFileState st, int segment, long length, Throwable throwable) {
+        final Path path = st.fullFilePath();
+        try {
+            if (throwable != null) {
+                failPromotion(st, segment, length, "download failed: " + throwable.getMessage());
+                return;
+            }
+            // fetchBlobAsync releases its own reference on success; take the family's reference now.
+            CachedIndexInput entry = fileCache.get(path);
+            if (entry == null) {
+                failPromotion(st, segment, length, "entry evicted before FULL");
+                return;
+            }
+            FSDirectory localDirectory = st.localDirectory();
+            if (localDirectory.fileLength(st.fileName()) != length) {
+                fileCache.decRef(path);
+                // Remove the entry (closes it and deletes the truncated file). Without this, the completed
+                // DelayedCreation entry stays live and the next retry reuses the same truncated file and fails again.
+                fileCache.remove(path);
+                failPromotion(st, segment, length, "downloaded length mismatch");
+                return;
+            }
+            // Open the family's OWN mapping with the RANDOM hint (do not reuse the cache entry's input).
+            IndexInput master = localDirectory.openInput(st.fileName(), IOContext.DEFAULT.withHints(DataAccessHint.RANDOM));
+            if (isMemorySegmentInput(master) == false) {
+                closeQuietly(master);
+                fileCache.decRef(path);
+                failPromotion(st, segment, length, "mapping is not a MemorySegmentIndexInput");
+                return;
+            }
+            // Publish localMaster BEFORE the CAS to FULL.
+            st.setLocalMaster(master);
+            if (st.casState(FullFileState.State.PROMOTING, FullFileState.State.FULL) == false) {
+                // Family closed while we were publishing; unwind.
+                closeQuietly(master);
+                st.setLocalMaster(null);
+                fileCache.decRef(path);
+                failPromotion(st, segment, length, "family closed during publish");
+                return;
+            }
+            slots.release();
+            logger.debug("promoted whole file to FULL: {}", path);
+        } catch (Exception e) {
+            failPromotion(st, segment, length, "exception publishing FULL: " + e.getMessage());
+        }
+    }
+
+    private void failPromotion(FullFileState st, int segment, long length, String reason) {
+        releaseSegmentBytes(segment, length);
+        slots.release();
+        decline(st, reason);
+    }
+
+    private void decline(FullFileState st, String reason) {
+        st.setRetryAt(clock.getAsLong() + RETRY_DELAY_MILLIS);
+        st.casState(FullFileState.State.PROMOTING, FullFileState.State.BLOCK);
+        logger.debug("whole-file promotion declined ({}) for {}", reason, st.fullFilePath());
+    }
+
+    /** Builds the download request by hand: ceil(length / partSize) parts at absolute offsets, last clipped, no zero tail. */
+    BlobFetchRequest buildRequest(FullFileState st, long length) {
+        List<BlobFetchRequest.BlobPart> parts = buildParts(st.fileName(), length, partSize);
+        return BlobFetchRequest.builder().directory(st.localDirectory()).fileName(st.fileName()).blobParts(parts).build();
+    }
+
+    static List<BlobFetchRequest.BlobPart> buildParts(String name, long length, long partSize) {
+        List<BlobFetchRequest.BlobPart> parts = new ArrayList<>();
+        long offset = 0;
+        while (offset < length) {
+            long partLen = Math.min(partSize, length - offset);
+            parts.add(new BlobFetchRequest.BlobPart(name, offset, partLen));
+            offset += partLen;
+        }
+        return parts;
+    }
+
+    private boolean reserveSegmentBytes(int segment, long length, long cap) {
+        while (true) {
+            long current = perSegmentWholeFileBytes.get(segment);
+            if (current + length > cap) {
+                return false;
+            }
+            if (perSegmentWholeFileBytes.compareAndSet(segment, current, current + length)) {
+                return true;
+            }
+        }
+    }
+
+    void releaseSegmentBytes(int segment, long length) {
+        perSegmentWholeFileBytes.addAndGet(segment, -length);
+    }
+
+    /**
+     * Replicates {@code SegmentedCache.segmentFor} for a path key: the same hash mix and mask, with
+     * {@code segments = ceilingNextPowerOfTwo(availableProcessors())}. Kept in sync with SegmentedCache; a unit test
+     * asserts equivalence.
+     */
+    int segmentIndexFor(Path path) {
+        int h = path.hashCode();
+        h = ((h >>> 16) ^ h) * 0x45d9f3b;
+        h = ((h >>> 16) ^ h) * 0x45d9f3b;
+        h = (h >>> 16) ^ h;
+        return h & 0x7fffffff & (segments - 1);
+    }
+
+    long perSegmentWholeFileBytes(int segment) {
+        return perSegmentWholeFileBytes.get(segment);
+    }
+
+    private static boolean isMemorySegmentInput(IndexInput input) {
+        // Lucene's mmap inputs are MemorySegmentIndexInput; detect via the MMapDirectory package without a hard
+        // dependency on the (package-private) concrete type.
+        return MMapDirectory.class.getPackageName().equals(input.getClass().getPackageName());
+    }
+
+    /**
+     * True for live cache entries we must never reuse or serve from (and therefore remove before re-downloading): a
+     * completed whole-file entry, a restore-placeholder, or a switchable family entry. The one entry we DO reuse is
+     * fetchBlobAsync's own in-flight placeholder (a private type), which is not in this set.
+     */
+    private static boolean isKnownNonReusableEntry(CachedIndexInput entry) {
+        return entry instanceof org.opensearch.index.store.remote.filecache.CachedFullFileIndexInput
+            || entry instanceof org.opensearch.index.store.remote.filecache.FileCache.RestoredCachedIndexInput
+            || entry instanceof org.opensearch.storage.indexinput.CachedSwitchableIndexInput;
+    }
+
+    private static void closeQuietly(IndexInput input) {
+        if (input == null) {
+            return;
+        }
+        try {
+            input.close();
+        } catch (IOException e) {
+            logger.trace("ignored error closing index input");
+        }
+    }
+
+    private static int ceilingNextPowerOfTwo(int x) {
+        return 1 << (Integer.SIZE - Integer.numberOfLeadingZeros(Math.max(1, x) - 1));
+    }
+}
