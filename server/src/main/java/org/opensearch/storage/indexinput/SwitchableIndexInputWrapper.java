@@ -86,7 +86,7 @@ public class SwitchableIndexInputWrapper extends FilterIndexInput implements Ran
         CLEANER.register(this, switchableIndexInput);
         if (countsHandle && fullFileState != null) {
             fullFileState.incHandles();
-            // Released only on close(), as the design specifies. Deliberately NOT released by the Cleaner: a whole-file
+            // Released only on close(), deliberately NOT by the Cleaner: a whole-file
             // view does not reference this wrapper, so the wrapper can become unreachable while a view derived from it
             // is still in use; a Cleaner release could then let the deferred close unmap under that live view (SIGSEGV).
             this.handleRelease = new HandleRelease(fullFileState);

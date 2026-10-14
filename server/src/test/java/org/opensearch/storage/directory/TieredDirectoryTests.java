@@ -109,7 +109,7 @@ public class TieredDirectoryTests extends TieredStorageBaseTestCase {
     }
 
     public void testCacheFilePutOverLiveEntryClosesTheReplacedFamily() throws Exception {
-        // Design §3.5: REPLACED never calls close(), so two openInput calls racing to create a family would leak the
+        // RemovalReason.REPLACED never calls close(), so two openInput calls racing to create a family would leak the
         // first family's mapping/reference/budget. cacheFile must close the entry it replaced.
         java.nio.file.Path key = org.opensearch.storage.utils.DirectoryUtils.getFilePathSwitchable(
             localDirectory,
@@ -130,6 +130,47 @@ public class TieredDirectoryTests extends TieredStorageBaseTestCase {
         assertEquals(org.opensearch.storage.warmfullfile.FullFileState.State.CLOSED, first.fullFileState().state());
         assertFalse("new entry live", second.isClosed());
         assertEquals(org.opensearch.storage.warmfullfile.FullFileState.State.BLOCK, second.fullFileState().state());
+    }
+
+    public void testHandleOfReplacedFamilyKeepsReadingBlocksAndNeverPromotes() throws Exception {
+        // The losing side of the two-thread openInput race: a handle returned just before a racing cacheFile replaced
+        // the family keeps reading blocks correctly, but it belongs to the CLOSED old family, so it never triggers a
+        // promotion and never gets a whole-file view. Only handles opened afterwards belong to the live family. (All
+        // reads stay inside block 0, which the fixture serves once.)
+        populateData();
+        Path key = getFilePathSwitchable(localDirectory, FILE_PRESENT_IN_REMOTE_ONLY);
+
+        IndexInput first = tieredDirectory.openInput(FILE_PRESENT_IN_REMOTE_ONLY, IOContext.DEFAULT);
+        org.opensearch.index.store.remote.filecache.CachedIndexInput oldEntry = fileCache.get(key);
+        fileCache.decRef(key);
+        org.opensearch.storage.warmfullfile.FullFileState oldState = oldEntry.fullFileState();
+        assertTrue("fixture file must be readable", first.length() > 0);
+        byte before = first.readByte();
+
+        tieredDirectory.cacheFile(FILE_PRESENT_IN_REMOTE_ONLY, true); // the race: a second put over the live family
+        org.opensearch.index.store.remote.filecache.CachedIndexInput newEntry = fileCache.get(key);
+        fileCache.decRef(key);
+        assertNotSame(oldEntry, newEntry);
+        assertTrue("replaced entry closed", oldEntry.isClosed());
+        assertEquals(org.opensearch.storage.warmfullfile.FullFileState.State.CLOSED, oldState.state());
+        assertEquals(org.opensearch.storage.warmfullfile.FullFileState.State.BLOCK, newEntry.fullFileState().state());
+
+        // The old handle still reads blocks, and agrees with a handle from the live family.
+        first.seek(0);
+        assertEquals(before, first.readByte());
+        IndexInput fresh = tieredDirectory.openInput(FILE_PRESENT_IN_REMOTE_ONLY, IOContext.DEFAULT);
+        assertEquals(before, fresh.readByte());
+
+        // But it never promotes: its clone is a block wrapper, reads the same bytes, and the old family stays CLOSED.
+        first.seek(0);
+        IndexInput clone = first.clone();
+        assertTrue("block clone, not a whole-file view", clone instanceof SwitchableIndexInputWrapper);
+        assertEquals(before, clone.readByte());
+        assertEquals(org.opensearch.storage.warmfullfile.FullFileState.State.CLOSED, oldState.state());
+
+        clone.close();
+        fresh.close();
+        first.close();
     }
 
     public void testListAll() throws IOException {

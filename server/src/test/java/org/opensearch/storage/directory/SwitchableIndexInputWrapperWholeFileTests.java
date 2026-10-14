@@ -32,6 +32,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executor;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Supplier;
@@ -42,7 +43,7 @@ import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 
 /**
- * Step 5 tests: the wrapper's promotion trigger, whole-file view serving, and handle counting.
+ * Tests for the wrapper's promotion trigger, whole-file view serving, and handle counting.
  */
 @ThreadLeakFilters(filters = CleanerDaemonThreadLeakFilter.class)
 public class SwitchableIndexInputWrapperWholeFileTests extends TieredStorageBaseTestCase {
@@ -199,6 +200,45 @@ public class SwitchableIndexInputWrapperWholeFileTests extends TieredStorageBase
         assertEquals("exactly one promotion request across threads", 1, exec.submitted.get());
     }
 
+    public void testNioServedFileDownloadsOnceAndIsNeverRetried() throws Exception {
+        // End to end through the trigger: the local directory serves the file with NIO, so promotion is declined for
+        // good. Later searches must not trigger again (no slot taken, nothing read, no second download).
+        SwitchableIndexInput in = remoteModeInput();
+        long len = in.length();
+        AtomicInteger reads = new AtomicInteger();
+        TransferManager countingTm = new TransferManager((name, position, length) -> {
+            reads.incrementAndGet();
+            return new java.io.ByteArrayInputStream(new byte[(int) length]);
+        }, fileCache, threadPool);
+        try (org.apache.lucene.store.NIOFSDirectory nio = new org.apache.lucene.store.NIOFSDirectory(localDirectory.getDirectory())) {
+            FullFileState st = new FullFileState(
+                countingTm,
+                nio,
+                remoteSegmentStoreDirectory,
+                fileCache,
+                FILE_NAME,
+                len,
+                getFilePath(localDirectory, FILE_NAME)
+            );
+            AtomicLong clock = new AtomicLong(0);
+            WarmFullFileManager mgr = new WarmFullFileManager(fileCache, Runnable::run, clock::get, 8);
+            SwitchableIndexInputWrapper handle = new SwitchableIndexInputWrapper("h", in, st, true, mgr);
+
+            handle.clone(); // triggers the one and only attempt
+            assertBusy(() -> assertEquals(Long.MAX_VALUE, st.retryAt()), 30, java.util.concurrent.TimeUnit.SECONDS);
+            assertEquals(FullFileState.State.BLOCK, st.state());
+            int afterFirst = reads.get();
+            assertTrue("downloaded once", afterFirst > 0);
+
+            clock.set(TimeUnit.DAYS.toMillis(365)); // far past any 60 s retry window
+            IndexInput again = handle.clone();
+            assertTrue("still served by blocks", again instanceof SwitchableIndexInputWrapper);
+            assertEquals("never retried", FullFileState.State.BLOCK, st.state());
+            assertEquals("no second download", afterFirst, reads.get());
+            assertNull(fileCache.get(getFilePath(localDirectory, FILE_NAME)));
+        }
+    }
+
     public void testNullManagerMeansFeatureOff() throws IOException {
         // Non-warm nodes have no FileCache, so Node builds no manager. An eligible handle must still work on blocks.
         SwitchableIndexInput in = remoteModeInput();
@@ -212,6 +252,23 @@ public class SwitchableIndexInputWrapperWholeFileTests extends TieredStorageBase
         assertEquals("no promotion without a manager", FullFileState.State.BLOCK, st.state());
         handle.close();
         assertEquals(0, st.handleCount());
+    }
+
+    public void testHandleOfClosedFamilyNeverTriggersOrGetsViews() throws IOException {
+        // A handle whose family closed under it (e.g. cacheFile replaced the entry in the two-thread openInput race) is
+        // CLOSED for good: eligible or not, it never requests a promotion and stays on blocks.
+        SwitchableIndexInput in = remoteModeInput();
+        FullFileState st = stateFor(in);
+        RecordingExecutor exec = new RecordingExecutor();
+        SwitchableIndexInputWrapper handle = new SwitchableIndexInputWrapper("h", in, st, true, manager(exec, new AtomicLong()));
+        st.closeFamily();
+
+        IndexInput c = handle.clone();
+        IndexInput s = handle.slice("s", 0, Math.min(16, in.length()));
+        assertEquals("no promotion requested", 0, exec.submitted.get());
+        assertEquals(FullFileState.State.CLOSED, st.state());
+        assertTrue("block clone, not a view", c instanceof SwitchableIndexInputWrapper);
+        assertTrue("block slice, not a view", s instanceof SwitchableIndexInputWrapper);
     }
 
     public void testIneligibleHandleNeverRequests() throws IOException {
@@ -589,7 +646,7 @@ public class SwitchableIndexInputWrapperWholeFileTests extends TieredStorageBase
         );
     }
 
-    // ---------------- Step 6: ownership and deferred close (design §6.1) ----------------
+    // ---------------- ownership and deferred close ----------------
 
     public void testDeferredCloseKeepsMappingUntilLastHandleThenReleasesEverything() throws Exception {
         java.nio.file.Path switchKey = getFilePathSwitchable(localDirectory, FILE_NAME);

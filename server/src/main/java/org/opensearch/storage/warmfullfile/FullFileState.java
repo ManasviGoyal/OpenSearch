@@ -203,7 +203,7 @@ public final class FullFileState {
     }
 
     /**
-     * The family-close routine (design §3.3/§3.5). Called from {@code CachedSwitchableIndexInput.close()}, which runs
+     * The family-close routine. Called from {@code CachedSwitchableIndexInput.close()}, which runs
      * inside the FileCache removal listener under a segment lock, so this must not touch the FileCache inline.
      *
      * <p>Marks the state CLOSED. If it was FULL: releases the budget now, and schedules the unmap + decRef for when the

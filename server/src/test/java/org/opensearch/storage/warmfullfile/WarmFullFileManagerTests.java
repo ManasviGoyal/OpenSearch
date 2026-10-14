@@ -52,7 +52,7 @@ public class WarmFullFileManagerTests extends OpenSearchTestCase {
 
     /**
      * A StreamReader whose bytes are position-dependent, so an offset/length bug produces wrong bytes (unlike the
-     * all-zero mocks in populateData / TransferManagerTestCase that the design warns against). The byte at absolute
+     * all-zero mocks in populateData / TransferManagerTestCase, which cannot catch one). The byte at absolute
      * file position p equals p modulo 256. Counts reads so tests can assert each range was read.
      */
     private static final class PositionDependentStreamReader implements TransferManager.StreamReader {
@@ -213,7 +213,7 @@ public class WarmFullFileManagerTests extends OpenSearchTestCase {
     }
 
     public void testConcurrentFamilyCloseAndPromotionDoNotDeadlock() throws Exception {
-        // Design §6.1 race: completions publishing FULL while the families' entries are removed. Keys spread over 4
+        // Race: completions publishing FULL while the families' entries are removed. Keys spread over 4
         // segments, removal runs closeFamily() inside the FileCache listener under a segment lock, and the cleanup
         // re-enters the cache. If that re-entry ever happened on the listener thread, two families whose keys hash to
         // each other's segments could deadlock AB-BA; the timeout below catches that.
@@ -307,6 +307,122 @@ public class WarmFullFileManagerTests extends OpenSearchTestCase {
                 assertEquals("budget fully released in segment " + s, 0L, mgr.perSegmentWholeFileBytes(s));
             }
         }, 30, java.util.concurrent.TimeUnit.SECONDS);
+    }
+
+    public void testNioMasterIsDeclinedPermanentlyAndCleanedUp() throws Exception {
+        // A local directory that serves the file with NIO (as hybridfs does for extensions on its NIO list).
+        long length = 4096;
+        String name = "_nio.faiss";
+        Path path = dir.resolve(name);
+        FileCache fileCache = FileCacheFactory.createConcurrentLRUFileCache(10_000_000, 1);
+        PositionDependentStreamReader reader = new PositionDependentStreamReader();
+        TransferManager tm = new TransferManager(reader, fileCache, threadPool);
+        // One slot: if the decline kept it, the mmap promotion below would be declined.
+        WarmFullFileManager mgr = new WarmFullFileManager(fileCache, Runnable::run, threadPool::relativeTimeInMillis, 1, 0.5, 1, 1024);
+
+        try (org.apache.lucene.store.NIOFSDirectory nio = new org.apache.lucene.store.NIOFSDirectory(dir)) {
+            FullFileState st = new FullFileState(tm, nio, null, fileCache, name, length, path);
+            assertTrue(st.casState(FullFileState.State.BLOCK, FullFileState.State.PROMOTING));
+            mgr.promote(st);
+
+            assertBusy(() -> assertEquals(Long.MAX_VALUE, st.retryAt()), 10, java.util.concurrent.TimeUnit.SECONDS);
+            assertEquals(FullFileState.State.BLOCK, st.state());
+            assertNull("nothing published", st.localMaster());
+            assertEquals("downloaded once (4 parts)", 4, reader.readCount());
+            assertTrue("the trigger never fires again", mgr.relativeTimeInMillis() < st.retryAt());
+            assertNull("useless whole file removed from the cache", fileCache.get(path));
+            assertFalse("and deleted from disk", Files.exists(path));
+            assertEquals("budget released", 0L, mgr.perSegmentWholeFileBytes(0));
+        }
+
+        // The slot was released: an mmap-served file now promotes.
+        FullFileState ok = newState(tm, fileCache, "_ok.faiss", length);
+        assertTrue(ok.casState(FullFileState.State.BLOCK, FullFileState.State.PROMOTING));
+        mgr.promote(ok);
+        awaitState(ok, FullFileState.State.FULL);
+    }
+
+    public void testNioDeclineWarnsOncePerExtensionThenDebug() throws Exception {
+        // One operator mistake (an NIO-served extension) must not produce one WARN per segment per shard: the first
+        // file of each extension is a WARN, later files of that extension are DEBUG. Other extensions get their own WARN.
+        long length = 4096;
+        FileCache fileCache = FileCacheFactory.createConcurrentLRUFileCache(10_000_000, 1);
+        TransferManager tm = new TransferManager(new PositionDependentStreamReader(), fileCache, threadPool);
+        WarmFullFileManager mgr = new WarmFullFileManager(fileCache, Runnable::run, threadPool::relativeTimeInMillis, 4, 0.5, 1, 1024);
+        String loggerName = WarmFullFileManager.class.getName();
+        try (
+            org.apache.lucene.store.NIOFSDirectory nio = new org.apache.lucene.store.NIOFSDirectory(dir);
+            org.opensearch.test.MockLogAppender appender = org.opensearch.test.MockLogAppender.createForLoggers(
+                org.apache.logging.log4j.LogManager.getLogger(WarmFullFileManager.class)
+            )
+        ) {
+            appender.addExpectation(
+                new org.opensearch.test.MockLogAppender.SeenEventExpectation(
+                    "one WARN for faiss",
+                    loggerName,
+                    org.apache.logging.log4j.Level.WARN,
+                    "*[.faiss]*first file [" + dir.resolve("_a.faiss") + "]*"
+                )
+            );
+            appender.addExpectation(
+                new org.opensearch.test.MockLogAppender.UnseenEventExpectation(
+                    "no second WARN for faiss",
+                    loggerName,
+                    org.apache.logging.log4j.Level.WARN,
+                    "*first file [" + dir.resolve("_b.faiss") + "]*"
+                )
+            );
+            appender.addExpectation(
+                new org.opensearch.test.MockLogAppender.SeenEventExpectation(
+                    "one WARN for veq",
+                    loggerName,
+                    org.apache.logging.log4j.Level.WARN,
+                    "*[.veq]*first file [" + dir.resolve("_c.veq") + "]*"
+                )
+            );
+            for (String name : new String[] { "_a.faiss", "_b.faiss", "_c.veq" }) {
+                FullFileState st = new FullFileState(tm, nio, null, fileCache, name, length, dir.resolve(name));
+                assertTrue(st.casState(FullFileState.State.BLOCK, FullFileState.State.PROMOTING));
+                mgr.promote(st);
+                assertBusy(() -> assertEquals(Long.MAX_VALUE, st.retryAt()), 10, java.util.concurrent.TimeUnit.SECONDS);
+                assertEquals(FullFileState.State.BLOCK, st.state());
+            }
+            appender.assertAllExpectationsMatched();
+        }
+    }
+
+    public void testPromoteOnClosedFamilyTakesNoSlotAndReadsNothing() throws Exception {
+        // The trigger CAS'd BLOCK -> PROMOTING and submitted promote(); the shard then closed before the executor ran it.
+        // promote() must return at once: no slot, no budget reservation, no remote read, no file.
+        FileCache fileCache = FileCacheFactory.createConcurrentLRUFileCache(10_000_000, 1);
+        PositionDependentStreamReader reader = new PositionDependentStreamReader();
+        TransferManager tm = new TransferManager(reader, fileCache, threadPool);
+        // One slot: if promote() took it before noticing the closed family, the promotion below would be declined.
+        WarmFullFileManager mgr = new WarmFullFileManager(fileCache, Runnable::run, threadPool::relativeTimeInMillis, 1, 0.5, 1, 1024);
+
+        FullFileState closed = newState(tm, fileCache, "_closed.faiss", 4096);
+        assertTrue(closed.casState(FullFileState.State.BLOCK, FullFileState.State.PROMOTING));
+        closed.closeFamily();
+        mgr.promote(closed);
+
+        assertEquals(FullFileState.State.CLOSED, closed.state());
+        assertEquals("no remote read", 0, reader.readCount());
+        assertEquals("no bytes reserved", 0L, mgr.perSegmentWholeFileBytes(0));
+        assertNull("nothing published", closed.localMaster());
+        assertFalse("no file written", Files.exists(dir.resolve("_closed.faiss")));
+        assertNull("no cache entry", fileCache.get(dir.resolve("_closed.faiss")));
+
+        // The single slot was never taken: a live family promotes.
+        FullFileState ok = newState(tm, fileCache, "_live.faiss", 4096);
+        assertTrue(ok.casState(FullFileState.State.BLOCK, FullFileState.State.PROMOTING));
+        mgr.promote(ok);
+        awaitState(ok, FullFileState.State.FULL);
+    }
+
+    public void testExtensionOf() {
+        assertEquals("faiss", WarmFullFileManager.extensionOf("_0.faiss"));
+        assertEquals("veq", WarmFullFileManager.extensionOf("_0_Lucene104_0.veq"));
+        assertEquals("segments_5", WarmFullFileManager.extensionOf("segments_5"));
     }
 
     public void testBudgetDeclinesDoNotLeakDownloadSlots() throws Exception {

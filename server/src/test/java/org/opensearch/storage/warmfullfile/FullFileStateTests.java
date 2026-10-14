@@ -14,7 +14,7 @@ import java.nio.file.Path;
 public class FullFileStateTests extends OpenSearchTestCase {
 
     private FullFileState newState() {
-        // The reference-type fields are only consumed by the manager (step 4); null is fine for state-machine tests.
+        // The reference-type fields are only consumed by the manager; null is fine for state-machine tests.
         return new FullFileState(null, null, null, null, "_5.faiss", 1_700_000_000L, Path.of("/cache/_5.faiss"));
     }
 
@@ -65,7 +65,7 @@ public class FullFileStateTests extends OpenSearchTestCase {
         assertEquals(1_700_000_000L, st.fileLength());
     }
 
-    // ---------------- Step 6: deferred close ----------------
+    // ---------------- deferred close ----------------
 
     /** Records tasks instead of running them, so a test can prove the cleanup never runs on the calling thread. */
     private static final class RecordingExecutor implements java.util.concurrent.Executor {

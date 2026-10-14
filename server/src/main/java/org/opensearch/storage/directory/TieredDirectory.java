@@ -155,7 +155,7 @@ public class TieredDirectory extends CompositeDirectory {
             return openSwitchableHandle(name, context, key);
         } catch (AlreadyClosedException e) {
             // Two openInput calls raced to create the family: cacheFile put a new entry over the one we had just looked
-            // up and closed it (the REPLACED fix below). The new entry is live; look it up once more.
+            // up and closed it (cacheFile closes the entry it replaces). The new entry is live; look it up once more.
             return openSwitchableHandle(name, context, key);
         }
     }
@@ -225,7 +225,7 @@ public class TieredDirectory extends CompositeDirectory {
         if (original.length() <= ONE_BLOCK_BYTES) { // original input: offset 0, length == whole file length
             return false;
         }
-        // Design §3.4 Views: the mapping must be a single mmap chunk (Lucene's default chunk is 16 GiB). Above that,
+        // The mapping must be a single mmap chunk (Lucene's default chunk is 16 GiB). Above that,
         // closing a view could unmap the master and segmentSliceOrNull returns null (no k-NN SIMD), so do not promote.
         if (original.length() >= WarmFullFileManager.MAX_WHOLE_FILE_BYTES) {
             return false;
@@ -321,10 +321,15 @@ public class TieredDirectory extends CompositeDirectory {
                 tieredStoragePrefetchSettingsSupplier
             )
         );
-        // Design §3.5: RemovalReason.REPLACED never calls the replaced entry's close(), so a put over a live entry (two
+        // RemovalReason.REPLACED never calls the replaced entry's close(), so a put over a live entry (two
         // openInput calls racing to create the family) would leak the old family's mapping, reference and budget. Run
         // the family-close routine on it. This is not inside the FileCache listener, but close() defers its cache work
         // to a pool thread regardless.
+        //
+        // A handle the racing openInput already returned from the replaced entry keeps working: its clone has its own
+        // block input and shares the TransferManager and FileCache, and its reference on the switchable key survives
+        // (put keeps the node and refcount). But its FullFileState is now CLOSED, so that handle never triggers a
+        // promotion and never receives whole-file views; only handles opened afterwards belong to the live family.
         if (previous != null) {
             try {
                 previous.close();
