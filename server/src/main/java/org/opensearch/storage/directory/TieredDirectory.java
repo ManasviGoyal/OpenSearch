@@ -25,7 +25,12 @@ import org.opensearch.storage.indexinput.SwitchableIndexInput;
 import org.opensearch.storage.indexinput.SwitchableIndexInputWrapper;
 import org.opensearch.storage.prefetch.TieredStoragePrefetchSettings;
 import org.opensearch.storage.utils.DirectoryUtils;
+import org.opensearch.storage.warmfullfile.FullFileState;
+import org.opensearch.storage.warmfullfile.WarmFullFileSettings;
 import org.opensearch.threadpool.ThreadPool;
+
+import org.apache.lucene.store.DataAccessHint;
+import org.apache.lucene.store.ReadOnceHint;
 
 import java.io.IOException;
 import java.nio.file.NoSuchFileException;
@@ -49,17 +54,23 @@ public class TieredDirectory extends CompositeDirectory {
 
     private static final Logger logger = LogManager.getLogger(TieredDirectory.class);
 
+    // A file at or below one block is already served as a single block; a whole-file copy gains nothing.
+    private static final long ONE_BLOCK_BYTES = 8L * 1024 * 1024;
+
     private final Supplier<TieredStoragePrefetchSettings> tieredStoragePrefetchSettingsSupplier;
+    private final Supplier<WarmFullFileSettings> warmFullFileSettingsSupplier;
 
     public TieredDirectory(
         Directory localDirectory,
         Directory remoteDirectory,
         FileCache fileCache,
         ThreadPool threadPool,
-        Supplier<TieredStoragePrefetchSettings> tieredStoragePrefetchSettingsSupplier
+        Supplier<TieredStoragePrefetchSettings> tieredStoragePrefetchSettingsSupplier,
+        Supplier<WarmFullFileSettings> warmFullFileSettingsSupplier
     ) {
         super(localDirectory, remoteDirectory, fileCache, threadPool);
         this.tieredStoragePrefetchSettingsSupplier = tieredStoragePrefetchSettingsSupplier;
+        this.warmFullFileSettingsSupplier = warmFullFileSettingsSupplier;
     }
 
     @Override
@@ -152,13 +163,62 @@ public class TieredDirectory extends CompositeDirectory {
             fileCache.decRef(key);
         }
         try {
+            SwitchableIndexInput original = (SwitchableIndexInput) indexInput.getIndexInput();
+            // Decide eligibility once per handle, here, because only openInput sees the IOContext.
+            boolean eligible = isEligibleForFullFile(name, context, original);
+            FullFileState fullFileState = indexInput.fullFileState();
             return new SwitchableIndexInputWrapper(
                 "SwitchableIndexInput (path=" + getFilePath(name) + ")",
-                (SwitchableIndexInput) indexInput.getIndexInput().clone()
+                (SwitchableIndexInput) original.clone(),
+                fullFileState,
+                eligible
             );
         } finally {
             fileCache.decRef(key);
         }
+    }
+
+    /**
+     * Decides, once per opened handle, whether this handle may trigger whole-file promotion. All conditions must hold:
+     * the extension is configured as eligible; the file is in remote (block) mode; it is larger than one block; the
+     * context is a plain DEFAULT read (excludes merges and FLUSH); and it carries no ReadOnce/SEQUENTIAL hint
+     * (excludes recovery checksum reads). Temp/corrupted files never reach here (handled earlier in openInput).
+     */
+    private boolean isEligibleForFullFile(String name, IOContext context, SwitchableIndexInput original) {
+        WarmFullFileSettings settings = warmFullFileSettingsSupplier == null ? null : warmFullFileSettingsSupplier.get();
+        if (settings == null || settings.getExtensions().isEmpty()) {
+            return false;
+        }
+        // Extension (part after the last dot, no leading dot); files with no dot are ineligible.
+        int dot = name.lastIndexOf('.');
+        if (dot < 0 || dot == name.length() - 1) {
+            return false;
+        }
+        if (settings.isExtensionEligible(name.substring(dot + 1)) == false) {
+            return false;
+        }
+        // Not an ordinary Lucene special file.
+        if (FileTypeUtils.isSegmentsFile(name) || FileTypeUtils.isLockFile(name) || name.endsWith(".cfs")) {
+            return false;
+        }
+        // Only promote files already uploaded and served from blocks; a not-yet-uploaded local file would be deleted
+        // out from under the mapping by switchToRemote.
+        if (original.hasSwitchedToRemote() == false) {
+            return false;
+        }
+        // A file of one block or less is already a single block; a whole copy gains nothing.
+        if (original.fileLength() <= ONE_BLOCK_BYTES) {
+            return false;
+        }
+        // Only plain search reads: DEFAULT context (excludes MERGE/FLUSH) with no ReadOnce/SEQUENTIAL hint
+        // (excludes recovery checksum reads via IOContext.READONCE).
+        if (context.context() != IOContext.Context.DEFAULT) {
+            return false;
+        }
+        if (context.hints().contains(ReadOnceHint.INSTANCE) || context.hints().contains(DataAccessHint.SEQUENTIAL)) {
+            return false;
+        }
+        return true;
     }
 
     @Override

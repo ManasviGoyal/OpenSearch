@@ -403,6 +403,23 @@ public class SwitchableIndexInput extends IndexInput implements Runnable, Random
         return hasSwitchedToRemote;
     }
 
+    /**
+     * The absolute offset of this instance into the underlying file. For the original (non-clone) input this is 0;
+     * for a slice it is the parent's offset plus the slice offset. Used to cut whole-file views at the right position.
+     * @return the absolute offset into the file
+     */
+    public long offset() {
+        return offset;
+    }
+
+    /**
+     * The logical length of this instance (the whole file length for the original, the slice length for a slice).
+     * @return the length in bytes
+     */
+    public long fileLength() {
+        return fileLength;
+    }
+
     // Visible for testing
     public boolean isCachedFromRemote() {
         return cachedFromRemote;

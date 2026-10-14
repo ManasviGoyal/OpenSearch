@@ -24,6 +24,7 @@ import org.opensearch.plugins.IndexStorePlugin;
 import org.opensearch.storage.indexinput.SwitchableIndexInput;
 import org.opensearch.storage.indexinput.SwitchableIndexInputWrapper;
 import org.opensearch.storage.prefetch.TieredStoragePrefetchSettings;
+import org.opensearch.storage.warmfullfile.WarmFullFileSettings;
 import org.junit.Before;
 
 import java.io.IOException;
@@ -31,6 +32,7 @@ import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
 import java.util.Arrays;
 import java.util.HashSet;
+import java.util.Set;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Supplier;
 
@@ -79,7 +81,8 @@ public class TieredDirectoryTests extends TieredStorageBaseTestCase {
             remoteSegmentStoreDirectory,
             fileCache,
             threadPool,
-            getMockPrefetchSettingsSupplier()
+            getMockPrefetchSettingsSupplier(),
+            getMockWarmFullFileSettingsSupplier()
         );
         addFilesToDirectory(LOCAL_FILES);
     }
@@ -90,6 +93,16 @@ public class TieredDirectoryTests extends TieredStorageBaseTestCase {
             when(settings.getReadAheadBlockCount()).thenReturn(TieredStoragePrefetchSettings.DEFAULT_READ_AHEAD_BLOCK_COUNT);
             when(settings.getReadAheadEnableFileFormats()).thenReturn(TieredStoragePrefetchSettings.READ_AHEAD_ENABLE_FILE_FORMATS);
             when(settings.isStoredFieldsPrefetchEnabled()).thenReturn(true);
+            return settings;
+        };
+    }
+
+    // Feature OFF (empty extensions): these existing tests exercise the inert path, so nothing is ever promoted.
+    private Supplier<WarmFullFileSettings> getMockWarmFullFileSettingsSupplier() {
+        return () -> {
+            WarmFullFileSettings settings = mock(WarmFullFileSettings.class);
+            when(settings.getExtensions()).thenReturn(Set.of());
+            when(settings.isExtensionEligible(org.mockito.ArgumentMatchers.anyString())).thenReturn(false);
             return settings;
         };
     }
@@ -246,7 +259,10 @@ public class TieredDirectoryTests extends TieredStorageBaseTestCase {
     }
 
     public void testTieredDirectoryFactory() throws IOException {
-        TieredDirectoryFactory factory = new TieredDirectoryFactory(getMockPrefetchSettingsSupplier());
+        TieredDirectoryFactory factory = new TieredDirectoryFactory(
+            getMockPrefetchSettingsSupplier(),
+            getMockWarmFullFileSettingsSupplier()
+        );
         FSDirectory factoryLocalDir = FSDirectory.open(createTempDir());
         IndexStorePlugin.DirectoryFactory localDirFactory = mock(IndexStorePlugin.DirectoryFactory.class);
         when(localDirFactory.newDirectory(any(), any())).thenReturn(factoryLocalDir);

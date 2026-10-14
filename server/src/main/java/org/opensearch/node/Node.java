@@ -291,6 +291,7 @@ import org.opensearch.storage.directory.TieredDataFormatAwareStoreDirectoryFacto
 import org.opensearch.storage.directory.TieredDirectoryFactory;
 import org.opensearch.storage.metrics.TierActionMetrics;
 import org.opensearch.storage.prefetch.TieredStoragePrefetchSettings;
+import org.opensearch.storage.warmfullfile.WarmFullFileSettings;
 import org.opensearch.storage.tiering.HotToWarmTieringService;
 import org.opensearch.storage.tiering.WarmToHotTieringService;
 import org.opensearch.task.commons.clients.TaskManagerClient;
@@ -977,12 +978,18 @@ public class Node implements Closeable {
             // Initialize tiered storage prefetch settings
             final TieredStoragePrefetchSettings tieredStoragePrefetchSettings;
             final Supplier<TieredStoragePrefetchSettings> tieredStoragePrefetchSettingsSupplier;
+            final WarmFullFileSettings warmFullFileSettings;
+            final Supplier<WarmFullFileSettings> warmFullFileSettingsSupplier;
             if (FeatureFlags.isEnabled(FeatureFlags.WRITABLE_WARM_INDEX_EXPERIMENTAL_FLAG)) {
                 tieredStoragePrefetchSettings = new TieredStoragePrefetchSettings(clusterService.getClusterSettings());
                 tieredStoragePrefetchSettingsSupplier = () -> tieredStoragePrefetchSettings;
+                warmFullFileSettings = new WarmFullFileSettings(clusterService.getClusterSettings());
+                warmFullFileSettingsSupplier = () -> warmFullFileSettings;
             } else {
                 tieredStoragePrefetchSettings = null;
                 tieredStoragePrefetchSettingsSupplier = () -> null;
+                warmFullFileSettings = null;
+                warmFullFileSettingsSupplier = () -> null;
             }
 
             final Map<String, IndexStorePlugin.DirectoryFactory> builtInDirectoryFactories = IndexModule.createBuiltInDirectoryFactories(
@@ -1026,7 +1033,7 @@ public class Node implements Closeable {
             if (FeatureFlags.isEnabled(FeatureFlags.WRITABLE_WARM_INDEX_EXPERIMENTAL_FLAG)) {
                 compositeDirectoryFactories.put(
                     TieringUtils.TIERED_COMPOSITE_INDEX_TYPE,
-                    new TieredDirectoryFactory(tieredStoragePrefetchSettingsSupplier)
+                    new TieredDirectoryFactory(tieredStoragePrefetchSettingsSupplier, warmFullFileSettingsSupplier)
                 );
             }
             final Map<String, org.opensearch.index.store.DataFormatAwareStoreDirectoryFactory> dataFormatAwareStoreDirectoryFactories =

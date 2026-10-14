@@ -11,6 +11,7 @@ package org.opensearch.index.store.remote.filecache;
 import org.apache.lucene.store.IndexInput;
 import org.opensearch.common.annotation.ExperimentalApi;
 import org.opensearch.common.annotation.PublicApi;
+import org.opensearch.storage.warmfullfile.FullFileState;
 
 import java.io.IOException;
 import java.util.concurrent.CompletableFuture;
@@ -50,4 +51,12 @@ public interface CachedIndexInput extends AutoCloseable {
      * @return true if the entry is closed, false otherwise
      */
     boolean isClosed();
+
+    /**
+     * @return the whole-file promotion state for this entry, or null if the entry does not support promotion
+     */
+    @ExperimentalApi
+    default FullFileState fullFileState() {
+        return null;
+    }
 }
