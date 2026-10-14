@@ -26,6 +26,7 @@ import org.opensearch.storage.indexinput.SwitchableIndexInputWrapper;
 import org.opensearch.storage.prefetch.TieredStoragePrefetchSettings;
 import org.opensearch.storage.utils.DirectoryUtils;
 import org.opensearch.storage.warmfullfile.FullFileState;
+import org.opensearch.storage.warmfullfile.WarmFullFileManager;
 import org.opensearch.storage.warmfullfile.WarmFullFileSettings;
 import org.opensearch.threadpool.ThreadPool;
 
@@ -59,6 +60,7 @@ public class TieredDirectory extends CompositeDirectory {
 
     private final Supplier<TieredStoragePrefetchSettings> tieredStoragePrefetchSettingsSupplier;
     private final Supplier<WarmFullFileSettings> warmFullFileSettingsSupplier;
+    private final WarmFullFileManager warmFullFileManager;
 
     public TieredDirectory(
         Directory localDirectory,
@@ -66,11 +68,13 @@ public class TieredDirectory extends CompositeDirectory {
         FileCache fileCache,
         ThreadPool threadPool,
         Supplier<TieredStoragePrefetchSettings> tieredStoragePrefetchSettingsSupplier,
-        Supplier<WarmFullFileSettings> warmFullFileSettingsSupplier
+        Supplier<WarmFullFileSettings> warmFullFileSettingsSupplier,
+        WarmFullFileManager warmFullFileManager
     ) {
         super(localDirectory, remoteDirectory, fileCache, threadPool);
         this.tieredStoragePrefetchSettingsSupplier = tieredStoragePrefetchSettingsSupplier;
         this.warmFullFileSettingsSupplier = warmFullFileSettingsSupplier;
+        this.warmFullFileManager = warmFullFileManager;
     }
 
     @Override
@@ -171,7 +175,8 @@ public class TieredDirectory extends CompositeDirectory {
                 "SwitchableIndexInput (path=" + getFilePath(name) + ")",
                 (SwitchableIndexInput) original.clone(),
                 fullFileState,
-                eligible
+                eligible,
+                warmFullFileManager
             );
         } finally {
             fileCache.decRef(key);
@@ -207,7 +212,7 @@ public class TieredDirectory extends CompositeDirectory {
             return false;
         }
         // A file of one block or less is already a single block; a whole copy gains nothing.
-        if (original.fileLength() <= ONE_BLOCK_BYTES) {
+        if (original.length() <= ONE_BLOCK_BYTES) { // original input: offset 0, length == whole file length
             return false;
         }
         // Only plain search reads: DEFAULT context (excludes MERGE/FLUSH) with no ReadOnce/SEQUENTIAL hint
