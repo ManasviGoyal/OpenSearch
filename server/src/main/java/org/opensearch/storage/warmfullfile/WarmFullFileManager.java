@@ -14,6 +14,7 @@ import org.apache.lucene.store.FSDirectory;
 import org.apache.lucene.store.IOContext;
 import org.apache.lucene.store.IndexInput;
 import org.apache.lucene.store.MMapDirectory;
+import org.apache.lucene.store.MemorySegmentAccessInput;
 import org.opensearch.common.annotation.ExperimentalApi;
 import org.opensearch.index.store.remote.filecache.CachedIndexInput;
 import org.opensearch.index.store.remote.filecache.FileCache;
@@ -25,7 +26,9 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Set;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executor;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.atomic.AtomicLongArray;
@@ -48,14 +51,14 @@ public class WarmFullFileManager {
 
     /** Default download/read part size: one block (8 MiB), matching the block path. */
     static final long DEFAULT_PART_SIZE = 8L * 1024 * 1024;
-    /** Retry delay after a decline or failure (constant, as in the design). */
+    /** Retry delay after a decline or failure. */
     static final long RETRY_DELAY_MILLIS = 60_000L;
     /** Whole-file bytes admitted per cache segment must stay at or below this fraction of the segment's capacity. */
     static final double DEFAULT_BUDGET_FRACTION = 0.5;
 
     /**
      * Largest file that may be promoted: strictly below Lucene's default mmap chunk size (16 GiB on 64-bit JVMs), so the
-     * family mapping is a single chunk (design §3.4 Views). Real .faiss/.veq files are far below this.
+     * family mapping is a single chunk. Real .faiss/.veq files are far below this.
      */
     public static final long MAX_WHOLE_FILE_BYTES = MMapDirectory.DEFAULT_MAX_CHUNK_SIZE;
 
@@ -72,6 +75,8 @@ public class WarmFullFileManager {
     private final long perSegmentCapacity;
     private final long partSize;
     private final AtomicLongArray perSegmentWholeFileBytes;
+    // Extensions already reported as permanently declined on this node (one WARN per extension, DEBUG per file after).
+    private final Set<String> permanentlyDeclinedExtensions = ConcurrentHashMap.newKeySet();
 
     /** A monotonic millisecond clock (injectable for tests). */
     @FunctionalInterface
@@ -114,7 +119,7 @@ public class WarmFullFileManager {
             fileCache,
             executor,
             clock,
-            // Download slots: a sixteenth-ish of the node's allocated processors (design §3.6).
+            // Download slots: one per eight allocated processors, at least one (4 on a 32 vCPU node).
             Math.max(1, allocatedProcessors / 8),
             DEFAULT_BUDGET_FRACTION,
             // Segment count must match the node FileCache's SegmentedCache, which NodeCacheService builds with the
@@ -177,12 +182,18 @@ public class WarmFullFileManager {
      * background executor. On decline or failure, returns the state to BLOCK and sets retryAt.
      */
     public void promote(FullFileState st) {
+        // The family closed (shard closed, entry evicted or replaced) between the trigger's CAS and this run: nothing
+        // to promote, and no slot or budget to spend on a download nobody will use. (A download already running when the
+        // shard closes cannot be cancelled, fetchBlobAsync has no hook for it; the completion handler tidies that up.)
+        if (st.state() != FullFileState.State.PROMOTING) {
+            return;
+        }
         final long length = st.fileLength();
         final Path path = st.fullFilePath();
         final int segment = segmentIndexFor(path);
         final long cap = (long) (perSegmentCapacity * budgetFraction);
 
-        // Single-chunk guard (design §3.4 Views: "assert it"). Eligibility already excludes these; this also covers a
+        // Single-chunk guard. Eligibility already excludes these; this also covers a
         // local directory configured with a smaller chunk size. Checked before taking a slot or reserving bytes.
         if (length >= maxChunkSize(st.localDirectory())) {
             decline(st, "file of " + length + " bytes exceeds the mmap chunk size");
@@ -263,10 +274,21 @@ public class WarmFullFileManager {
             }
             // Open the family's OWN mapping with the RANDOM hint (do not reuse the cache entry's input).
             IndexInput master = localDirectory.openInput(st.fileName(), IOContext.DEFAULT.withHints(DataAccessHint.RANDOM));
-            if (isMemorySegmentInput(master) == false) {
+            // The master must be Lucene's mmap input. Views of an NIO master would go through
+            // BufferedIndexInput (a copy per read, no k-NN SIMD), which is not the feature. This happens only if the
+            // extension is on the local directory's NIO list (hybridfs), so it will not change for this family.
+            if ((master instanceof MemorySegmentAccessInput) == false) {
                 closeQuietly(master);
                 fileCache.decRef(path);
-                failPromotion(st, segment, length, "mapping is not a MemorySegmentIndexInput");
+                // Drop the useless whole file so it is not charged against the cache until eviction, and so nothing
+                // reuses it.
+                fileCache.remove(path);
+                declinePermanently(
+                    st,
+                    segment,
+                    length,
+                    "the local directory serves it as " + master.getClass().getSimpleName() + ", not mmap"
+                );
                 return;
             }
             // Attach the teardown, then publish localMaster, then CAS to FULL (all three before the CAS). If the family
@@ -313,6 +335,35 @@ public class WarmFullFileManager {
         }
     }
 
+    /**
+     * Declines for the lifetime of this family: a retry would fail the same way, so a 60 s retry would only take a slot
+     * and a budget reservation every minute forever. {@code retryAt = Long.MAX_VALUE} makes the trigger never fire again.
+     * A new family for the same file (e.g. after a shard restart) tries once more.
+     *
+     * <p>Logging: the cause is one operator setting (an extension the local directory serves with NIO), but it would
+     * surface once per segment per shard, so only the first file of each extension is logged at WARN on this node;
+     * later files of that extension are logged at DEBUG by {@link #decline(FullFileState, String, long)}.
+     */
+    private void declinePermanently(FullFileState st, int segment, long length, String reason) {
+        releaseSegmentBytes(segment, length);
+        slots.release();
+        if (decline(st, reason, Long.MAX_VALUE)) {
+            String extension = extensionOf(st.fileName());
+            if (permanentlyDeclinedExtensions.add(extension)) {
+                logger.warn(
+                    "whole-file promotion of [.{}] files is permanently declined on this node: {} (first file [{}]). "
+                        + "Remove the extension from [{}] or take it off the local directory's NIO list; "
+                        + "further [.{}] files are logged at DEBUG",
+                    extension,
+                    reason,
+                    st.fullFilePath(),
+                    WarmFullFileSettings.EXTENSIONS.getKey(),
+                    extension
+                );
+            }
+        }
+    }
+
     private void failPromotion(FullFileState st, int segment, long length, String reason) {
         releaseSegmentBytes(segment, length);
         slots.release();
@@ -320,14 +371,32 @@ public class WarmFullFileManager {
     }
 
     private void decline(FullFileState st, String reason) {
-        st.setRetryAt(clock.getAsLong() + RETRY_DELAY_MILLIS);
+        decline(st, reason, clock.getAsLong() + RETRY_DELAY_MILLIS);
+    }
+
+    /**
+     * Returns the family to BLOCK with the given retry time. Sets {@code retryAt} BEFORE the CAS so a trigger racing
+     * this decline cannot start a new promotion in between.
+     *
+     * @return true if the family went back to BLOCK; false if it closed meanwhile (then a WARN is logged:
+     *         the slot and bytes were held for the whole download because fetchBlobAsync cannot be cancelled)
+     */
+    private boolean decline(FullFileState st, String reason, long retryAt) {
+        st.setRetryAt(retryAt);
         if (st.casState(FullFileState.State.PROMOTING, FullFileState.State.BLOCK)) {
             logger.debug("whole-file promotion declined ({}) for {}", reason, st.fullFilePath());
-        } else if (st.state() == FullFileState.State.CLOSED) {
-            // Design §3.5: a completion landing on a closed family (e.g. shard closed mid-download) is logged at WARN;
-            // the slot and bytes were held for the whole download because fetchBlobAsync cannot be cancelled.
+            return true;
+        }
+        if (st.state() == FullFileState.State.CLOSED) {
             logger.warn("whole-file download for [{}] completed after its family closed ({})", st.fullFilePath(), reason);
         }
+        return false;
+    }
+
+    /** The part of the name after the last dot (no leading dot); the whole name if it has no dot. */
+    static String extensionOf(String name) {
+        int dot = name.lastIndexOf('.');
+        return dot < 0 ? name : name.substring(dot + 1);
     }
 
     /** Builds the download request by hand: ceil(length / partSize) parts at absolute offsets, last clipped, no zero tail. */
@@ -364,16 +433,37 @@ public class WarmFullFileManager {
     }
 
     /**
-     * Replicates {@code SegmentedCache.segmentFor} for a path key: the same hash mix and mask, with
-     * {@code segments = ceilingNextPowerOfTwo(availableProcessors())}. Kept in sync with SegmentedCache; a unit test
-     * asserts equivalence.
+     * Replicates {@code SegmentedCache.segmentFor} for a path key: the same hash mix and mask, with this manager's
+     * segment count ({@code ceilingNextPowerOfTwo(availableProcessors())} in production). Kept in sync with
+     * SegmentedCache by {@code WarmFullFileSegmentIndexTests} (in the cache's package, where {@code segmentFor} is
+     * visible): two paths share a cache segment exactly when they get the same index here, for several segment counts,
+     * and the production segment count equals a default-concurrency FileCache's. The budget only needs that bijection
+     * (every counter has the same cap), not that index {@code i} is table slot {@code i}.
      */
     int segmentIndexFor(Path path) {
+        return segmentIndexFor(path, segments);
+    }
+
+    /**
+     * The segment index of {@code path} in a {@code SegmentedCache} with {@code segments} segments (a power of two):
+     * the same hash mix and mask as {@code SegmentedCache.segmentFor}. Public and static only so the equivalence test
+     * can live next to {@code SegmentedCache}.
+     *
+     * @param path     the FileCache key
+     * @param segments the cache's segment count (a power of two)
+     * @return the segment index in {@code [0, segments)}
+     */
+    public static int segmentIndexFor(Path path, int segments) {
         int h = path.hashCode();
         h = ((h >>> 16) ^ h) * 0x45d9f3b;
         h = ((h >>> 16) ^ h) * 0x45d9f3b;
         h = (h >>> 16) ^ h;
         return h & 0x7fffffff & (segments - 1);
+    }
+
+    /** @return the number of cache segments this manager budgets over (visible for testing) */
+    public int segments() {
+        return segments;
     }
 
     long perSegmentWholeFileBytes(int segment) {
@@ -386,12 +476,6 @@ public class WarmFullFileManager {
             return Math.min(mmap.getMaxChunkSize(), MAX_WHOLE_FILE_BYTES);
         }
         return MAX_WHOLE_FILE_BYTES;
-    }
-
-    private static boolean isMemorySegmentInput(IndexInput input) {
-        // Lucene's mmap inputs are MemorySegmentIndexInput; detect via the MMapDirectory package without a hard
-        // dependency on the (package-private) concrete type.
-        return MMapDirectory.class.getPackageName().equals(input.getClass().getPackageName());
     }
 
     /**
