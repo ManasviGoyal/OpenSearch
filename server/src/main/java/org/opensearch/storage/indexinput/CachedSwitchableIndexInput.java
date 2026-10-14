@@ -16,6 +16,7 @@ import org.opensearch.index.store.remote.filecache.CachedIndexInput;
 import org.opensearch.index.store.remote.filecache.FileCache;
 import org.opensearch.index.store.remote.utils.TransferManager;
 import org.opensearch.storage.prefetch.TieredStoragePrefetchSettings;
+import org.opensearch.storage.warmfullfile.FullFileState;
 import org.opensearch.threadpool.ThreadPool;
 
 import java.io.IOException;
@@ -31,6 +32,7 @@ import static org.opensearch.storage.utils.DirectoryUtils.getFilePathSwitchable;
 public class CachedSwitchableIndexInput implements CachedIndexInput {
 
     private final SwitchableIndexInput switchableIndexInput;
+    private final FullFileState fullFileState;
     private final AtomicBoolean isClosed;
 
     public CachedSwitchableIndexInput(
@@ -58,6 +60,27 @@ public class CachedSwitchableIndexInput implements CachedIndexInput {
             threadPool,
             tieredStoragePrefetchSettingsSupplier
         );
+        // The whole file (when promoted) occupies the <dir>/<name> key; its length comes from the switchable input
+        // (CachedSwitchableIndexInput.length() returns 0 and must not be used here).
+        this.fullFileState = new FullFileState(
+            transferManager,
+            localDirectory,
+            remoteDirectory,
+            fileCache,
+            fileName,
+            switchableIndexInput.fileLength(),
+            getFilePath(localDirectory, fileName)
+        );
+    }
+
+    /**
+     * Returns the whole-file promotion state for this family. Safe to call on a closed entry (plain field read; does
+     * not throw, unlike {@link #getIndexInput()}).
+     * @return the family's {@link FullFileState}
+     */
+    @Override
+    public FullFileState fullFileState() {
+        return fullFileState;
     }
 
     @Override

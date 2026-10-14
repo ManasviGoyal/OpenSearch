@@ -179,6 +179,7 @@ import org.opensearch.search.streaming.FlushModeResolver;
 import org.opensearch.snapshots.InternalSnapshotsInfoService;
 import org.opensearch.snapshots.SnapshotsService;
 import org.opensearch.storage.common.tiering.TieringUtils;
+import org.opensearch.storage.warmfullfile.WarmFullFileSettings;
 import org.opensearch.storage.prefetch.TieredStoragePrefetchSettings;
 import org.opensearch.tasks.TaskCancellationMonitoringSettings;
 import org.opensearch.tasks.TaskManager;
@@ -956,6 +957,7 @@ public final class ClusterSettings extends AbstractScopedSettings {
                 StreamSearchTransportService.STREAM_SEARCH_ENABLED,
                 TieredStoragePrefetchSettings.READ_AHEAD_BLOCK_COUNT,
                 TieredStoragePrefetchSettings.STORED_FIELDS_PREFETCH_ENABLED_SETTING,
+                WarmFullFileSettings.EXTENSIONS,
                 SearchIndexPruningSettings.ENABLED,
                 SearchIndexPruningSettings.MIN_SHARDS,
                 SearchIndexPruningSettings.FIELDS
