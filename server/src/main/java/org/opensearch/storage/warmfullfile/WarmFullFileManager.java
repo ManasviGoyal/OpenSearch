@@ -53,9 +53,19 @@ public class WarmFullFileManager {
     /** Whole-file bytes admitted per cache segment must stay at or below this fraction of the segment's capacity. */
     static final double DEFAULT_BUDGET_FRACTION = 0.5;
 
+    /**
+     * Largest file that may be promoted: strictly below Lucene's default mmap chunk size (16 GiB on 64-bit JVMs), so the
+     * family mapping is a single chunk (design §3.4 Views). Real .faiss/.veq files are far below this.
+     */
+    public static final long MAX_WHOLE_FILE_BYTES = MMapDirectory.DEFAULT_MAX_CHUNK_SIZE;
+
+    /** How long a closed FULL family may keep open handles before a WARN is logged (leak detection). */
+    static final long STUCK_HANDLE_WARN_DELAY_MILLIS = 5 * 60_000L;
+
     private final FileCache fileCache;
     private final Executor executor;
     private final LongSupplier clock;
+    private final DelayedScheduler scheduler;
     private final Semaphore slots;
     private final double budgetFraction;
     private final int segments;
@@ -69,23 +79,50 @@ public class WarmFullFileManager {
         long getAsLong();
     }
 
+    /** Runs a task once after a delay (injectable for tests; production uses the node ThreadPool). */
+    @FunctionalInterface
+    public interface DelayedScheduler {
+        void schedule(Runnable task, long delayMillis);
+    }
+
+    /** A scheduler that drops tasks; used where leak warnings are not needed. */
+    static final DelayedScheduler NO_OP_SCHEDULER = (task, delayMillis) -> {};
+
+    /** Production constructor without leak warnings (no scheduler). */
+    public WarmFullFileManager(FileCache fileCache, Executor executor, LongSupplier clock, int allocatedProcessors) {
+        this(fileCache, executor, clock, allocatedProcessors, NO_OP_SCHEDULER);
+    }
+
     /**
      * Production constructor.
      *
      * @param fileCache            the node file cache
-     * @param executor             the pool to run promote() and the completion handler on (never the search thread)
+     * @param executor             the pool to run promote(), the completion handler, and the deferred cleanup on
+     *                             (never the search thread, never the FileCache listener thread)
      * @param clock                a monotonic millis clock (e.g. {@code threadPool::relativeTimeInMillis})
      * @param allocatedProcessors  the node's allocated processor count
+     * @param scheduler            delayed-task scheduler for the stuck-handle warning
      */
-    public WarmFullFileManager(FileCache fileCache, Executor executor, LongSupplier clock, int allocatedProcessors) {
+    public WarmFullFileManager(
+        FileCache fileCache,
+        Executor executor,
+        LongSupplier clock,
+        int allocatedProcessors,
+        DelayedScheduler scheduler
+    ) {
         this(
             fileCache,
             executor,
             clock,
+            // Download slots: a sixteenth-ish of the node's allocated processors (design §3.6).
             Math.max(1, allocatedProcessors / 8),
             DEFAULT_BUDGET_FRACTION,
-            ceilingNextPowerOfTwo(allocatedProcessors),
-            DEFAULT_PART_SIZE
+            // Segment count must match the node FileCache's SegmentedCache, which NodeCacheService builds with the
+            // default concurrency level = Runtime.availableProcessors() (NOT allocatedProcessors, which differs when
+            // node.processors is set). A mismatch would charge whole-file bytes to the wrong segment.
+            ceilingNextPowerOfTwo(Runtime.getRuntime().availableProcessors()),
+            DEFAULT_PART_SIZE,
+            scheduler
         );
     }
 
@@ -99,9 +136,24 @@ public class WarmFullFileManager {
         int segments,
         long partSize
     ) {
+        this(fileCache, executor, clock, maxConcurrentDownloads, budgetFraction, segments, partSize, NO_OP_SCHEDULER);
+    }
+
+    /** Package-private constructor for tests that also inject the scheduler. */
+    WarmFullFileManager(
+        FileCache fileCache,
+        Executor executor,
+        LongSupplier clock,
+        int maxConcurrentDownloads,
+        double budgetFraction,
+        int segments,
+        long partSize,
+        DelayedScheduler scheduler
+    ) {
         this.fileCache = fileCache;
         this.executor = executor;
         this.clock = clock;
+        this.scheduler = scheduler == null ? NO_OP_SCHEDULER : scheduler;
         this.slots = new Semaphore(Math.max(1, maxConcurrentDownloads));
         this.budgetFraction = budgetFraction;
         this.segments = Math.max(1, segments);
@@ -129,6 +181,13 @@ public class WarmFullFileManager {
         final Path path = st.fullFilePath();
         final int segment = segmentIndexFor(path);
         final long cap = (long) (perSegmentCapacity * budgetFraction);
+
+        // Single-chunk guard (design §3.4 Views: "assert it"). Eligibility already excludes these; this also covers a
+        // local directory configured with a smaller chunk size. Checked before taking a slot or reserving bytes.
+        if (length >= maxChunkSize(st.localDirectory())) {
+            decline(st, "file of " + length + " bytes exceeds the mmap chunk size");
+            return;
+        }
 
         // Admission: a free slot AND the per-segment whole-file budget.
         if (slots.tryAcquire() == false) {
@@ -179,6 +238,7 @@ public class WarmFullFileManager {
 
     private void onDownloadComplete(FullFileState st, int segment, long length, Throwable throwable) {
         final Path path = st.fullFilePath();
+        boolean refTaken = false;
         try {
             if (throwable != null) {
                 failPromotion(st, segment, length, "download failed: " + throwable.getMessage());
@@ -190,6 +250,7 @@ public class WarmFullFileManager {
                 failPromotion(st, segment, length, "entry evicted before FULL");
                 return;
             }
+            refTaken = true;
             FSDirectory localDirectory = st.localDirectory();
             if (localDirectory.fileLength(st.fileName()) != length) {
                 fileCache.decRef(path);
@@ -207,10 +268,12 @@ public class WarmFullFileManager {
                 failPromotion(st, segment, length, "mapping is not a MemorySegmentIndexInput");
                 return;
             }
-            // Publish localMaster BEFORE the CAS to FULL.
+            // Attach the teardown, then publish localMaster, then CAS to FULL (all three before the CAS). If the family
+            // closes after the CAS, closeFamily() releases the budget and the deferred cleanup unmaps + decRefs.
+            st.attachCleanup(executor, () -> releaseSegmentBytes(segment, length), () -> scheduleStuckHandleWarning(st));
             st.setLocalMaster(master);
             if (st.casState(FullFileState.State.PROMOTING, FullFileState.State.FULL) == false) {
-                // Family closed while we were publishing; unwind.
+                // Family closed while we were publishing (closeFamily saw PROMOTING, so it owes no cleanup); unwind.
                 closeQuietly(master);
                 st.setLocalMaster(null);
                 fileCache.decRef(path);
@@ -220,7 +283,32 @@ public class WarmFullFileManager {
             slots.release();
             logger.debug("promoted whole file to FULL: {}", path);
         } catch (Exception e) {
+            if (refTaken) {
+                fileCache.decRef(path); // do not leak the family reference taken above
+            }
             failPromotion(st, segment, length, "exception publishing FULL: " + e.getMessage());
+        }
+    }
+
+    /**
+     * Leak detection: if the family closed while handles were still open, warn once after a delay if they are still
+     * open. The mapping and the whole file stay until those handles close (never unmapped under a live handle).
+     */
+    private void scheduleStuckHandleWarning(FullFileState st) {
+        try {
+            scheduler.schedule(() -> {
+                if (st.cleanupDone() == false && st.handleCount() > 0) {
+                    logger.warn(
+                        "whole-file family [{}] closed {} ms ago but still has [{}] open handle(s); its mapping and "
+                            + "whole file are kept until they close. A caller may not be closing an IndexInput.",
+                        st.fullFilePath(),
+                        STUCK_HANDLE_WARN_DELAY_MILLIS,
+                        st.handleCount()
+                    );
+                }
+            }, STUCK_HANDLE_WARN_DELAY_MILLIS);
+        } catch (RuntimeException e) {
+            logger.debug("could not schedule stuck-handle check for {}", st.fullFilePath(), e);
         }
     }
 
@@ -232,8 +320,13 @@ public class WarmFullFileManager {
 
     private void decline(FullFileState st, String reason) {
         st.setRetryAt(clock.getAsLong() + RETRY_DELAY_MILLIS);
-        st.casState(FullFileState.State.PROMOTING, FullFileState.State.BLOCK);
-        logger.debug("whole-file promotion declined ({}) for {}", reason, st.fullFilePath());
+        if (st.casState(FullFileState.State.PROMOTING, FullFileState.State.BLOCK)) {
+            logger.debug("whole-file promotion declined ({}) for {}", reason, st.fullFilePath());
+        } else if (st.state() == FullFileState.State.CLOSED) {
+            // Design §3.5: a completion landing on a closed family (e.g. shard closed mid-download) is logged at WARN;
+            // the slot and bytes were held for the whole download because fetchBlobAsync cannot be cancelled.
+            logger.warn("whole-file download for [{}] completed after its family closed ({})", st.fullFilePath(), reason);
+        }
     }
 
     /** Builds the download request by hand: ceil(length / partSize) parts at absolute offsets, last clipped, no zero tail. */
@@ -284,6 +377,14 @@ public class WarmFullFileManager {
 
     long perSegmentWholeFileBytes(int segment) {
         return perSegmentWholeFileBytes.get(segment);
+    }
+
+    /** The local directory's mmap chunk size if it is an MMapDirectory, else Lucene's default. */
+    static long maxChunkSize(FSDirectory directory) {
+        if (directory instanceof MMapDirectory mmap) {
+            return Math.min(mmap.getMaxChunkSize(), MAX_WHOLE_FILE_BYTES);
+        }
+        return MAX_WHOLE_FILE_BYTES;
     }
 
     private static boolean isMemorySegmentInput(IndexInput input) {

@@ -118,14 +118,7 @@ public class SwitchableIndexInputWrapper extends FilterIndexInput implements Ran
             maybeTrigger(st);
         }
         // Derived wrappers inherit eligibility and state but do not hold a handle count.
-        return new SwitchableIndexInputWrapper(
-            "Cloned " + resourceDescription,
-            switchableIndexInput.clone(),
-            st,
-            eligible,
-            manager,
-            false
-        );
+        return new SwitchableIndexInputWrapper("Cloned " + resourceDescription, switchableIndexInput.clone(), st, eligible, manager, false);
     }
 
     @Override

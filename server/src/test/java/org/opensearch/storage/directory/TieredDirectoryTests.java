@@ -108,6 +108,30 @@ public class TieredDirectoryTests extends TieredStorageBaseTestCase {
         };
     }
 
+    public void testCacheFilePutOverLiveEntryClosesTheReplacedFamily() throws Exception {
+        // Design §3.5: REPLACED never calls close(), so two openInput calls racing to create a family would leak the
+        // first family's mapping/reference/budget. cacheFile must close the entry it replaced.
+        java.nio.file.Path key = org.opensearch.storage.utils.DirectoryUtils.getFilePathSwitchable(
+            localDirectory,
+            FILE_PRESENT_IN_REMOTE_ONLY
+        );
+        tieredDirectory.cacheFile(FILE_PRESENT_IN_REMOTE_ONLY, true);
+        org.opensearch.index.store.remote.filecache.CachedIndexInput first = fileCache.get(key);
+        fileCache.decRef(key);
+        assertNotNull(first);
+        assertFalse(first.isClosed());
+
+        tieredDirectory.cacheFile(FILE_PRESENT_IN_REMOTE_ONLY, true);
+        org.opensearch.index.store.remote.filecache.CachedIndexInput second = fileCache.get(key);
+        fileCache.decRef(key);
+
+        assertNotSame(first, second);
+        assertTrue("replaced entry closed", first.isClosed());
+        assertEquals(org.opensearch.storage.warmfullfile.FullFileState.State.CLOSED, first.fullFileState().state());
+        assertFalse("new entry live", second.isClosed());
+        assertEquals(org.opensearch.storage.warmfullfile.FullFileState.State.BLOCK, second.fullFileState().state());
+    }
+
     public void testListAll() throws IOException {
         String[] actualFileNames = tieredDirectory.listAll();
         String[] expectedFileNames = new String[] {

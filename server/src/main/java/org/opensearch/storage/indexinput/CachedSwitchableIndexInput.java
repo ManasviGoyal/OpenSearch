@@ -102,6 +102,9 @@ public class CachedSwitchableIndexInput implements CachedIndexInput {
     @Override
     public void close() throws Exception {
         if (!isClosed.getAndSet(true)) {
+            // Runs inside the FileCache removal listener under a segment lock. closeFamily() never touches the FileCache
+            // inline: it releases the budget and defers the unmap + decRef to a pool thread, once the last handle closes.
+            fullFileState.closeFamily();
             switchableIndexInput.close();
         }
     }

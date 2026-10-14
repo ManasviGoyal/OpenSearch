@@ -7,6 +7,8 @@
  */
 package org.opensearch.storage.warmfullfile;
 
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
 import org.apache.lucene.store.FSDirectory;
 import org.apache.lucene.store.IndexInput;
 import org.opensearch.common.annotation.ExperimentalApi;
@@ -14,7 +16,10 @@ import org.opensearch.index.store.RemoteSegmentStoreDirectory;
 import org.opensearch.index.store.remote.filecache.FileCache;
 import org.opensearch.index.store.remote.utils.TransferManager;
 
+import java.io.IOException;
 import java.nio.file.Path;
+import java.util.concurrent.Executor;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 
@@ -32,14 +37,19 @@ import java.util.concurrent.atomic.AtomicReference;
  *   any --(family closes)--&gt;  CLOSED
  * </pre>
  *
- * The {@code localMaster} mapping is published (volatile) before the CAS to {@link State#FULL}, and is unmapped only
- * after the last handle closes (see {@link #incHandles()}/{@link #decHandles()}); that deferral is enforced by the
- * owning cache entry's close path, not here.
+ * The {@code localMaster} mapping is published (volatile) before the CAS to {@link State#FULL}. When the family
+ * closes while FULL ({@link #closeFamily()}), the budget is released at once, and the unmap plus the release of the
+ * family's FileCache reference run exactly once, on the cleanup executor, after the last handle closes
+ * ({@link #incHandles()}/{@link #decHandles()}). Whichever of "family closed" and "last handle closed" happens second
+ * schedules it, so no thread waits. Nothing here re-enters the FileCache inline, because {@link #closeFamily()} runs
+ * inside the FileCache removal listener under a segment lock.
  *
  * @opensearch.experimental
  */
 @ExperimentalApi
 public final class FullFileState {
+
+    private static final Logger logger = LogManager.getLogger(FullFileState.class);
 
     /** Promotion lifecycle state. */
     @ExperimentalApi
@@ -58,6 +68,15 @@ public final class FullFileState {
     private volatile IndexInput localMaster;
     private volatile long retryAt;
     private final AtomicInteger handleCount = new AtomicInteger(0);
+
+    // Teardown wiring, attached by the manager before the CAS to FULL.
+    private volatile Executor cleanupExecutor;
+    private volatile Runnable budgetRelease;
+    private volatile Runnable onClosedWithLiveHandles;
+    // Set only when the family closed while FULL: the deferred cleanup is owed exactly in that case.
+    private volatile boolean closedWhileFull;
+    private final AtomicBoolean cleanupScheduled = new AtomicBoolean(false);
+    private volatile boolean cleanupDone;
 
     // Everything promote() needs to build the download request and open the family's own mapping.
     // All five are available from the CachedSwitchableIndexInput constructor.
@@ -153,16 +172,105 @@ public final class FullFileState {
     }
 
     /**
-     * Releases a live handle (called when a wrapper handle closes).
+     * Releases a live handle (called when a wrapper handle closes). If this was the last handle of a family that
+     * already closed while FULL, schedules the deferred cleanup.
      * @return the new handle count
      */
     public int decHandles() {
-        return handleCount.decrementAndGet();
+        int remaining = handleCount.decrementAndGet();
+        if (remaining == 0) {
+            maybeScheduleCleanup();
+        }
+        return remaining;
     }
 
     /** @return the current live handle count */
     public int handleCount() {
         return handleCount.get();
+    }
+
+    /**
+     * Attaches the teardown for a FULL family. Called by the manager before it publishes FULL.
+     *
+     * @param cleanupExecutor          pool the unmap + decRef run on (never the FileCache listener thread)
+     * @param budgetRelease            returns this file's reserved per-segment budget bytes
+     * @param onClosedWithLiveHandles  called if the family closes while handles are still open (leak detection)
+     */
+    void attachCleanup(Executor cleanupExecutor, Runnable budgetRelease, Runnable onClosedWithLiveHandles) {
+        this.cleanupExecutor = cleanupExecutor;
+        this.budgetRelease = budgetRelease;
+        this.onClosedWithLiveHandles = onClosedWithLiveHandles;
+    }
+
+    /**
+     * The family-close routine (design §3.3/§3.5). Called from {@code CachedSwitchableIndexInput.close()}, which runs
+     * inside the FileCache removal listener under a segment lock, so this must not touch the FileCache inline.
+     *
+     * <p>Marks the state CLOSED. If it was FULL: releases the budget now, and schedules the unmap + decRef for when the
+     * handle count reaches zero (immediately on the cleanup executor if it already is). If it was PROMOTING, the
+     * manager's completion handler sees the lost CAS and unwinds; if BLOCK, there is nothing to release.
+     */
+    public void closeFamily() {
+        State prev = state.getAndSet(State.CLOSED);
+        if (prev != State.FULL) {
+            return;
+        }
+        Runnable release = budgetRelease;
+        if (release != null) {
+            release.run();
+        }
+        closedWhileFull = true;
+        if (handleCount.get() > 0) {
+            Runnable report = onClosedWithLiveHandles;
+            if (report != null) {
+                report.run();
+            }
+        }
+        maybeScheduleCleanup();
+    }
+
+    /**
+     * Schedules the cleanup exactly once, and only when the family closed while FULL and no handle remains. Both
+     * {@link #closeFamily()} and {@link #decHandles()} call this after their own write, so whichever runs second sees
+     * both conditions true.
+     */
+    private void maybeScheduleCleanup() {
+        if (closedWhileFull == false || handleCount.get() != 0) {
+            return;
+        }
+        Executor executor = cleanupExecutor;
+        if (executor == null || cleanupScheduled.compareAndSet(false, true) == false) {
+            return;
+        }
+        try {
+            executor.execute(this::runCleanup);
+        } catch (RuntimeException e) {
+            // Only expected on node shutdown. Never run inline: we may be on the FileCache listener thread.
+            logger.warn("could not schedule whole-file cleanup for {}; mapping kept until shutdown", fullFilePath, e);
+        }
+    }
+
+    private void runCleanup() {
+        IndexInput master = localMaster;
+        localMaster = null;
+        if (master != null) {
+            try {
+                master.close(); // munmap: safe now, no handle (and so no view derived from one) remains
+            } catch (IOException | RuntimeException e) {
+                logger.warn("failed to close whole-file mapping for {}", fullFilePath, e);
+            }
+        }
+        try {
+            fileCache.decRef(fullFilePath); // release the family's reference; the whole file becomes evictable
+        } catch (RuntimeException e) {
+            logger.warn("failed to release whole-file cache reference for {}", fullFilePath, e);
+        }
+        cleanupDone = true;
+    }
+
+    /** @return true once the deferred unmap + decRef has run */
+    public boolean cleanupDone() {
+        return cleanupDone;
     }
 
     // Accessors for the fields promote() needs. These are package-private on purpose: they expose internal types
