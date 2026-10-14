@@ -11,6 +11,7 @@ package org.opensearch.storage.directory;
 import com.carrotsearch.randomizedtesting.annotations.ThreadLeakFilters;
 
 import org.apache.lucene.store.FSDirectory;
+import org.apache.lucene.store.FilterIndexInput;
 import org.apache.lucene.store.IOContext;
 import org.apache.lucene.store.IndexInput;
 import org.opensearch.common.lucene.store.InputStreamIndexInput;
@@ -22,6 +23,7 @@ import org.opensearch.index.store.remote.filecache.FullFileCachedIndexInput;
 import org.opensearch.index.store.remote.utils.TransferManager;
 import org.opensearch.storage.indexinput.OnDemandPrefetchBlockSnapshotIndexInput;
 import org.opensearch.storage.indexinput.SwitchableIndexInput;
+import org.opensearch.storage.indexinput.SwitchableIndexInputWrapper;
 import org.opensearch.storage.prefetch.TieredStoragePrefetchSettings;
 import org.opensearch.threadpool.ThreadPool;
 import org.junit.Before;
@@ -261,6 +263,42 @@ public class SwitchableIndexInputTests extends TieredStorageBaseTestCase {
         } finally {
             assertTrue(terminate(testRunner));
         }
+    }
+
+    public void testWrapperWithoutFullFileStateClonesAndSlicesToBlockWrappers() throws IOException {
+        // The two-argument wrapper carries no whole-file state: clone() and slice() return block wrappers over
+        // SwitchableIndexInput clones, no whole-file entry appears in the cache, and the wrapper closes cleanly.
+        populateData();
+        SwitchableIndexInput switchableIndexInput = new SwitchableIndexInput(
+            "switchable",
+            FILE_NAME,
+            getFilePath(localDirectory, FILE_NAME),
+            getFilePathSwitchable(localDirectory, FILE_NAME),
+            fileCache,
+            localDirectory,
+            remoteSegmentStoreDirectory,
+            transferManager,
+            true,
+            threadPool,
+            getPrefetchSettingsSupplier()
+        );
+        SwitchableIndexInputWrapper wrapper = new SwitchableIndexInputWrapper("wrapper", switchableIndexInput);
+
+        IndexInput clone = wrapper.clone();
+        IndexInput slice = wrapper.slice("slice", 0, wrapper.length());
+        assertTrue(clone instanceof SwitchableIndexInputWrapper);
+        assertTrue(slice instanceof SwitchableIndexInputWrapper);
+        assertTrue(((FilterIndexInput) clone).getDelegate() instanceof SwitchableIndexInput);
+        assertTrue(((FilterIndexInput) slice).getDelegate() instanceof SwitchableIndexInput);
+        assertEquals(wrapper.length(), clone.length());
+        assertEquals(wrapper.length(), slice.length());
+        assertEquals(clone.readByte(), slice.readByte());
+        assertNull("no whole-file entry", getFileCacheEntry(FILE_NAME));
+        assertNotNull("block entry", getFileCacheEntry(FILE_NAME_BLOCK));
+
+        clone.close();
+        slice.close();
+        wrapper.close();
     }
 
     private void testCloneSliceRefCounting(SwitchableIndexInput switchableIndexInput, String fileName) throws IOException {

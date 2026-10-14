@@ -7,9 +7,13 @@
  */
 package org.opensearch.storage.warmfullfile;
 
+import com.carrotsearch.randomizedtesting.annotations.ThreadLeakFilters;
+
 import org.apache.lucene.store.FSDirectory;
 import org.apache.lucene.store.IOContext;
 import org.apache.lucene.store.IndexInput;
+import org.opensearch.index.store.remote.file.CleanerDaemonThreadLeakFilter;
+import org.opensearch.index.store.remote.filecache.CachedFullFileIndexInput;
 import org.opensearch.index.store.remote.filecache.CachedIndexInput;
 import org.opensearch.index.store.remote.filecache.FileCache;
 import org.opensearch.index.store.remote.filecache.FileCacheFactory;
@@ -22,13 +26,22 @@ import org.junit.After;
 import org.junit.Before;
 
 import java.io.ByteArrayInputStream;
+import java.io.FilterInputStream;
+import java.io.IOException;
 import java.io.InputStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 
+// CachedFullFileIndexInput (used by the pre-existing-entry tests) registers with a Cleaner whose daemon thread is never
+// stopped; the filter excludes that one thread from leak detection, as the other FileCache tests do.
+@ThreadLeakFilters(filters = CleanerDaemonThreadLeakFilter.class)
 public class WarmFullFileManagerTests extends OpenSearchTestCase {
 
     private static final long PART = 8L * 1024 * 1024;
@@ -55,7 +68,7 @@ public class WarmFullFileManagerTests extends OpenSearchTestCase {
      * all-zero mocks in populateData / TransferManagerTestCase, which cannot catch one). The byte at absolute
      * file position p equals p modulo 256. Counts reads so tests can assert each range was read.
      */
-    private static final class PositionDependentStreamReader implements TransferManager.StreamReader {
+    static final class PositionDependentStreamReader implements TransferManager.StreamReader {
         private final AtomicInteger reads = new AtomicInteger(0);
 
         @Override
@@ -71,6 +84,94 @@ public class WarmFullFileManagerTests extends OpenSearchTestCase {
         int readCount() {
             return reads.get();
         }
+    }
+
+    /** Delegates to {@code inner} once {@code release} is counted down; every read blocks until then. */
+    private static TransferManager.StreamReader blockingReader(CountDownLatch release, TransferManager.StreamReader inner) {
+        return (name, position, length) -> {
+            try {
+                release.await();
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+            return inner.read(name, position, length);
+        };
+    }
+
+    /** Serves position-dependent bytes but throws from the {@code failingCall}-th read (1-based) instead of returning a stream. */
+    private static final class FailingPartStreamReader implements TransferManager.StreamReader {
+        private final PositionDependentStreamReader inner = new PositionDependentStreamReader();
+        private final AtomicInteger calls = new AtomicInteger(0);
+        private final int failingCall;
+
+        FailingPartStreamReader(int failingCall) {
+            this.failingCall = failingCall;
+        }
+
+        @Override
+        public InputStream read(String name, long position, long length) throws IOException {
+            if (calls.incrementAndGet() == failingCall) {
+                throw new IOException("simulated failure on part " + failingCall);
+            }
+            return inner.read(name, position, length);
+        }
+
+        /** @return the number of streams actually handed out (the failing call hands out none) */
+        int streamsReturned() {
+            return inner.readCount();
+        }
+    }
+
+    /** Wraps every stream the delegate returns so that the number of opened and closed streams can be compared. */
+    private static final class CloseCountingStreamReader implements TransferManager.StreamReader {
+        private final TransferManager.StreamReader delegate;
+        private final AtomicInteger opened = new AtomicInteger(0);
+        private final AtomicInteger closed = new AtomicInteger(0);
+
+        CloseCountingStreamReader(TransferManager.StreamReader delegate) {
+            this.delegate = delegate;
+        }
+
+        @Override
+        public InputStream read(String name, long position, long length) throws IOException {
+            InputStream in = delegate.read(name, position, length);
+            opened.incrementAndGet();
+            return new FilterInputStream(in) {
+                private boolean closedOnce;
+
+                @Override
+                public void close() throws IOException {
+                    if (closedOnce == false) {
+                        closedOnce = true;
+                        closed.incrementAndGet();
+                    }
+                    super.close();
+                }
+            };
+        }
+
+        int opened() {
+            return opened.get();
+        }
+
+        int closed() {
+            return closed.get();
+        }
+    }
+
+    /** Reads the whole content of the family's published mapping through a clone (the master's position is untouched). */
+    private static byte[] readAll(IndexInput master, long length) throws IOException {
+        IndexInput clone = master.clone();
+        clone.seek(0);
+        byte[] actual = new byte[(int) length];
+        clone.readBytes(actual, 0, (int) length);
+        return actual;
+    }
+
+    private byte[] wrongBytes(long length) {
+        byte[] b = new byte[(int) length];
+        java.util.Arrays.fill(b, (byte) 0x7f);
+        return b;
     }
 
     private FullFileState newState(TransferManager tm, FileCache fileCache, String name, long length) {
@@ -509,5 +610,323 @@ public class WarmFullFileManagerTests extends OpenSearchTestCase {
         awaitState(retry, FullFileState.State.FULL);
         assertEquals(expectedLength, localDirectory.fileLength(name));
         assertTrue("retry actually downloaded", goodReader.readCount() > 0);
+    }
+
+    // ---------- admission: download slots ----------
+
+    public void testSlotDeclineReturnsToBlockWithoutReservingOrReading() throws Exception {
+        // One slot, a generous budget. The first family's download holds the slot (its reader blocks), so the second
+        // family is declined on the slot alone: BLOCK, retryAt = now + 60 s, no bytes reserved for it, no remote read.
+        long length = 4096;
+        CountDownLatch release = new CountDownLatch(1);
+        PositionDependentStreamReader firstReader = new PositionDependentStreamReader();
+        PositionDependentStreamReader secondReader = new PositionDependentStreamReader();
+        FileCache fileCache = FileCacheFactory.createConcurrentLRUFileCache(10_000_000, 1);
+        TransferManager blockedTm = new TransferManager(blockingReader(release, firstReader), fileCache, threadPool);
+        TransferManager freeTm = new TransferManager(secondReader, fileCache, threadPool);
+        AtomicLong clock = new AtomicLong(5_000);
+        WarmFullFileManager mgr = new WarmFullFileManager(fileCache, Runnable::run, clock::get, 1, 0.5, 1, 1024);
+
+        FullFileState first = newState(blockedTm, fileCache, "_slot1.faiss", length);
+        assertTrue(first.casState(FullFileState.State.BLOCK, FullFileState.State.PROMOTING));
+        mgr.promote(first); // returns with the download queued and the single slot held
+        assertEquals(FullFileState.State.PROMOTING, first.state());
+        assertEquals(length, mgr.perSegmentWholeFileBytes(0));
+
+        FullFileState second = newState(freeTm, fileCache, "_slot2.faiss", length);
+        assertTrue(second.casState(FullFileState.State.BLOCK, FullFileState.State.PROMOTING));
+        mgr.promote(second);
+
+        assertEquals("declined on the slot", FullFileState.State.BLOCK, second.state());
+        assertEquals(5_000 + WarmFullFileManager.RETRY_DELAY_MILLIS, second.retryAt());
+        assertEquals("only the first family's bytes are reserved", length, mgr.perSegmentWholeFileBytes(0));
+        assertEquals("no remote read for the declined family", 0, secondReader.readCount());
+        assertFalse("no file for the declined family", Files.exists(dir.resolve("_slot2.faiss")));
+        assertNull("no cache entry for the declined family", fileCache.get(dir.resolve("_slot2.faiss")));
+        assertEquals("the first download has not started reading", 0, firstReader.readCount());
+
+        release.countDown();
+        awaitState(first, FullFileState.State.FULL);
+        assertEquals(4, firstReader.readCount());
+
+        // The slot is free again once the first family is FULL: the declined family now promotes.
+        assertTrue(second.casState(FullFileState.State.BLOCK, FullFileState.State.PROMOTING));
+        mgr.promote(second);
+        awaitState(second, FullFileState.State.FULL);
+        assertEquals(4, secondReader.readCount());
+    }
+
+    // ---------- failure in the middle of a multi-part download ----------
+
+    public void testMiddlePartFailureLeavesNoFileOrEntryAndReleasesSlotAndBytes() throws Exception {
+        // The reader throws on the 3rd of 4 parts. The partial file and its cache entry must be gone, the family back
+        // in BLOCK with retryAt set, and the slot and bytes released (a 1-slot manager then promotes another file).
+        long length = 4096;
+        String name = "_mid.faiss";
+        Path path = dir.resolve(name);
+        FailingPartStreamReader failing = new FailingPartStreamReader(3);
+        FileCache fileCache = FileCacheFactory.createConcurrentLRUFileCache(10_000_000, 1);
+        TransferManager tm = new TransferManager(failing, fileCache, threadPool);
+        AtomicLong clock = new AtomicLong(700);
+        WarmFullFileManager mgr = new WarmFullFileManager(fileCache, Runnable::run, clock::get, 1, 0.5, 1, 1024);
+
+        FullFileState st = newState(tm, fileCache, name, length);
+        assertTrue(st.casState(FullFileState.State.BLOCK, FullFileState.State.PROMOTING));
+        mgr.promote(st);
+
+        awaitState(st, FullFileState.State.BLOCK);
+        assertEquals(700 + WarmFullFileManager.RETRY_DELAY_MILLIS, st.retryAt());
+        assertNull("nothing published", st.localMaster());
+        assertEquals("two parts were read before the failure", 2, failing.streamsReturned());
+        assertFalse("partial file deleted", Files.exists(path));
+        assertNull("no cache entry left at the whole-file key", fileCache.get(path));
+        assertEquals("bytes released", 0L, mgr.perSegmentWholeFileBytes(0));
+        assertEquals("no usage left in the cache", 0L, fileCache.usage());
+
+        // The slot was released: a following promotion of another file succeeds with the single slot.
+        PositionDependentStreamReader good = new PositionDependentStreamReader();
+        TransferManager goodTm = new TransferManager(good, fileCache, threadPool);
+        FullFileState ok = newState(goodTm, fileCache, "_after_mid.faiss", length);
+        assertTrue(ok.casState(FullFileState.State.BLOCK, FullFileState.State.PROMOTING));
+        mgr.promote(ok);
+        awaitState(ok, FullFileState.State.FULL);
+        assertEquals(4, good.readCount());
+        assertEquals(length, mgr.perSegmentWholeFileBytes(0));
+    }
+
+    // ---------- every reader stream is closed ----------
+
+    public void testEveryReaderStreamIsClosedOnSuccess() throws Exception {
+        long length = 4096;
+        CloseCountingStreamReader counting = new CloseCountingStreamReader(new PositionDependentStreamReader());
+        FileCache fileCache = FileCacheFactory.createConcurrentLRUFileCache(10_000_000, 1);
+        TransferManager tm = new TransferManager(counting, fileCache, threadPool);
+        WarmFullFileManager mgr = new WarmFullFileManager(fileCache, Runnable::run, threadPool::relativeTimeInMillis, 4, 0.5, 1, 1024);
+
+        FullFileState st = newState(tm, fileCache, "_closed_ok.faiss", length);
+        assertTrue(st.casState(FullFileState.State.BLOCK, FullFileState.State.PROMOTING));
+        mgr.promote(st);
+        awaitState(st, FullFileState.State.FULL);
+
+        assertEquals("one stream per part", 4, counting.opened());
+        assertEquals("every stream closed", counting.opened(), counting.closed());
+    }
+
+    public void testEveryReaderStreamIsClosedOnMiddlePartFailure() throws Exception {
+        long length = 4096;
+        CloseCountingStreamReader counting = new CloseCountingStreamReader(new FailingPartStreamReader(3));
+        FileCache fileCache = FileCacheFactory.createConcurrentLRUFileCache(10_000_000, 1);
+        TransferManager tm = new TransferManager(counting, fileCache, threadPool);
+        WarmFullFileManager mgr = new WarmFullFileManager(fileCache, Runnable::run, threadPool::relativeTimeInMillis, 4, 0.5, 1, 1024);
+
+        FullFileState st = newState(tm, fileCache, "_closed_fail.faiss", length);
+        assertTrue(st.casState(FullFileState.State.BLOCK, FullFileState.State.PROMOTING));
+        mgr.promote(st);
+        awaitState(st, FullFileState.State.BLOCK);
+
+        assertEquals("the two parts before the failure were opened", 2, counting.opened());
+        assertEquals("both were closed", counting.opened(), counting.closed());
+    }
+
+    // ---------- pre-existing entries at the whole-file key ----------
+
+    public void testLiveCachedFullFileEntryAtKeyIsRemovedAndRedownloaded() throws Exception {
+        // A completed whole-file entry with WRONG bytes sits at the key. It must be removed (not served), and the file
+        // re-downloaded from the reader.
+        long length = 4096;
+        String name = "_stale_full.faiss";
+        Path path = dir.resolve(name);
+        PositionDependentStreamReader reader = new PositionDependentStreamReader();
+        FileCache fileCache = FileCacheFactory.createConcurrentLRUFileCache(10_000_000, 1);
+        TransferManager tm = new TransferManager(reader, fileCache, threadPool);
+        WarmFullFileManager mgr = new WarmFullFileManager(fileCache, Runnable::run, threadPool::relativeTimeInMillis, 4, 0.5, 1, 1024);
+
+        Files.write(path, wrongBytes(length));
+        IndexInput wrong = localDirectory.openInput(name, IOContext.DEFAULT);
+        CachedFullFileIndexInput stale = new CachedFullFileIndexInput(fileCache, path, wrong);
+        fileCache.put(path, stale);
+        fileCache.decRef(path);
+        assertEquals(length, fileCache.usage());
+
+        FullFileState st = newState(tm, fileCache, name, length);
+        assertTrue(st.casState(FullFileState.State.BLOCK, FullFileState.State.PROMOTING));
+        mgr.promote(st);
+        awaitState(st, FullFileState.State.FULL);
+
+        assertEquals("re-downloaded in 4 parts", 4, reader.readCount());
+        assertTrue("stale entry closed by its removal", stale.isClosed());
+        assertArrayEquals("served bytes come from the reader", expectedBytes(length), readAll(st.localMaster(), length));
+        try (IndexInput onDisk = localDirectory.openInput(name, IOContext.DEFAULT)) {
+            assertArrayEquals("file on disk was rewritten", expectedBytes(length), readAll(onDisk, length));
+        }
+        CachedIndexInput current = fileCache.get(path);
+        assertNotNull(current);
+        assertNotSame("the stale entry is no longer in the cache", stale, current);
+        fileCache.decRef(path);
+        assertEquals("exactly the family's reference", Integer.valueOf(1), fileCache.getRef(path));
+    }
+
+    public void testRestoredPlaceholderAtKeyIsRemovedAndRedownloaded() throws Exception {
+        // A restore placeholder (no open handle, file with WRONG bytes on disk) sits at the key: removed, re-downloaded.
+        long length = 4096;
+        String name = "_restored.faiss";
+        Path path = dir.resolve(name);
+        PositionDependentStreamReader reader = new PositionDependentStreamReader();
+        FileCache fileCache = FileCacheFactory.createConcurrentLRUFileCache(10_000_000, 1);
+        TransferManager tm = new TransferManager(reader, fileCache, threadPool);
+        WarmFullFileManager mgr = new WarmFullFileManager(fileCache, Runnable::run, threadPool::relativeTimeInMillis, 4, 0.5, 1, 1024);
+
+        Files.write(path, wrongBytes(length));
+        FileCache.RestoredCachedIndexInput restored = new FileCache.RestoredCachedIndexInput(length);
+        fileCache.put(path, restored);
+        fileCache.decRef(path);
+
+        FullFileState st = newState(tm, fileCache, name, length);
+        assertTrue(st.casState(FullFileState.State.BLOCK, FullFileState.State.PROMOTING));
+        mgr.promote(st);
+        awaitState(st, FullFileState.State.FULL);
+
+        assertEquals("re-downloaded in 4 parts", 4, reader.readCount());
+        assertArrayEquals("served bytes come from the reader", expectedBytes(length), readAll(st.localMaster(), length));
+        CachedIndexInput current = fileCache.get(path);
+        assertNotNull(current);
+        assertNotSame("the placeholder is no longer in the cache", restored, current);
+        fileCache.decRef(path);
+        assertEquals("exactly the family's reference", Integer.valueOf(1), fileCache.getRef(path));
+    }
+
+    public void testInFlightPlaceholderIsReusedWithoutSecondDownload() throws Exception {
+        // A download of the same whole file is already in flight (its reader blocks). promote() must join it rather
+        // than start another: one download's worth of reads, FULL, and exactly the family's one reference afterwards.
+        long length = 4096;
+        String name = "_inflight.faiss";
+        Path path = dir.resolve(name);
+        CountDownLatch release = new CountDownLatch(1);
+        PositionDependentStreamReader inner = new PositionDependentStreamReader();
+        FileCache fileCache = FileCacheFactory.createConcurrentLRUFileCache(10_000_000, 1);
+        TransferManager tm = new TransferManager(blockingReader(release, inner), fileCache, threadPool);
+        WarmFullFileManager mgr = new WarmFullFileManager(fileCache, Runnable::run, threadPool::relativeTimeInMillis, 4, 0.5, 1, 1024);
+
+        BlobFetchRequest sameRequest = BlobFetchRequest.builder()
+            .directory(localDirectory)
+            .fileName(name)
+            .blobParts(WarmFullFileManager.buildParts(name, length, 1024))
+            .build();
+        CompletableFuture<IndexInput> inFlight = tm.fetchBlobAsync(sameRequest);
+        assertFalse(inFlight.isDone());
+        CachedIndexInput placeholder = fileCache.get(path);
+        assertNotNull("the in-flight placeholder is in the cache", placeholder);
+        fileCache.decRef(path);
+
+        FullFileState st = newState(tm, fileCache, name, length);
+        assertTrue(st.casState(FullFileState.State.BLOCK, FullFileState.State.PROMOTING));
+        mgr.promote(st);
+        assertEquals("waiting on the shared download", FullFileState.State.PROMOTING, st.state());
+        assertEquals("no read until the latch opens", 0, inner.readCount());
+
+        release.countDown();
+        awaitState(st, FullFileState.State.FULL);
+        assertTrue(inFlight.isDone());
+        assertEquals("one download's worth of part reads", 4, inner.readCount());
+        assertArrayEquals(expectedBytes(length), readAll(st.localMaster(), length));
+        CachedIndexInput current = fileCache.get(path);
+        assertSame("the placeholder entry itself was reused", placeholder, current);
+        fileCache.decRef(path);
+        assertEquals("exactly the family's reference, nothing leaked", Integer.valueOf(1), fileCache.getRef(path));
+        assertEquals(length, mgr.perSegmentWholeFileBytes(0));
+    }
+
+    public void testStrayFileWithoutEntryIsDeletedAndRedownloaded() throws Exception {
+        // A file with WRONG bytes exists at the path but nothing in the cache refers to it: deleted and re-downloaded.
+        long length = 4096;
+        String name = "_stray.faiss";
+        Path path = dir.resolve(name);
+        PositionDependentStreamReader reader = new PositionDependentStreamReader();
+        FileCache fileCache = FileCacheFactory.createConcurrentLRUFileCache(10_000_000, 1);
+        TransferManager tm = new TransferManager(reader, fileCache, threadPool);
+        WarmFullFileManager mgr = new WarmFullFileManager(fileCache, Runnable::run, threadPool::relativeTimeInMillis, 4, 0.5, 1, 1024);
+
+        Files.write(path, wrongBytes(length));
+        assertNull(fileCache.get(path));
+
+        FullFileState st = newState(tm, fileCache, name, length);
+        assertTrue(st.casState(FullFileState.State.BLOCK, FullFileState.State.PROMOTING));
+        mgr.promote(st);
+        awaitState(st, FullFileState.State.FULL);
+
+        assertEquals("re-downloaded, one read per part", 4, reader.readCount());
+        assertArrayEquals("served bytes come from the reader", expectedBytes(length), readAll(st.localMaster(), length));
+        try (IndexInput onDisk = localDirectory.openInput(name, IOContext.DEFAULT)) {
+            assertArrayEquals("stray file replaced on disk", expectedBytes(length), readAll(onDisk, length));
+        }
+        assertNotNull(fileCache.get(path));
+        fileCache.decRef(path);
+        assertEquals(Integer.valueOf(1), fileCache.getRef(path));
+    }
+
+    // ---------- concurrent promote() of one family ----------
+
+    public void testConcurrentPromoteOfOneFamilyDownloadsOnce() throws Exception {
+        // One state CAS'd to PROMOTING once, then promote(st) from 4 threads at once. The file is downloaded once, the
+        // family ends FULL holding exactly one cache reference and one file's worth of budget, and all 4 slots are
+        // free afterwards.
+        long length = 4096;
+        String name = "_race.faiss";
+        Path path = dir.resolve(name);
+        PositionDependentStreamReader reader = new PositionDependentStreamReader();
+        FileCache fileCache = FileCacheFactory.createConcurrentLRUFileCache(10_000_000, 1);
+        TransferManager tm = new TransferManager(reader, fileCache, threadPool);
+        WarmFullFileManager mgr = new WarmFullFileManager(fileCache, Runnable::run, threadPool::relativeTimeInMillis, 4, 0.5, 1, 1024);
+
+        FullFileState st = newState(tm, fileCache, name, length);
+        assertTrue(st.casState(FullFileState.State.BLOCK, FullFileState.State.PROMOTING));
+
+        int callers = 4;
+        CountDownLatch start = new CountDownLatch(1);
+        List<Thread> threads = new ArrayList<>();
+        for (int i = 0; i < callers; i++) {
+            Thread t = new Thread(() -> {
+                try {
+                    start.await();
+                } catch (InterruptedException e) {
+                    return;
+                }
+                mgr.promote(st);
+            }, "promoter-" + i);
+            threads.add(t);
+            t.start();
+        }
+        start.countDown();
+        for (Thread t : threads) {
+            t.join(30_000);
+            assertFalse("promoter stuck: " + t.getName(), t.isAlive());
+        }
+
+        assertBusy(() -> {
+            assertEquals(FullFileState.State.FULL, st.state());
+            assertEquals("one download's worth of part reads", 4, reader.readCount());
+            assertEquals("one file's worth of budget", length, mgr.perSegmentWholeFileBytes(0));
+            assertEquals("exactly the family's reference", Integer.valueOf(1), fileCache.getRef(path));
+        }, 30, TimeUnit.SECONDS);
+        assertEquals(length, localDirectory.fileLength(name));
+
+        // All 4 slots are free: 4 more families are admitted at once (none declined) while their reader blocks.
+        CountDownLatch release = new CountDownLatch(1);
+        PositionDependentStreamReader laterReader = new PositionDependentStreamReader();
+        TransferManager laterTm = new TransferManager(blockingReader(release, laterReader), fileCache, threadPool);
+        List<FullFileState> later = new ArrayList<>();
+        for (int i = 0; i < callers; i++) {
+            FullFileState s = newState(laterTm, fileCache, "_after_race" + i + ".faiss", length);
+            assertTrue(s.casState(FullFileState.State.BLOCK, FullFileState.State.PROMOTING));
+            mgr.promote(s);
+            assertEquals("admitted (slot " + i + " was free)", FullFileState.State.PROMOTING, s.state());
+            later.add(s);
+        }
+        assertEquals("budget: the raced family plus 4 in flight", length * (callers + 1), mgr.perSegmentWholeFileBytes(0));
+        release.countDown();
+        for (FullFileState s : later) {
+            awaitState(s, FullFileState.State.FULL);
+        }
+        assertEquals(4 * callers, laterReader.readCount());
     }
 }

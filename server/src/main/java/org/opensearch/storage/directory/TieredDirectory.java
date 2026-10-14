@@ -199,7 +199,8 @@ public class TieredDirectory extends CompositeDirectory {
      * context is a plain DEFAULT read (excludes merges and FLUSH); and it carries no ReadOnce/SEQUENTIAL hint
      * (excludes recovery checksum reads). Temp/corrupted files never reach here (handled earlier in openInput).
      */
-    private boolean isEligibleForFullFile(String name, IOContext context, SwitchableIndexInput original) {
+    // visible for testing
+    boolean isEligibleForFullFile(String name, IOContext context, SwitchableIndexInput original) {
         WarmFullFileSettings settings = warmFullFileSettingsSupplier == null ? null : warmFullFileSettingsSupplier.get();
         if (settings == null || settings.getExtensions().isEmpty()) {
             return false;
