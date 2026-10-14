@@ -199,6 +199,21 @@ public class SwitchableIndexInputWrapperWholeFileTests extends TieredStorageBase
         assertEquals("exactly one promotion request across threads", 1, exec.submitted.get());
     }
 
+    public void testNullManagerMeansFeatureOff() throws IOException {
+        // Non-warm nodes have no FileCache, so Node builds no manager. An eligible handle must still work on blocks.
+        SwitchableIndexInput in = remoteModeInput();
+        FullFileState st = stateFor(in);
+        SwitchableIndexInputWrapper handle = new SwitchableIndexInputWrapper("h", in, st, true, null);
+
+        IndexInput c = handle.clone();
+        IndexInput s = handle.slice("s", 0, Math.min(16, in.length()));
+        assertTrue(c instanceof SwitchableIndexInputWrapper);
+        assertTrue(s instanceof SwitchableIndexInputWrapper);
+        assertEquals("no promotion without a manager", FullFileState.State.BLOCK, st.state());
+        handle.close();
+        assertEquals(0, st.handleCount());
+    }
+
     public void testIneligibleHandleNeverRequests() throws IOException {
         SwitchableIndexInput in = remoteModeInput();
         FullFileState st = stateFor(in);
