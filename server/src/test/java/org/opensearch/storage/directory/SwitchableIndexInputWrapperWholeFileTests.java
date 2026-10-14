@@ -13,6 +13,7 @@ import org.apache.lucene.store.FSDirectory;
 import org.apache.lucene.store.IOContext;
 import org.apache.lucene.store.IndexInput;
 import org.apache.lucene.store.IndexOutput;
+import org.apache.lucene.store.MemorySegmentAccessInput;
 import org.apache.lucene.store.RandomAccessInput;
 import org.opensearch.common.lucene.store.InputStreamIndexInput;
 import org.opensearch.index.store.remote.file.CleanerDaemonThreadLeakFilter;
@@ -27,12 +28,19 @@ import org.opensearch.storage.warmfullfile.WarmFullFileManager;
 import org.opensearch.threadpool.ThreadPool;
 import org.junit.Before;
 
+import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Queue;
+import java.util.Random;
+import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executor;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Supplier;
@@ -759,6 +767,178 @@ public class SwitchableIndexInputWrapperWholeFileTests extends TieredStorageBase
 
         held.get(0).run();
         assertTrue(st.cleanupDone());
+    }
+
+    // ---------------- Publish-FULL race ----------------
+
+    public void testConcurrentClonesAndSlicesReadCorrectBytesAcrossFullPublication() throws Exception {
+        // Eight threads keep cloning and slicing one handle and reading random positions while a real promotion runs:
+        // before the download (blocks), while the download is held on a gate (blocks), and after FULL is published
+        // (views). Every byte read must match the position-dependent remote content whichever path served it.
+        final String promotionThread = "whole-file-promotion";
+        CountDownLatch downloadReached = new CountDownLatch(1);
+        CountDownLatch downloadGate = new CountDownLatch(1);
+        // Position-aware remote: block reads and the whole-file download both come from here and agree byte for byte.
+        // Only the whole-file download (which runs on the promotion thread) waits on the gate.
+        TransferManager positionAware = new TransferManager((name, position, length) -> {
+            if (Thread.currentThread().getName().equals(promotionThread)) {
+                downloadReached.countDown();
+                try {
+                    if (downloadGate.await(30, TimeUnit.SECONDS) == false) {
+                        throw new IOException("download gate was never opened");
+                    }
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    throw new IOException(e);
+                }
+            }
+            byte[] bytes = new byte[(int) length];
+            for (int i = 0; i < bytes.length; i++) {
+                bytes[i] = expected(position + i);
+            }
+            return new ByteArrayInputStream(bytes);
+        }, fileCache, threadPool);
+        SwitchableIndexInput in = new SwitchableIndexInput(
+            "switchable",
+            FILE_NAME,
+            getFilePath(localDirectory, FILE_NAME),
+            getFilePathSwitchable(localDirectory, FILE_NAME),
+            fileCache,
+            localDirectory,
+            remoteSegmentStoreDirectory,
+            positionAware,
+            true,
+            threadPool,
+            PREFETCH
+        );
+        final long len = in.length();
+        assumeTrue("need a few bytes to read", len >= 64);
+        FullFileState st = new FullFileState(
+            positionAware,
+            localDirectory,
+            remoteSegmentStoreDirectory,
+            fileCache,
+            FILE_NAME,
+            len,
+            getFilePath(localDirectory, FILE_NAME)
+        );
+        ExecutorService promoter = Executors.newSingleThreadExecutor(r -> new Thread(r, promotionThread));
+        try {
+            SwitchableIndexInputWrapper handle = new SwitchableIndexInputWrapper("h", in, st, true, manager(promoter, new AtomicLong()));
+
+            final int threads = 8;
+            AtomicBoolean stop = new AtomicBoolean(false);
+            AtomicLong iterations = new AtomicLong();
+            AtomicInteger blockResults = new AtomicInteger();
+            AtomicInteger viewResults = new AtomicInteger();
+            AtomicInteger[] viewsPerThread = new AtomicInteger[threads];
+            Queue<Throwable> failures = new ConcurrentLinkedQueue<>();
+            CountDownLatch start = new CountDownLatch(1);
+            List<Thread> workers = new ArrayList<>();
+            for (int t = 0; t < threads; t++) {
+                final AtomicInteger myViews = new AtomicInteger();
+                viewsPerThread[t] = myViews;
+                final Random random = new Random(randomLong());
+                Thread worker = new Thread(() -> {
+                    try {
+                        start.await();
+                        while (stop.get() == false) {
+                            IndexInput clone = handle.clone();
+                            try {
+                                classify(clone, blockResults, viewResults, myViews);
+                                long pos = random.nextInt((int) len);
+                                clone.seek(pos);
+                                byte got = clone.readByte();
+                                if (got != expected(pos)) {
+                                    throw new AssertionError("clone byte at " + pos + ": expected " + expected(pos) + " got " + got);
+                                }
+                                if (clone instanceof RandomAccessInput rai) {
+                                    long rpos = random.nextInt((int) len);
+                                    byte rgot = rai.readByte(rpos);
+                                    if (rgot != expected(rpos)) {
+                                        throw new AssertionError(
+                                            "positional byte at " + rpos + ": expected " + expected(rpos) + " got " + rgot
+                                        );
+                                    }
+                                }
+                            } finally {
+                                clone.close();
+                            }
+                            long off = random.nextInt((int) len);
+                            long sliceLen = 1 + random.nextInt((int) (len - off));
+                            IndexInput slice = handle.slice("s", off, sliceLen);
+                            try {
+                                classify(slice, blockResults, viewResults, myViews);
+                                long k = random.nextInt((int) sliceLen);
+                                slice.seek(k);
+                                byte got = slice.readByte();
+                                if (got != expected(off + k)) {
+                                    throw new AssertionError(
+                                        "slice byte at " + k + " (abs " + (off + k) + "): expected " + expected(off + k) + " got " + got
+                                    );
+                                }
+                            } finally {
+                                slice.close();
+                            }
+                            iterations.incrementAndGet();
+                        }
+                    } catch (Throwable e) {
+                        failures.add(e);
+                    }
+                });
+                workers.add(worker);
+                worker.start();
+            }
+            start.countDown();
+
+            // The first clone or slice triggers the promotion; its download then parks on the gate while readers go on.
+            assertTrue("promotion reached the download", downloadReached.await(30, TimeUnit.SECONDS));
+            assertEquals(FullFileState.State.PROMOTING, st.state());
+            long beforeGate = iterations.get();
+            assertBusy(() -> assertTrue("readers progress while PROMOTING", iterations.get() >= beforeGate + 50), 30, TimeUnit.SECONDS);
+            assertEquals("no views before FULL", 0, viewResults.get());
+            assertTrue("blocks served before FULL", blockResults.get() > 0);
+            assertTrue("no read failures before FULL: " + failures, failures.isEmpty());
+
+            downloadGate.countDown();
+            assertBusy(() -> assertEquals(FullFileState.State.FULL, st.state()), 30, TimeUnit.SECONDS);
+            assertBusy(() -> {
+                for (int t = 0; t < threads; t++) {
+                    assertTrue("thread " + t + " got a view after FULL", viewsPerThread[t].get() >= 1);
+                }
+            }, 30, TimeUnit.SECONDS);
+
+            stop.set(true);
+            for (Thread worker : workers) {
+                worker.join(TimeUnit.SECONDS.toMillis(30));
+                assertFalse("worker finished", worker.isAlive());
+            }
+            if (failures.isEmpty() == false) {
+                AssertionError error = new AssertionError(failures.size() + " read failures, first: " + failures.peek());
+                failures.forEach(error::addSuppressed);
+                throw error;
+            }
+            assertTrue(blockResults.get() > 0);
+            assertTrue(viewResults.get() > 0);
+            assertEquals(FullFileState.State.FULL, st.state());
+            handle.close();
+            assertEquals(0, st.handleCount());
+        } finally {
+            promoter.shutdown();
+            assertTrue(terminate(promoter));
+        }
+    }
+
+    /** Counts a clone/slice result as a block wrapper or a whole-file view, failing on anything else. */
+    private static void classify(IndexInput result, AtomicInteger blocks, AtomicInteger views, AtomicInteger myViews) {
+        if (result instanceof SwitchableIndexInputWrapper) {
+            blocks.incrementAndGet();
+        } else if (result instanceof MemorySegmentAccessInput) {
+            views.incrementAndGet();
+            myViews.incrementAndGet();
+        } else {
+            throw new AssertionError("unexpected input type " + result.getClass().getName());
+        }
     }
 
     // ---------------- Handle count ----------------
