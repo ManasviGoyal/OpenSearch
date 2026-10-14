@@ -134,6 +134,22 @@ public class SwitchableIndexInputWrapper extends FilterIndexInput implements Ran
         if (st != null) {
             IndexInput master = st.localMaster(); // read the volatile once
             if (st.state() == FullFileState.State.FULL && master != null) {
+                // The master spans the whole file, so its own bounds check is not enough: keep the slice inside this
+                // handle's window, as the block path (and Lucene's slice contract) would.
+                if (offset < 0 || length < 0 || offset + length > switchableIndexInput.fileLength()) {
+                    throw new IllegalArgumentException(
+                        "slice() "
+                            + sliceDescription
+                            + " out of bounds: offset="
+                            + offset
+                            + ",length="
+                            + length
+                            + ",fileLength="
+                            + switchableIndexInput.fileLength()
+                            + ": "
+                            + this
+                    );
+                }
                 try {
                     // A slice starts at 0, as Lucene requires; cut it at this instance's absolute offset.
                     return master.slice(sliceDescription, switchableIndexInput.offset() + offset, length);
