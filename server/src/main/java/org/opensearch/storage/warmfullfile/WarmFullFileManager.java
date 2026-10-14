@@ -197,6 +197,7 @@ public class WarmFullFileManager {
         boolean bytesReserved = false;
         try {
             if (reserveSegmentBytes(segment, length, cap) == false) {
+                slots.release(); // the slot was taken above; give it back or every budget decline leaks one
                 decline(st, "per-segment whole-file budget exceeded");
                 return;
             }

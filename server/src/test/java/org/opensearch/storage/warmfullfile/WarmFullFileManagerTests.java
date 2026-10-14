@@ -158,7 +158,7 @@ public class WarmFullFileManagerTests extends OpenSearchTestCase {
         assertEquals("multi-part: 4 parts each read once", 4, reader.readCount());
     }
 
-    public void testSlotDeclineReturnsToBlockWithRetryAt() throws Exception {
+    public void testBudgetDeclineReturnsToBlockWithRetryAt() throws Exception {
         long length = 4096;
         String name = "_7.faiss";
         PositionDependentStreamReader reader = new PositionDependentStreamReader();
@@ -307,6 +307,30 @@ public class WarmFullFileManagerTests extends OpenSearchTestCase {
                 assertEquals("budget fully released in segment " + s, 0L, mgr.perSegmentWholeFileBytes(s));
             }
         }, 30, java.util.concurrent.TimeUnit.SECONDS);
+    }
+
+    public void testBudgetDeclinesDoNotLeakDownloadSlots() throws Exception {
+        // One download slot, and a budget of half a 10,000-byte segment = 5,000 bytes. Each 8,192-byte file is declined
+        // on budget AFTER the slot is taken; if a decline kept the slot, the following 4,096-byte file would be declined
+        // with "no free download slot" instead of promoting.
+        FileCache fileCache = FileCacheFactory.createConcurrentLRUFileCache(10_000, 1);
+        PositionDependentStreamReader reader = new PositionDependentStreamReader();
+        TransferManager tm = new TransferManager(reader, fileCache, threadPool);
+        WarmFullFileManager mgr = new WarmFullFileManager(fileCache, Runnable::run, threadPool::relativeTimeInMillis, 1, 0.5, 1, 1024);
+
+        for (int i = 0; i < 3; i++) {
+            FullFileState big = newState(tm, fileCache, "_big" + i + ".faiss", 8192);
+            assertTrue(big.casState(FullFileState.State.BLOCK, FullFileState.State.PROMOTING));
+            mgr.promote(big);
+            assertEquals("declined on budget", FullFileState.State.BLOCK, big.state());
+        }
+        assertEquals("no download for budget declines", 0, reader.readCount());
+
+        FullFileState small = newState(tm, fileCache, "_small.faiss", 4096);
+        assertTrue(small.casState(FullFileState.State.BLOCK, FullFileState.State.PROMOTING));
+        mgr.promote(small);
+        awaitState(small, FullFileState.State.FULL);
+        assertEquals(4096L, mgr.perSegmentWholeFileBytes(0));
     }
 
     public void testFileAtOrAboveMmapChunkSizeIsDeclinedWithoutDownload() throws Exception {

@@ -988,13 +988,19 @@ public class Node implements Closeable {
                 tieredStoragePrefetchSettingsSupplier = () -> tieredStoragePrefetchSettings;
                 warmFullFileSettings = new WarmFullFileSettings(clusterService.getClusterSettings());
                 warmFullFileSettingsSupplier = () -> warmFullFileSettings;
-                warmFullFileManager = new WarmFullFileManager(
-                    fileCache(),
-                    threadPool.executor(ThreadPool.Names.GENERIC),
-                    threadPool::relativeTimeInMillis,
-                    OpenSearchExecutors.allocatedProcessors(settings),
-                    (task, delayMillis) -> threadPool.schedule(task, TimeValue.timeValueMillis(delayMillis), ThreadPool.Names.GENERIC)
-                );
+                // Only warm nodes have a FileCache (fileCache() is null otherwise, e.g. cluster-manager-only or data-only
+                // nodes). Without one there is nothing to promote into; TieredDirectory and the wrapper treat a null
+                // manager as "feature off".
+                final FileCache nodeFileCache = fileCache();
+                warmFullFileManager = nodeFileCache == null
+                    ? null
+                    : new WarmFullFileManager(
+                        nodeFileCache,
+                        threadPool.executor(ThreadPool.Names.GENERIC),
+                        threadPool::relativeTimeInMillis,
+                        OpenSearchExecutors.allocatedProcessors(settings),
+                        (task, delayMillis) -> threadPool.schedule(task, TimeValue.timeValueMillis(delayMillis), ThreadPool.Names.GENERIC)
+                    );
             } else {
                 tieredStoragePrefetchSettings = null;
                 tieredStoragePrefetchSettingsSupplier = () -> null;
