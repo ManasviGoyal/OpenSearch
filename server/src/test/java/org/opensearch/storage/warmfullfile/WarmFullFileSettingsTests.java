@@ -30,7 +30,11 @@ public class WarmFullFileSettingsTests extends OpenSearchTestCase {
     public void setUp() throws Exception {
         super.setUp();
         threadPool = new TestThreadPool("WarmFullFileSettingsTests");
-        clusterService = ClusterServiceUtils.createClusterService(Settings.EMPTY, new ClusterSettings(Settings.EMPTY, BUILT_IN_CLUSTER_SETTINGS), threadPool);
+        clusterService = ClusterServiceUtils.createClusterService(
+            Settings.EMPTY,
+            new ClusterSettings(Settings.EMPTY, BUILT_IN_CLUSTER_SETTINGS),
+            threadPool
+        );
     }
 
     @Override
@@ -56,9 +60,7 @@ public class WarmFullFileSettingsTests extends OpenSearchTestCase {
         WarmFullFileSettings settings = new WarmFullFileSettings(clusterService.getClusterSettings());
         assertTrue(settings.getExtensions().isEmpty());
 
-        Settings updated = Settings.builder()
-            .putList(WarmFullFileSettings.EXTENSIONS.getKey(), List.of("faiss", "veq"))
-            .build();
+        Settings updated = Settings.builder().putList(WarmFullFileSettings.EXTENSIONS.getKey(), List.of("faiss", "veq")).build();
         clusterService.getClusterSettings().applySettings(updated);
 
         assertEquals(Set.of("faiss", "veq"), settings.getExtensions());

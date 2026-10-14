@@ -24,6 +24,7 @@ import org.opensearch.storage.indexinput.SwitchableIndexInputWrapper;
 import org.opensearch.storage.prefetch.TieredStoragePrefetchSettings;
 import org.opensearch.storage.warmfullfile.FullFileState;
 import org.opensearch.storage.warmfullfile.WarmFullFileManager;
+import org.opensearch.threadpool.ThreadPool;
 import org.junit.Before;
 
 import java.io.IOException;
@@ -76,7 +77,9 @@ public class SwitchableIndexInputWrapperWholeFileTests extends TieredStorageBase
         remoteSegmentStoreDirectory.init();
         populateData();
         localDirectory = FSDirectory.open(createTempDir());
-        fileCache = FileCacheFactory.createConcurrentLRUFileCache(FILE_CACHE_CAPACITY, 1);
+        // Same shape as the node cache (NodeCacheService): default segment count = availableProcessors(), which is what
+        // WarmFullFileManager's production constructor assumes. 1 GiB is only a limit; nothing is allocated.
+        fileCache = FileCacheFactory.createConcurrentLRUFileCache(1L << 30);
         transferManager = new TransferManager(
             (name, position, length) -> new InputStreamIndexInput(
                 remoteSegmentStoreDirectory.openBlockInput(name, position, length, IOContext.DEFAULT),
@@ -253,7 +256,13 @@ public class SwitchableIndexInputWrapperWholeFileTests extends TieredStorageBase
         long len = in.length();
         assumeTrue("need a few bytes to test", len >= 8);
         FullFileState st = stateFor(in);
-        SwitchableIndexInputWrapper handle = new SwitchableIndexInputWrapper("h", in, st, true, manager(new RecordingExecutor(), new AtomicLong()));
+        SwitchableIndexInputWrapper handle = new SwitchableIndexInputWrapper(
+            "h",
+            in,
+            st,
+            true,
+            manager(new RecordingExecutor(), new AtomicLong())
+        );
         makeFull(st, openMaster(len));
 
         long pos = len / 2;
@@ -277,7 +286,13 @@ public class SwitchableIndexInputWrapperWholeFileTests extends TieredStorageBase
         long len = in.length();
         assumeTrue("need room for nested slices", len >= 16);
         FullFileState st = stateFor(in);
-        SwitchableIndexInputWrapper handle = new SwitchableIndexInputWrapper("h", in, st, true, manager(new RecordingExecutor(), new AtomicLong()));
+        SwitchableIndexInputWrapper handle = new SwitchableIndexInputWrapper(
+            "h",
+            in,
+            st,
+            true,
+            manager(new RecordingExecutor(), new AtomicLong())
+        );
         makeFull(st, openMaster(len));
 
         long off = len / 4;
@@ -303,7 +318,13 @@ public class SwitchableIndexInputWrapperWholeFileTests extends TieredStorageBase
         SwitchableIndexInput in = remoteModeInput();
         long len = in.length();
         FullFileState st = stateFor(in);
-        SwitchableIndexInputWrapper handle = new SwitchableIndexInputWrapper("h", in, st, false, manager(new RecordingExecutor(), new AtomicLong()));
+        SwitchableIndexInputWrapper handle = new SwitchableIndexInputWrapper(
+            "h",
+            in,
+            st,
+            false,
+            manager(new RecordingExecutor(), new AtomicLong())
+        );
 
         IndexInput before = handle.clone();
         makeFull(st, openMaster(len));
@@ -363,7 +384,13 @@ public class SwitchableIndexInputWrapperWholeFileTests extends TieredStorageBase
         long len = in.length();
         assumeTrue("fixture must hold the typed header", len >= 128);
         FullFileState st = stateFor(in);
-        SwitchableIndexInputWrapper handle = new SwitchableIndexInputWrapper("h", in, st, true, manager(new RecordingExecutor(), new AtomicLong()));
+        SwitchableIndexInputWrapper handle = new SwitchableIndexInputWrapper(
+            "h",
+            in,
+            st,
+            true,
+            manager(new RecordingExecutor(), new AtomicLong())
+        );
         long[] p = writeTypedMaster("typed.bin", len);
         makeFull(st, localDirectory.openInput("typed.bin", IOContext.DEFAULT));
 
@@ -411,7 +438,13 @@ public class SwitchableIndexInputWrapperWholeFileTests extends TieredStorageBase
         long len = in.length();
         assumeTrue("need a few bytes", len >= 64);
         FullFileState st = stateFor(in);
-        SwitchableIndexInputWrapper handle = new SwitchableIndexInputWrapper("h", in, st, true, manager(new RecordingExecutor(), new AtomicLong()));
+        SwitchableIndexInputWrapper handle = new SwitchableIndexInputWrapper(
+            "h",
+            in,
+            st,
+            true,
+            manager(new RecordingExecutor(), new AtomicLong())
+        );
         // FSDirectory.open on a 64-bit JVM is an MMapDirectory, so the master is a real mmap input.
         makeFull(st, openMaster(len));
 
@@ -456,7 +489,13 @@ public class SwitchableIndexInputWrapperWholeFileTests extends TieredStorageBase
         long len = in.length();
         assumeTrue("need room for a sub-window", len >= 64);
         FullFileState st = stateFor(in);
-        SwitchableIndexInputWrapper handle = new SwitchableIndexInputWrapper("h", in, st, true, manager(new RecordingExecutor(), new AtomicLong()));
+        SwitchableIndexInputWrapper handle = new SwitchableIndexInputWrapper(
+            "h",
+            in,
+            st,
+            true,
+            manager(new RecordingExecutor(), new AtomicLong())
+        );
         makeFull(st, openMaster(len));
 
         // In-bounds slices are views.
@@ -523,12 +562,145 @@ public class SwitchableIndexInputWrapperWholeFileTests extends TieredStorageBase
         assertTrue(first instanceof SwitchableIndexInputWrapper);
     }
 
+    /**
+     * A TransferManager with its own position-aware reader, so a whole-file download returns exactly the file's length.
+     * populateData() serves every remote read from ONE shared mock stream, which other reads of the same test consume.
+     */
+    private TransferManager downloadTransferManager() {
+        return new TransferManager(
+            (name, position, length) -> new java.io.ByteArrayInputStream(new byte[(int) length]),
+            fileCache,
+            threadPool
+        );
+    }
+
+    // ---------------- Step 6: ownership and deferred close (design §6.1) ----------------
+
+    public void testDeferredCloseKeepsMappingUntilLastHandleThenReleasesEverything() throws Exception {
+        java.nio.file.Path switchKey = getFilePathSwitchable(localDirectory, FILE_NAME);
+        java.nio.file.Path fullPath = getFilePath(localDirectory, FILE_NAME);
+        // The family's cache entry, as TieredDirectory.cacheFile creates it.
+        org.opensearch.storage.indexinput.CachedSwitchableIndexInput entry =
+            new org.opensearch.storage.indexinput.CachedSwitchableIndexInput(
+                fileCache,
+                FILE_NAME,
+                localDirectory,
+                remoteSegmentStoreDirectory,
+                downloadTransferManager(),
+                true,
+                threadPool,
+                PREFETCH
+            );
+        fileCache.put(switchKey, entry);
+        fileCache.decRef(switchKey);
+        FullFileState st = entry.fullFileState();
+        // Real pool: the cleanup must run off the FileCache listener thread, as in production.
+        WarmFullFileManager realManager = new WarmFullFileManager(
+            fileCache,
+            threadPool.executor(ThreadPool.Names.REMOTE_RECOVERY),
+            threadPool::relativeTimeInMillis,
+            1
+        );
+        SwitchableIndexInputWrapper handle = new SwitchableIndexInputWrapper(
+            "h",
+            (SwitchableIndexInput) entry.getIndexInput().clone(),
+            st,
+            true,
+            realManager
+        );
+
+        handle.clone(); // trigger
+        assertBusy(() -> assertEquals(FullFileState.State.FULL, st.state()), 30, java.util.concurrent.TimeUnit.SECONDS);
+        assertEquals("after FULL the whole-file entry has exactly one reference", Integer.valueOf(1), fileCache.getRef(fullPath));
+        IndexInput view = handle.clone();
+        assertTrue(view instanceof org.apache.lucene.store.MemorySegmentAccessInput);
+
+        // fileCache.remove ignores refcounts and closes the family (the deleteFile/prune/close path) while a view is open.
+        fileCache.remove(switchKey);
+        assertEquals(FullFileState.State.CLOSED, st.state());
+        assertFalse("not unmapped while a handle is open", st.cleanupDone());
+        assertEquals("the view keeps reading", 0, view.readByte());
+        assertEquals(Integer.valueOf(1), fileCache.getRef(fullPath));
+
+        // Last handle closes: the deferred cleanup closes the family's master and releases its reference.
+        IndexInput master = st.localMaster();
+        handle.close();
+        assertBusy(() -> assertTrue(st.cleanupDone()), 30, java.util.concurrent.TimeUnit.SECONDS);
+        assertNull("master released", st.localMaster());
+        assertEquals(Integer.valueOf(0), fileCache.getRef(fullPath));
+        // Our master is closed. (Whether a stale view then throws is up to Lucene: since 10.x, MMapDirectory groups a
+        // segment's files into one ref-counted shared Arena, so the memory is unmapped only after every input in the
+        // group closes. Not asserted here; it is not part of our contract.)
+        expectThrows(org.apache.lucene.store.AlreadyClosedException.class, master::readByte);
+
+        // The whole file is now evictable: prune removes the entry and deletes the file.
+        fileCache.prune();
+        assertNull(fileCache.getRef(fullPath));
+        assertFalse(java.nio.file.Files.exists(fullPath));
+    }
+
+    public void testFamilyClosedWithoutHandlesCleansUpOnPoolNotOnRemovingThread() throws Exception {
+        java.nio.file.Path switchKey = getFilePathSwitchable(localDirectory, FILE_NAME);
+        org.opensearch.storage.indexinput.CachedSwitchableIndexInput entry =
+            new org.opensearch.storage.indexinput.CachedSwitchableIndexInput(
+                fileCache,
+                FILE_NAME,
+                localDirectory,
+                remoteSegmentStoreDirectory,
+                downloadTransferManager(),
+                true,
+                threadPool,
+                PREFETCH
+            );
+        fileCache.put(switchKey, entry);
+        fileCache.decRef(switchKey);
+        FullFileState st = entry.fullFileState();
+        // Run promote() and the download for real, but hold the cleanup so we can see it is not run inline.
+        java.util.List<Runnable> held = new java.util.concurrent.CopyOnWriteArrayList<>();
+        java.util.concurrent.atomic.AtomicBoolean holdCleanup = new java.util.concurrent.atomic.AtomicBoolean(false);
+        Executor exec = command -> {
+            if (holdCleanup.get()) {
+                held.add(command);
+            } else {
+                threadPool.executor(ThreadPool.Names.REMOTE_RECOVERY).execute(command);
+            }
+        };
+        WarmFullFileManager realManager = new WarmFullFileManager(fileCache, exec, threadPool::relativeTimeInMillis, 1);
+        SwitchableIndexInputWrapper handle = new SwitchableIndexInputWrapper(
+            "h",
+            (SwitchableIndexInput) entry.getIndexInput().clone(),
+            st,
+            true,
+            realManager
+        );
+        handle.clone();
+        assertBusy(() -> assertEquals(FullFileState.State.FULL, st.state()), 30, java.util.concurrent.TimeUnit.SECONDS);
+        handle.close(); // no handles left; the family is still open
+        holdCleanup.set(true);
+
+        // Remove on this thread: the removal listener runs closeFamily() here. The cleanup re-enters the FileCache
+        // (decRef), so it must be handed to the pool, never run on this (lock-holding) thread.
+        fileCache.remove(switchKey);
+        assertEquals(FullFileState.State.CLOSED, st.state());
+        assertEquals("cleanup handed to the pool", 1, held.size());
+        assertFalse("and not run inline", st.cleanupDone());
+
+        held.get(0).run();
+        assertTrue(st.cleanupDone());
+    }
+
     // ---------------- Handle count ----------------
 
     public void testOpenedHandleHoldsOneCountReleasedOnceOnClose() throws IOException {
         SwitchableIndexInput in = remoteModeInput();
         FullFileState st = stateFor(in);
-        SwitchableIndexInputWrapper handle = new SwitchableIndexInputWrapper("h", in, st, true, manager(new RecordingExecutor(), new AtomicLong()));
+        SwitchableIndexInputWrapper handle = new SwitchableIndexInputWrapper(
+            "h",
+            in,
+            st,
+            true,
+            manager(new RecordingExecutor(), new AtomicLong())
+        );
         assertEquals(1, st.handleCount());
 
         handle.clone(); // derived wrappers do not count

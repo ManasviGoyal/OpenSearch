@@ -11,9 +11,12 @@ package org.opensearch.storage.directory;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.apache.lucene.index.IndexFileNames;
+import org.apache.lucene.store.AlreadyClosedException;
+import org.apache.lucene.store.DataAccessHint;
 import org.apache.lucene.store.Directory;
 import org.apache.lucene.store.IOContext;
 import org.apache.lucene.store.IndexInput;
+import org.apache.lucene.store.ReadOnceHint;
 import org.opensearch.common.annotation.ExperimentalApi;
 import org.opensearch.index.store.CompositeDirectory;
 import org.opensearch.index.store.RemoteSegmentStoreDirectory;
@@ -29,9 +32,6 @@ import org.opensearch.storage.warmfullfile.FullFileState;
 import org.opensearch.storage.warmfullfile.WarmFullFileManager;
 import org.opensearch.storage.warmfullfile.WarmFullFileSettings;
 import org.opensearch.threadpool.ThreadPool;
-
-import org.apache.lucene.store.DataAccessHint;
-import org.apache.lucene.store.ReadOnceHint;
 
 import java.io.IOException;
 import java.nio.file.NoSuchFileException;
@@ -151,6 +151,16 @@ public class TieredDirectory extends CompositeDirectory {
             return localDirectory.openInput(name, context);
         }
         Path key = getFilePathSwitchable(localDirectory, name);
+        try {
+            return openSwitchableHandle(name, context, key);
+        } catch (AlreadyClosedException e) {
+            // Two openInput calls raced to create the family: cacheFile put a new entry over the one we had just looked
+            // up and closed it (the REPLACED fix below). The new entry is live; look it up once more.
+            return openSwitchableHandle(name, context, key);
+        }
+    }
+
+    private IndexInput openSwitchableHandle(String name, IOContext context, Path key) throws IOException {
         CachedIndexInput indexInput = fileCache.get(key);
         if (indexInput == null) {
             RemoteSegmentStoreDirectory.UploadedSegmentMetadata uploadedSegmentMetadata = remoteDirectory.getSegmentsUploadedToRemoteStore()
@@ -213,6 +223,11 @@ public class TieredDirectory extends CompositeDirectory {
         }
         // A file of one block or less is already a single block; a whole copy gains nothing.
         if (original.length() <= ONE_BLOCK_BYTES) { // original input: offset 0, length == whole file length
+            return false;
+        }
+        // Design §3.4 Views: the mapping must be a single mmap chunk (Lucene's default chunk is 16 GiB). Above that,
+        // closing a view could unmap the master and segmentSliceOrNull returns null (no k-NN SIMD), so do not promote.
+        if (original.length() >= WarmFullFileManager.MAX_WHOLE_FILE_BYTES) {
             return false;
         }
         // Only plain search reads: DEFAULT context (excludes MERGE/FLUSH) with no ReadOnce/SEQUENTIAL hint
@@ -293,7 +308,7 @@ public class TieredDirectory extends CompositeDirectory {
     // protected for testing
     protected void cacheFile(String fileName, boolean cacheFromRemote) throws IOException {
         Path switchableFilePath = getFilePathSwitchable(localDirectory, fileName);
-        fileCache.put(
+        CachedIndexInput previous = fileCache.put(
             switchableFilePath,
             new CachedSwitchableIndexInput(
                 fileCache,
@@ -306,5 +321,16 @@ public class TieredDirectory extends CompositeDirectory {
                 tieredStoragePrefetchSettingsSupplier
             )
         );
+        // Design §3.5: RemovalReason.REPLACED never calls the replaced entry's close(), so a put over a live entry (two
+        // openInput calls racing to create the family) would leak the old family's mapping, reference and budget. Run
+        // the family-close routine on it. This is not inside the FileCache listener, but close() defers its cache work
+        // to a pool thread regardless.
+        if (previous != null) {
+            try {
+                previous.close();
+            } catch (Exception e) {
+                logger.warn("failed to close replaced switchable entry for {}", fileName, e);
+            }
+        }
     }
 }

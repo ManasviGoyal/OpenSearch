@@ -292,10 +292,10 @@ import org.opensearch.storage.directory.TieredDataFormatAwareStoreDirectoryFacto
 import org.opensearch.storage.directory.TieredDirectoryFactory;
 import org.opensearch.storage.metrics.TierActionMetrics;
 import org.opensearch.storage.prefetch.TieredStoragePrefetchSettings;
-import org.opensearch.storage.warmfullfile.WarmFullFileManager;
-import org.opensearch.storage.warmfullfile.WarmFullFileSettings;
 import org.opensearch.storage.tiering.HotToWarmTieringService;
 import org.opensearch.storage.tiering.WarmToHotTieringService;
+import org.opensearch.storage.warmfullfile.WarmFullFileManager;
+import org.opensearch.storage.warmfullfile.WarmFullFileSettings;
 import org.opensearch.task.commons.clients.TaskManagerClient;
 import org.opensearch.tasks.Task;
 import org.opensearch.tasks.TaskCancellationMonitoringService;
@@ -992,7 +992,8 @@ public class Node implements Closeable {
                     fileCache(),
                     threadPool.executor(ThreadPool.Names.GENERIC),
                     threadPool::relativeTimeInMillis,
-                    OpenSearchExecutors.allocatedProcessors(settings)
+                    OpenSearchExecutors.allocatedProcessors(settings),
+                    (task, delayMillis) -> threadPool.schedule(task, TimeValue.timeValueMillis(delayMillis), ThreadPool.Names.GENERIC)
                 );
             } else {
                 tieredStoragePrefetchSettings = null;
