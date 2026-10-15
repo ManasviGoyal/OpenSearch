@@ -314,6 +314,36 @@ public class TieredDirectoryTests extends TieredStorageBaseTestCase {
         remoteHandle.close();
     }
 
+    public void testFamilyIsNotMarkedRemoteWhenSwitchFails() throws IOException {
+        // FILE_PRESENT_LOCALLY is not registered in the remote store metadata, so switchToRemote rejects it and the
+        // family keeps serving the local copy. It must not be flagged remote-mode, or whole-file promotion could
+        // remove the only copy of the file.
+        Path localKey = getFilePathSwitchable(localDirectory, FILE_PRESENT_LOCALLY);
+        assertTrue(existsInLocalDirectory(FILE_PRESENT_LOCALLY));
+
+        tieredDirectory.afterSyncToRemote(FILE_PRESENT_LOCALLY);
+
+        assertTrue("local copy is still the only copy", existsInLocalDirectory(FILE_PRESENT_LOCALLY));
+        CachedIndexInput entry = fileCache.get(localKey);
+        assertNotNull(entry);
+        try {
+            SwitchableIndexInput original = (SwitchableIndexInput) entry.getIndexInput();
+            assertFalse("switch did not happen", original.hasSwitchedToRemote());
+            assertFalse("family stays non-promotable while serving the local copy", entry.fullFileState().isRemoteMode());
+        } finally {
+            fileCache.decRef(localKey);
+        }
+    }
+
+    public void testSwitchFileToRemoteWithoutCacheEntryDoesNotThrow() {
+        Path key = getFilePathSwitchable(localDirectory, NON_EXISTENT_FILE);
+        assertNull(fileCache.getRef(key));
+
+        tieredDirectory.switchFileToRemote(NON_EXISTENT_FILE);
+
+        assertNull(fileCache.getRef(key));
+    }
+
     public void testAfterSyncToRemote() throws IOException {
         populateData();
         String fileName = "_0.si";

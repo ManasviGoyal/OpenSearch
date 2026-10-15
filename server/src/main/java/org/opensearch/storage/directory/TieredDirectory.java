@@ -257,6 +257,11 @@ public class TieredDirectory extends CompositeDirectory {
         markFamilyRemote(file);
     }
 
+    /**
+     * Flags the family as remote-mode only if its original input has actually switched to remote. When the switch
+     * failed (or the entry is gone), the family keeps serving the local copy and must stay non-promotable, since
+     * whole-file promotion removes the family's local cache entry.
+     */
     private void markFamilyRemote(String file) {
         Path key = getFilePathSwitchable(localDirectory, file);
         CachedIndexInput entry = fileCache.get(key);
@@ -265,9 +270,14 @@ public class TieredDirectory extends CompositeDirectory {
         }
         try {
             FullFileState fullFileState = entry.fullFileState();
-            if (fullFileState != null) {
+            if (fullFileState != null
+                && entry.getIndexInput() instanceof SwitchableIndexInput switchable
+                && switchable.hasSwitchedToRemote()) {
                 fullFileState.markRemoteMode();
             }
+        } catch (IOException e) {
+            // Cannot confirm the switch, so the family stays non-promotable.
+            logger.error("Failed to read switchable entry while marking family remote - " + file, e);
         } finally {
             fileCache.decRef(key);
         }
@@ -284,8 +294,13 @@ public class TieredDirectory extends CompositeDirectory {
      */
     public void switchFileToRemote(String file) {
         Path filePath = getFilePathSwitchable(localDirectory, file);
+        CachedIndexInput entry = fileCache.get(filePath);
+        if (entry == null) {
+            // No switchable entry for this file (evicted or removed): nothing to switch.
+            return;
+        }
         try {
-            SwitchableIndexInput switchableIndexInput = ((SwitchableIndexInput) fileCache.get(filePath).getIndexInput());
+            SwitchableIndexInput switchableIndexInput = (SwitchableIndexInput) entry.getIndexInput();
             switchableIndexInput.switchToRemote();
         } catch (IOException | IllegalStateException e) {
             logger.error("Failed to switch full file to blocked - " + file, e);
