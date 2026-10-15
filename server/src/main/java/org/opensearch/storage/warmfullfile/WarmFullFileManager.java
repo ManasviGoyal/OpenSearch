@@ -20,17 +20,21 @@ import org.opensearch.index.store.remote.filecache.CachedIndexInput;
 import org.opensearch.index.store.remote.filecache.FileCache;
 import org.opensearch.index.store.remote.utils.BlobFetchRequest;
 import org.opensearch.index.store.remote.utils.TransferManager;
+import org.opensearch.storage.warmfullfile.WarmFullFileStats.DeclineReason;
 
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.EnumMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executor;
 import java.util.concurrent.Semaphore;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicLongArray;
 
 /**
@@ -40,7 +44,8 @@ import java.util.concurrent.atomic.AtomicLongArray;
  * only when a download slot is free and the per-segment whole-file budget allows it, downloads the whole file in
  * hand-built 8 MiB parts via {@link TransferManager#fetchBlobAsync}, then opens the family's own memory mapping and
  * flips the state to {@link FullFileState.State#FULL}. On any decline or failure the state returns to
- * {@link FullFileState.State#BLOCK} with a retry time set.
+ * {@link FullFileState.State#BLOCK} with a retry time set. Every promotion that reaches FULL is logged at INFO with its
+ * download time, and {@link #stats()} returns the node's promotion and decline counters.
  *
  * @opensearch.experimental
  */
@@ -69,12 +74,20 @@ public class WarmFullFileManager {
     private final Executor executor;
     private final LongSupplier clock;
     private final DelayedScheduler scheduler;
+    private final int maxConcurrentDownloads;
     private final Semaphore slots;
     private final double budgetFraction;
     private final int segments;
     private final long perSegmentCapacity;
     private final long partSize;
     private final AtomicLongArray perSegmentWholeFileBytes;
+    private final AtomicLong requested = new AtomicLong();
+    private final AtomicLong started = new AtomicLong();
+    private final AtomicLong downloadedBytes = new AtomicLong();
+    private final AtomicLong promoted = new AtomicLong();
+    private final AtomicLong promotedBytes = new AtomicLong();
+    private final AtomicLong downloadMillis = new AtomicLong();
+    private final AtomicLongArray declinedByReason = new AtomicLongArray(DeclineReason.values().length);
     // Extensions already reported as permanently declined on this node (one WARN per extension, DEBUG per file after).
     private final Set<String> permanentlyDeclinedExtensions = ConcurrentHashMap.newKeySet();
     // Runs on the promotion executor after admission (slot and budget held) and before the first remote read.
@@ -162,7 +175,8 @@ public class WarmFullFileManager {
         this.executor = executor;
         this.clock = clock;
         this.scheduler = scheduler == null ? NO_OP_SCHEDULER : scheduler;
-        this.slots = new Semaphore(Math.max(1, maxConcurrentDownloads));
+        this.maxConcurrentDownloads = Math.max(1, maxConcurrentDownloads);
+        this.slots = new Semaphore(this.maxConcurrentDownloads);
         this.budgetFraction = budgetFraction;
         this.segments = Math.max(1, segments);
         this.perSegmentCapacity = (fileCache.capacity() + this.segments - 1) / this.segments;
@@ -196,6 +210,7 @@ public class WarmFullFileManager {
      * background executor. On decline or failure, returns the state to BLOCK and sets retryAt.
      */
     public void promote(FullFileState st) {
+        requested.incrementAndGet();
         // The family closed (shard closed, entry evicted or replaced) between the trigger's CAS and this run: nothing
         // to promote, and no slot or budget to spend on a download nobody will use. (A download already running when the
         // shard closes cannot be cancelled, fetchBlobAsync has no hook for it; the completion handler tidies that up.)
@@ -210,20 +225,20 @@ public class WarmFullFileManager {
         // Single-chunk guard. Eligibility already excludes these; this also covers a
         // local directory configured with a smaller chunk size. Checked before taking a slot or reserving bytes.
         if (length >= maxChunkSize(st.localDirectory())) {
-            decline(st, "file of " + length + " bytes exceeds the mmap chunk size");
+            decline(st, DeclineReason.TOO_LARGE, "file of " + length + " bytes exceeds the mmap chunk size");
             return;
         }
 
         // Admission: a free slot AND the per-segment whole-file budget.
         if (slots.tryAcquire() == false) {
-            decline(st, "no free download slot");
+            decline(st, DeclineReason.NO_SLOT, "no free download slot");
             return;
         }
         boolean bytesReserved = false;
         try {
             if (reserveSegmentBytes(segment, length, cap) == false) {
                 slots.release(); // the slot was taken above; give it back or every budget decline leaks one
-                decline(st, "per-segment whole-file budget exceeded");
+                decline(st, DeclineReason.BUDGET_EXCEEDED, "per-segment whole-file budget exceeded");
                 return;
             }
             bytesReserved = true;
@@ -247,34 +262,37 @@ public class WarmFullFileManager {
 
             BlobFetchRequest request = buildRequest(st, length);
             beforeDownloadHook.run();
+            final long startedAt = clock.getAsLong();
+            started.incrementAndGet();
             CompletableFuture<IndexInput> future = st.transferManager().fetchBlobAsync(request);
             // Ownership of slot + reserved bytes passes to the completion handler; do not release them here.
             bytesReserved = false;
             // The future's value is the cache entry's own (non-clone) input; it must NOT be closed here (closing it
             // would close the entry's master input). The family serves from its own mapping opened below.
-            future.whenComplete((indexInput, throwable) -> onDownloadComplete(st, segment, length, throwable));
+            future.whenComplete((indexInput, throwable) -> onDownloadComplete(st, segment, length, startedAt, throwable));
         } catch (Exception e) {
             logger.warn("whole-file promotion failed to start for {}", path, e);
             if (bytesReserved) {
                 releaseSegmentBytes(segment, length);
             }
             slots.release();
-            decline(st, "exception starting download: " + e.getMessage());
+            decline(st, DeclineReason.ERROR, "exception starting download: " + e.getMessage());
         }
     }
 
-    private void onDownloadComplete(FullFileState st, int segment, long length, Throwable throwable) {
+    private void onDownloadComplete(FullFileState st, int segment, long length, long startedAt, Throwable throwable) {
         final Path path = st.fullFilePath();
         boolean refTaken = false;
         try {
             if (throwable != null) {
-                failPromotion(st, segment, length, "download failed: " + throwable.getMessage());
+                failPromotion(st, segment, length, DeclineReason.DOWNLOAD_FAILED, "download failed: " + throwable.getMessage());
                 return;
             }
+            downloadedBytes.addAndGet(length);
             // fetchBlobAsync releases its own reference on success; take the family's reference now.
             CachedIndexInput entry = fileCache.get(path);
             if (entry == null) {
-                failPromotion(st, segment, length, "entry evicted before FULL");
+                failPromotion(st, segment, length, DeclineReason.ENTRY_EVICTED, "entry evicted before FULL");
                 return;
             }
             refTaken = true;
@@ -284,7 +302,7 @@ public class WarmFullFileManager {
                 // Remove the entry (closes it and deletes the truncated file). Without this, the completed
                 // DelayedCreation entry stays live and the next retry reuses the same truncated file and fails again.
                 fileCache.remove(path);
-                failPromotion(st, segment, length, "downloaded length mismatch");
+                failPromotion(st, segment, length, DeclineReason.LENGTH_MISMATCH, "downloaded length mismatch");
                 return;
             }
             // Open the family's OWN mapping with the RANDOM hint (do not reuse the cache entry's input).
@@ -328,17 +346,29 @@ public class WarmFullFileManager {
                 releaseSegmentBytes(segment, length);
                 slots.release();
                 if (st.state() != FullFileState.State.FULL) {
-                    decline(st, "family closed during publish");
+                    decline(st, DeclineReason.FAMILY_CLOSED, "family closed during publish");
                 }
                 return;
             }
             slots.release();
-            logger.debug("promoted whole file to FULL: {}", path);
+            final long elapsedMillis = clock.getAsLong() - startedAt;
+            promoted.incrementAndGet();
+            promotedBytes.addAndGet(length);
+            downloadMillis.addAndGet(elapsedMillis);
+            logger.info(
+                "promoted [{}] to a whole file: {} bytes in {} ms ({} parts of {} bytes, cache segment {})",
+                path,
+                length,
+                elapsedMillis,
+                partCount(length),
+                partSize,
+                segment
+            );
         } catch (Exception e) {
             if (refTaken) {
                 fileCache.decRef(path); // do not leak the family reference taken above
             }
-            failPromotion(st, segment, length, "exception publishing FULL: " + e.getMessage());
+            failPromotion(st, segment, length, DeclineReason.ERROR, "exception publishing FULL: " + e.getMessage());
         }
     }
 
@@ -371,12 +401,12 @@ public class WarmFullFileManager {
      *
      * <p>Logging: the cause is one operator setting (an extension the local directory serves with NIO), but it would
      * surface once per segment per shard, so only the first file of each extension is logged at WARN on this node;
-     * later files of that extension are logged at DEBUG by {@link #decline(FullFileState, String, long)}.
+     * later files of that extension are logged at DEBUG by {@link #decline(FullFileState, DeclineReason, String, long)}.
      */
     private void declinePermanently(FullFileState st, int segment, long length, String reason) {
         releaseSegmentBytes(segment, length);
         slots.release();
-        if (decline(st, reason, Long.MAX_VALUE)) {
+        if (decline(st, DeclineReason.NOT_MMAP, reason, Long.MAX_VALUE)) {
             String extension = extensionOf(st.fileName());
             if (permanentlyDeclinedExtensions.add(extension)) {
                 logger.warn(
@@ -393,33 +423,66 @@ public class WarmFullFileManager {
         }
     }
 
-    private void failPromotion(FullFileState st, int segment, long length, String reason) {
+    private void failPromotion(FullFileState st, int segment, long length, DeclineReason reason, String detail) {
         releaseSegmentBytes(segment, length);
         slots.release();
-        decline(st, reason);
+        decline(st, reason, detail);
     }
 
-    private void decline(FullFileState st, String reason) {
-        decline(st, reason, clock.getAsLong() + RETRY_DELAY_MILLIS);
+    private void decline(FullFileState st, DeclineReason reason, String detail) {
+        decline(st, reason, detail, clock.getAsLong() + RETRY_DELAY_MILLIS);
     }
 
     /**
-     * Returns the family to BLOCK with the given retry time. Sets {@code retryAt} BEFORE the CAS so a trigger racing
-     * this decline cannot start a new promotion in between.
+     * Returns the family to BLOCK with the given retry time and counts the decline under {@code reason}. Sets
+     * {@code retryAt} BEFORE the CAS so a trigger racing this decline cannot start a new promotion in between.
      *
      * @return true if the family went back to BLOCK; false if it closed meanwhile (then a WARN is logged:
      *         the slot and bytes were held for the whole download because fetchBlobAsync cannot be cancelled)
      */
-    private boolean decline(FullFileState st, String reason, long retryAt) {
+    private boolean decline(FullFileState st, DeclineReason reason, String detail, long retryAt) {
+        declinedByReason.incrementAndGet(reason.ordinal());
         st.setRetryAt(retryAt);
         if (st.casState(FullFileState.State.PROMOTING, FullFileState.State.BLOCK)) {
-            logger.debug("whole-file promotion declined ({}) for {}", reason, st.fullFilePath());
+            logger.debug("whole-file promotion declined ({}) for {}", detail, st.fullFilePath());
             return true;
         }
         if (st.state() == FullFileState.State.CLOSED) {
-            logger.warn("whole-file download for [{}] completed after its family closed ({})", st.fullFilePath(), reason);
+            logger.warn("whole-file download for [{}] completed after its family closed ({})", st.fullFilePath(), detail);
         }
         return false;
+    }
+
+    /**
+     * A snapshot of this node's promotion counters.
+     *
+     * @return the current counters
+     */
+    public WarmFullFileStats stats() {
+        Map<DeclineReason, Long> declined = new EnumMap<>(DeclineReason.class);
+        for (DeclineReason reason : DeclineReason.values()) {
+            declined.put(reason, declinedByReason.get(reason.ordinal()));
+        }
+        long[] reservedPerSegment = new long[segments];
+        for (int i = 0; i < segments; i++) {
+            reservedPerSegment[i] = perSegmentWholeFileBytes.get(i);
+        }
+        return new WarmFullFileStats(
+            requested.get(),
+            started.get(),
+            promoted.get(),
+            downloadedBytes.get(),
+            promotedBytes.get(),
+            downloadMillis.get(),
+            declined,
+            reservedPerSegment,
+            maxConcurrentDownloads - slots.availablePermits()
+        );
+    }
+
+    /** The number of parts a download of {@code length} bytes is split into. */
+    long partCount(long length) {
+        return (length + partSize - 1) / partSize;
     }
 
     /** The part of the name after the last dot (no leading dot); the whole name if it has no dot. */
