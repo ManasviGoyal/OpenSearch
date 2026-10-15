@@ -327,6 +327,58 @@ public class SwitchableIndexInputWrapperWholeFileTests extends TieredStorageBase
         handle.close();
     }
 
+    @org.opensearch.test.junit.annotations.TestLogging(value = "org.opensearch.storage.indexinput.SwitchableIndexInputWrapper:DEBUG", reason = "the request line is logged at DEBUG")
+    public void testTriggerLogsOneRequestWithTheThreadName() throws Exception {
+        syncLocalAndRemoteForFile(localDirectory, FILE_NAME);
+        SwitchableIndexInput in = new SwitchableIndexInput(
+            "switchable",
+            FILE_NAME,
+            getFilePath(localDirectory, FILE_NAME),
+            getFilePathSwitchable(localDirectory, FILE_NAME),
+            fileCache,
+            localDirectory,
+            remoteSegmentStoreDirectory,
+            transferManager,
+            true,
+            threadPool,
+            PREFETCH
+        );
+        FullFileState st = stateFor(in);
+        st.markRemoteMode();
+        RecordingExecutor exec = new RecordingExecutor();
+        SwitchableIndexInputWrapper handle = new SwitchableIndexInputWrapper("h", in, st, true, manager(exec, new AtomicLong()));
+        String loggerName = SwitchableIndexInputWrapper.class.getName();
+        String expected = "whole-file promotion requested for h on thread [" + Thread.currentThread().getName() + "]";
+        AtomicInteger seen = new AtomicInteger();
+        try (
+            org.opensearch.test.MockLogAppender appender = org.opensearch.test.MockLogAppender.createForLoggers(
+                org.apache.logging.log4j.LogManager.getLogger(SwitchableIndexInputWrapper.class)
+            )
+        ) {
+            appender.addExpectation(new org.opensearch.test.MockLogAppender.LoggingExpectation() {
+                @Override
+                public void match(org.apache.logging.log4j.core.LogEvent event) {
+                    if (event.getLevel() == org.apache.logging.log4j.Level.DEBUG
+                        && event.getLoggerName().equals(loggerName)
+                        && event.getMessage().getFormattedMessage().equals(expected)) {
+                        seen.incrementAndGet();
+                    }
+                }
+
+                @Override
+                public void assertMatched() {
+                    assertEquals("one request line for one promotion attempt", 1, seen.get());
+                }
+            });
+            handle.clone(); // wins the CAS: logged
+            handle.clone(); // PROMOTING: no CAS, no line
+            handle.slice("s", 0, Math.min(16, in.length()));
+            assertEquals(1, exec.submitted.get());
+            appender.assertAllExpectationsMatched();
+        }
+        handle.close();
+    }
+
     public void testIneligibleHandleNeverRequests() throws IOException {
         SwitchableIndexInput in = remoteModeInput();
         FullFileState st = stateFor(in);
