@@ -218,28 +218,40 @@ public class TieredDirectory extends CompositeDirectory {
         if (settings.isExtensionEligible(name.substring(dot + 1)) == false) {
             return false;
         }
+        // The extension is configured, so a rejection by a later rule is worth a line when debugging a node that never
+        // promotes. This runs once per openInput, never on a read.
+        String rejection = ineligibleReason(name, context, original);
+        if (rejection != null) {
+            logger.debug("whole-file promotion: [{}] opened with {} is not eligible: {}", name, context, rejection);
+            return false;
+        }
+        return true;
+    }
+
+    /** The rule that rejects a file whose extension is configured, or null when the file is eligible. */
+    private static String ineligibleReason(String name, IOContext context, SwitchableIndexInput original) {
         // Not an ordinary Lucene special file.
         if (FileTypeUtils.isSegmentsFile(name) || FileTypeUtils.isLockFile(name) || name.endsWith(".cfs")) {
-            return false;
+            return "segments, lock or compound file";
         }
         // A file of one block or less is already a single block; a whole copy gains nothing.
         if (original.length() <= ONE_BLOCK_BYTES) { // original input: offset 0, length == whole file length
-            return false;
+            return "length " + original.length() + " is at most one block";
         }
         // The mapping must be a single mmap chunk (Lucene's default chunk is 16 GiB). Above that,
         // closing a view could unmap the master and segmentSliceOrNull returns null (no k-NN SIMD), so do not promote.
         if (original.length() >= WarmFullFileManager.MAX_WHOLE_FILE_BYTES) {
-            return false;
+            return "length " + original.length() + " is not below the mmap chunk size";
         }
         // Only plain search reads: DEFAULT context (excludes MERGE/FLUSH) with no ReadOnce/SEQUENTIAL hint
         // (excludes recovery checksum reads via IOContext.READONCE).
         if (context.context() != IOContext.Context.DEFAULT) {
-            return false;
+            return "context is " + context.context();
         }
         if (context.hints().contains(ReadOnceHint.INSTANCE) || context.hints().contains(DataAccessHint.SEQUENTIAL)) {
-            return false;
+            return "read-once or sequential hint";
         }
-        return true;
+        return null;
     }
 
     @Override

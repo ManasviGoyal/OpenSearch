@@ -483,6 +483,56 @@ public class TieredDirectoryTests extends TieredStorageBaseTestCase {
         assertFalse("write.lock", dir.isEligibleForFullFile("write.lock", IOContext.DEFAULT, original));
     }
 
+    @org.opensearch.test.junit.annotations.TestLogging(value = "org.opensearch.storage.directory.TieredDirectory:DEBUG", reason = "the rejection line is logged at DEBUG")
+    public void testEligibilityRejectionOfConfiguredExtensionIsLoggedAtDebug() throws Exception {
+        TieredDirectory dir = directoryWith(() -> realSettings("faiss", "cfs"), null);
+        SwitchableIndexInput original = remoteOriginal(ONE_BLOCK_BYTES + 1);
+        String loggerName = TieredDirectory.class.getName();
+        try (
+            org.opensearch.test.MockLogAppender appender = org.opensearch.test.MockLogAppender.createForLoggers(
+                org.apache.logging.log4j.LogManager.getLogger(TieredDirectory.class)
+            )
+        ) {
+            appender.addExpectation(
+                new org.opensearch.test.MockLogAppender.SeenEventExpectation(
+                    "compound file rejection names the rule",
+                    loggerName,
+                    org.apache.logging.log4j.Level.DEBUG,
+                    "*[_0.cfs]*not eligible: segments, lock or compound file*"
+                )
+            );
+            appender.addExpectation(
+                new org.opensearch.test.MockLogAppender.SeenEventExpectation(
+                    "read-once rejection names the rule",
+                    loggerName,
+                    org.apache.logging.log4j.Level.DEBUG,
+                    "*[_0.faiss]*not eligible: read-once or sequential hint*"
+                )
+            );
+            appender.addExpectation(
+                new org.opensearch.test.MockLogAppender.UnseenEventExpectation(
+                    "an unconfigured extension is not logged",
+                    loggerName,
+                    org.apache.logging.log4j.Level.DEBUG,
+                    "*[_0.vec]*"
+                )
+            );
+            appender.addExpectation(
+                new org.opensearch.test.MockLogAppender.UnseenEventExpectation(
+                    "an eligible file is not logged",
+                    loggerName,
+                    org.apache.logging.log4j.Level.DEBUG,
+                    "*[_1.faiss]*"
+                )
+            );
+            assertFalse(dir.isEligibleForFullFile("_0.cfs", IOContext.DEFAULT, original));
+            assertFalse(dir.isEligibleForFullFile("_0.faiss", IOContext.READONCE, original));
+            assertFalse(dir.isEligibleForFullFile("_0.vec", IOContext.DEFAULT, original));
+            assertTrue(dir.isEligibleForFullFile("_1.faiss", IOContext.DEFAULT, original));
+            appender.assertAllExpectationsMatched();
+        }
+    }
+
     public void testEligibilityRequiresPlainDefaultReadContext() {
         TieredDirectory dir = directoryWith(() -> realSettings("faiss"), null);
         SwitchableIndexInput original = remoteOriginal(ONE_BLOCK_BYTES + 1);

@@ -185,6 +185,8 @@ public class SwitchableIndexInputWrapper extends FilterIndexInput implements Ran
             return;
         }
         if (st.casState(FullFileState.State.BLOCK, FullFileState.State.PROMOTING)) {
+            // Once per promotion attempt, not per clone or slice. The thread name shows what started it.
+            logger.debug("whole-file promotion requested for {} on thread [{}]", resourceDescription, Thread.currentThread().getName());
             try {
                 manager.executor().execute(() -> manager.promote(st));
             } catch (RuntimeException e) {
