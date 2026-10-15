@@ -280,6 +280,40 @@ public class TieredDirectoryTests extends TieredStorageBaseTestCase {
         triggerGarbageCollectionAndAssertClonesClosed(path);
     }
 
+    public void testFamilyIsMarkedRemoteAfterSyncAndAtCreationFromRemote() throws IOException {
+        // A family created for a just-written local file is not promotable; afterSyncToRemote marks it remote once the
+        // switch has completed. A family created for a file already in the remote store is promotable from the start.
+        populateData();
+        String localFile = "_0.si";
+        addFilesToDirectory(new String[] { localFile });
+        Path localKey = getFilePathSwitchable(localDirectory, localFile);
+        org.opensearch.index.store.remote.filecache.CachedIndexInput entry = fileCache.get(localKey);
+        try {
+            assertFalse("local-mode family not yet promotable", entry.fullFileState().isRemoteMode());
+        } finally {
+            fileCache.decRef(localKey);
+        }
+
+        tieredDirectory.afterSyncToRemote(localFile);
+
+        entry = fileCache.get(localKey);
+        try {
+            assertTrue("marked remote once the switch completed", entry.fullFileState().isRemoteMode());
+        } finally {
+            fileCache.decRef(localKey);
+        }
+
+        IndexInput remoteHandle = tieredDirectory.openInput(FILE_PRESENT_IN_REMOTE_ONLY, IOContext.DEFAULT);
+        Path remoteKey = getFilePathSwitchable(localDirectory, FILE_PRESENT_IN_REMOTE_ONLY);
+        entry = fileCache.get(remoteKey);
+        try {
+            assertTrue("family created from remote is promotable at once", entry.fullFileState().isRemoteMode());
+        } finally {
+            fileCache.decRef(remoteKey);
+        }
+        remoteHandle.close();
+    }
+
     public void testAfterSyncToRemote() throws IOException {
         populateData();
         String fileName = "_0.si";

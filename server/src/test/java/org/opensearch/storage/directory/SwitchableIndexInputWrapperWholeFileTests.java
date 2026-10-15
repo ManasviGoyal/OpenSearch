@@ -116,7 +116,7 @@ public class SwitchableIndexInputWrapperWholeFileTests extends TieredStorageBase
     }
 
     private FullFileState stateFor(SwitchableIndexInput in) {
-        return new FullFileState(
+        FullFileState state = new FullFileState(
             transferManager,
             localDirectory,
             remoteSegmentStoreDirectory,
@@ -125,6 +125,10 @@ public class SwitchableIndexInputWrapperWholeFileTests extends TieredStorageBase
             in.length(),
             getFilePath(localDirectory, FILE_NAME)
         );
+        if (in.hasSwitchedToRemote()) {
+            state.markRemoteMode(); // as CachedSwitchableIndexInput does for a family created from remote
+        }
+        return state;
     }
 
     private WarmFullFileManager manager(Executor executor, AtomicLong clock) {
@@ -228,6 +232,7 @@ public class SwitchableIndexInputWrapperWholeFileTests extends TieredStorageBase
                 len,
                 getFilePath(localDirectory, FILE_NAME)
             );
+            st.markRemoteMode(); // the file is already in the remote store, as CachedSwitchableIndexInput would record
             AtomicLong clock = new AtomicLong(0);
             WarmFullFileManager mgr = new WarmFullFileManager(fileCache, Runnable::run, clock::get, 8);
             SwitchableIndexInputWrapper handle = new SwitchableIndexInputWrapper("h", in, st, true, mgr);
@@ -306,9 +311,18 @@ public class SwitchableIndexInputWrapperWholeFileTests extends TieredStorageBase
         assertEquals(FullFileState.State.BLOCK, st.state());
 
         in.switchToRemote();
-
+        assertTrue(in.hasSwitchedToRemote());
         handle.clone();
-        assertEquals("the first clone after the switch requests promotion", 1, exec.submitted.get());
+        assertEquals(
+            "the input's own flag is not enough: the family is not marked remote until the switch has finished",
+            0,
+            exec.submitted.get()
+        );
+        assertEquals(FullFileState.State.BLOCK, st.state());
+
+        st.markRemoteMode(); // what TieredDirectory.afterSyncToRemote does once switchFileToRemote has returned
+        handle.clone();
+        assertEquals("the first clone after the family is marked remote requests promotion", 1, exec.submitted.get());
         assertEquals(FullFileState.State.PROMOTING, st.state());
         handle.close();
     }
@@ -856,6 +870,7 @@ public class SwitchableIndexInputWrapperWholeFileTests extends TieredStorageBase
             len,
             getFilePath(localDirectory, FILE_NAME)
         );
+        st.markRemoteMode(); // the file is already in the remote store, as CachedSwitchableIndexInput would record
         ExecutorService promoter = Executors.newSingleThreadExecutor(r -> new Thread(r, promotionThread));
         try {
             SwitchableIndexInputWrapper handle = new SwitchableIndexInputWrapper("h", in, st, true, manager(promoter, new AtomicLong()));

@@ -251,6 +251,26 @@ public class TieredDirectory extends CompositeDirectory {
 
         // perform the full file to block switch for the switchable index input (currently called here for testing)
         switchFileToRemote(file);
+
+        // Only now may whole-file promotion start for this family: the original and every clone are in remote mode and
+        // the local copy has been removed, so a download can no longer overlap that removal.
+        markFamilyRemote(file);
+    }
+
+    private void markFamilyRemote(String file) {
+        Path key = getFilePathSwitchable(localDirectory, file);
+        CachedIndexInput entry = fileCache.get(key);
+        if (entry == null) {
+            return;
+        }
+        try {
+            FullFileState fullFileState = entry.fullFileState();
+            if (fullFileState != null) {
+                fullFileState.markRemoteMode();
+            }
+        } finally {
+            fileCache.decRef(key);
+        }
     }
 
     @Override
