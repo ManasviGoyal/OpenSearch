@@ -77,6 +77,9 @@ public class WarmFullFileManager {
     private final AtomicLongArray perSegmentWholeFileBytes;
     // Extensions already reported as permanently declined on this node (one WARN per extension, DEBUG per file after).
     private final Set<String> permanentlyDeclinedExtensions = ConcurrentHashMap.newKeySet();
+    // Runs on the promotion executor after admission (slot and budget held) and before the first remote read.
+    // No-op in production; tests install a blocking hook to hold a download at a known point.
+    private volatile Runnable beforeDownloadHook = () -> {};
 
     /** A monotonic millisecond clock (injectable for tests). */
     @FunctionalInterface
@@ -172,6 +175,17 @@ public class WarmFullFileManager {
         return executor;
     }
 
+    /**
+     * Installs a hook that {@link #promote} runs once per download, on the promotion executor, after the slot and the
+     * budget are held and before the first remote read. Visible for testing: a blocking hook holds a download at that
+     * point so a test can act (close the shard, delete the index) while a promotion is in flight. Not for production use.
+     *
+     * @param hook the hook; null restores the no-op
+     */
+    public void setBeforeDownloadHook(Runnable hook) {
+        this.beforeDownloadHook = hook == null ? () -> {} : hook;
+    }
+
     /** @return the current monotonic time in millis (for the wrapper's retryAt comparison) */
     public long relativeTimeInMillis() {
         return clock.getAsLong();
@@ -232,6 +246,7 @@ public class WarmFullFileManager {
             }
 
             BlobFetchRequest request = buildRequest(st, length);
+            beforeDownloadHook.run();
             CompletableFuture<IndexInput> future = st.transferManager().fetchBlobAsync(request);
             // Ownership of slot + reserved bytes passes to the completion handler; do not release them here.
             bytesReserved = false;
@@ -294,13 +309,27 @@ public class WarmFullFileManager {
             // Attach the teardown, then publish localMaster, then CAS to FULL (all three before the CAS). If the family
             // closes after the CAS, closeFamily() releases the budget and the deferred cleanup unmaps + decRefs.
             st.attachCleanup(executor, () -> releaseSegmentBytes(segment, length), () -> scheduleStuckHandleWarning(st));
-            st.setLocalMaster(master);
-            if (st.casState(FullFileState.State.PROMOTING, FullFileState.State.FULL) == false) {
-                // Family closed while we were publishing (closeFamily saw PROMOTING, so it owes no cleanup); unwind.
+            if (st.compareAndSetLocalMaster(null, master) == false) {
+                // Another completion handler for this family already installed its mapping (two promote() calls joined
+                // the same download). Keep theirs and unwind only what this handler holds.
                 closeQuietly(master);
-                st.setLocalMaster(null);
                 fileCache.decRef(path);
-                failPromotion(st, segment, length, "family closed during publish");
+                releaseSegmentBytes(segment, length);
+                slots.release();
+                logger.debug("whole-file mapping for {} was already published by another completion", path);
+                return;
+            }
+            if (st.casState(FullFileState.State.PROMOTING, FullFileState.State.FULL) == false) {
+                // The family closed while we were publishing (closeFamily saw PROMOTING, so it owes no cleanup). Unwind
+                // this handler's own mapping only; never touch a mapping installed by someone else.
+                closeQuietly(master);
+                st.compareAndSetLocalMaster(master, null);
+                fileCache.decRef(path);
+                releaseSegmentBytes(segment, length);
+                slots.release();
+                if (st.state() != FullFileState.State.FULL) {
+                    decline(st, "family closed during publish");
+                }
                 return;
             }
             slots.release();

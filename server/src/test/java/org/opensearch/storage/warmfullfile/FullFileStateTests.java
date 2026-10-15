@@ -26,6 +26,22 @@ public class FullFileStateTests extends OpenSearchTestCase {
         assertEquals(0L, st.retryAt());
     }
 
+    public void testCompareAndSetLocalMasterInstallsOnceAndClearsOnlyTheInstalledMapping() throws Exception {
+        FullFileState st = newState();
+        try (
+            org.apache.lucene.store.IndexInput first = new org.opensearch.common.lucene.store.ByteArrayIndexInput("first", new byte[4]);
+            org.apache.lucene.store.IndexInput second = new org.opensearch.common.lucene.store.ByteArrayIndexInput("second", new byte[4])
+        ) {
+            assertTrue("first publish installs", st.compareAndSetLocalMaster(null, first));
+            assertFalse("second publish is rejected while one is installed", st.compareAndSetLocalMaster(null, second));
+            assertSame(first, st.localMaster());
+            assertFalse("a handler cannot clear a mapping it did not install", st.compareAndSetLocalMaster(second, null));
+            assertSame(first, st.localMaster());
+            assertTrue("the installer can clear its own mapping", st.compareAndSetLocalMaster(first, null));
+            assertNull(st.localMaster());
+        }
+    }
+
     public void testCasTransitions() {
         FullFileState st = newState();
         assertTrue(st.casState(FullFileState.State.BLOCK, FullFileState.State.PROMOTING));
