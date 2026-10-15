@@ -8,6 +8,8 @@
 
 package org.opensearch.remotestore;
 
+import org.apache.lucene.store.Directory;
+import org.apache.lucene.store.FilterDirectory;
 import org.opensearch.action.admin.cluster.remotestore.restore.RestoreRemoteStoreRequest;
 import org.opensearch.action.admin.cluster.repositories.get.GetRepositoriesRequest;
 import org.opensearch.action.admin.cluster.repositories.get.GetRepositoriesResponse;
@@ -34,6 +36,7 @@ import org.opensearch.index.IndexService;
 import org.opensearch.index.IndexSettings;
 import org.opensearch.index.mapper.MapperService;
 import org.opensearch.index.shard.IndexShard;
+import org.opensearch.index.store.CompositeDirectory;
 import org.opensearch.indices.IndicesService;
 import org.opensearch.indices.RemoteStoreSettings;
 import org.opensearch.indices.replication.common.ReplicationType;
@@ -43,6 +46,7 @@ import org.opensearch.remotestore.multipart.mocks.MockFsRepositoryPlugin;
 import org.opensearch.repositories.RepositoriesService;
 import org.opensearch.repositories.blobstore.BlobStoreRepository;
 import org.opensearch.repositories.fs.ReloadableFsRepository;
+import org.opensearch.storage.directory.TieredDirectory;
 import org.opensearch.test.OpenSearchIntegTestCase;
 import org.junit.After;
 
@@ -70,6 +74,45 @@ import static org.opensearch.repositories.fs.ReloadableFsRepository.REPOSITORIES
 import static org.opensearch.test.hamcrest.OpenSearchAssertions.assertAcked;
 
 public class RemoteStoreBaseIntegTestCase extends OpenSearchIntegTestCase {
+
+    /**
+     * Walks the {@link FilterDirectory} chain of a shard's store directory down to its {@link CompositeDirectory}.
+     *
+     * @throws IllegalArgumentException if no CompositeDirectory is in the chain
+     */
+    protected static CompositeDirectory unwrapToCompositeDirectory(Directory directory) {
+        Directory current = directory;
+        while (current instanceof FilterDirectory) {
+            if (current instanceof CompositeDirectory) {
+                return (CompositeDirectory) current;
+            }
+            current = ((FilterDirectory) current).getDelegate();
+        }
+        if (current instanceof CompositeDirectory) {
+            return (CompositeDirectory) current;
+        }
+        throw new IllegalArgumentException("Expected CompositeDirectory but got: " + directory.getClass().getName());
+    }
+
+    /**
+     * Walks the {@link FilterDirectory} chain of a shard's store directory down to its {@link TieredDirectory}.
+     *
+     * @throws IllegalArgumentException if no TieredDirectory is in the chain
+     */
+    protected static TieredDirectory unwrapToTieredDirectory(Directory directory) {
+        Directory current = directory;
+        while (current instanceof FilterDirectory) {
+            if (current instanceof TieredDirectory) {
+                return (TieredDirectory) current;
+            }
+            current = ((FilterDirectory) current).getDelegate();
+        }
+        if (current instanceof TieredDirectory) {
+            return (TieredDirectory) current;
+        }
+        throw new IllegalArgumentException("Expected TieredDirectory but got: " + directory.getClass().getName());
+    }
+
     protected static final String REPOSITORY_NAME = "test-remote-store-repo";
     protected static final String REPOSITORY_2_NAME = "test-remote-store-repo-2";
     protected static final String REPOSITORY_3_NAME = "test-remote-store-repo-3";

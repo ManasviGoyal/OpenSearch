@@ -11,7 +11,6 @@ package org.opensearch.storage;
 import com.carrotsearch.randomizedtesting.annotations.ThreadLeakFilters;
 
 import org.apache.lucene.store.Directory;
-import org.apache.lucene.store.FilterDirectory;
 import org.opensearch.action.admin.indices.close.CloseIndexRequest;
 import org.opensearch.action.admin.indices.close.CloseIndexResponse;
 import org.opensearch.action.admin.indices.delete.DeleteIndexRequest;
@@ -194,42 +193,6 @@ public class WarmIndexBasicIT extends RemoteStoreBaseIntegTestCase {
 
         // Deleting the index to avoid any file leaks
         assertAcked(client().admin().indices().delete(new DeleteIndexRequest(INDEX_NAME)).get());
-    }
-
-    /**
-     * Unwraps the directory chain (walking through FilterDirectory wrappers including
-     * BucketedCompositeDirectory) to find the underlying CompositeDirectory.
-     */
-    private static Directory unwrapToCompositeDirectory(Directory directory) {
-        Directory current = directory;
-        while (current instanceof FilterDirectory) {
-            if (current instanceof CompositeDirectory) {
-                return current;
-            }
-            current = ((FilterDirectory) current).getDelegate();
-        }
-        if (current instanceof CompositeDirectory) {
-            return current;
-        }
-        throw new IllegalArgumentException("Expected CompositeDirectory but got: " + directory.getClass().getName());
-    }
-
-    /**
-     * Unwraps the directory chain (walking through FilterDirectory wrappers including
-     * BucketedCompositeDirectory) to find the underlying TieredDirectory.
-     */
-    private static TieredDirectory unwrapToTieredDirectory(Directory directory) {
-        Directory current = directory;
-        while (current instanceof FilterDirectory) {
-            if (current instanceof TieredDirectory) {
-                return (TieredDirectory) current;
-            }
-            current = ((FilterDirectory) current).getDelegate();
-        }
-        if (current instanceof TieredDirectory) {
-            return (TieredDirectory) current;
-        }
-        throw new IllegalArgumentException("Expected TieredDirectory but got: " + directory.getClass().getName());
     }
 
     protected long getDocCount(String indexName) {

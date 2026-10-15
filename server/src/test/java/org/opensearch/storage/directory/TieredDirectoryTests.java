@@ -466,13 +466,16 @@ public class TieredDirectoryTests extends TieredStorageBaseTestCase {
         );
     }
 
-    public void testEligibilityRequiresRemoteMode() {
+    public void testEligibilityDoesNotDependOnRemoteModeAtOpen() {
+        // A handle opened while the file is still local (e.g. by the searcher at refresh time, before the upload) is
+        // eligible; whether the file has switched to remote mode is checked by the wrapper when a clone or slice is
+        // taken, so the handle becomes promotable after the upload without being reopened.
         TieredDirectory dir = directoryWith(() -> realSettings("faiss"), null);
         SwitchableIndexInput local = mock(SwitchableIndexInput.class);
         when(local.length()).thenReturn(ONE_BLOCK_BYTES + 1);
         when(local.hasSwitchedToRemote()).thenReturn(false);
 
-        assertFalse("local (not yet uploaded) file", dir.isEligibleForFullFile(FAISS_FILE, IOContext.DEFAULT, local));
+        assertTrue("local (not yet uploaded) file", dir.isEligibleForFullFile(FAISS_FILE, IOContext.DEFAULT, local));
         assertTrue(
             "same file once in remote mode",
             dir.isEligibleForFullFile(FAISS_FILE, IOContext.DEFAULT, remoteOriginal(ONE_BLOCK_BYTES + 1))
