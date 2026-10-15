@@ -66,6 +66,10 @@ public final class FullFileState {
     }
 
     private final AtomicReference<State> state = new AtomicReference<>(State.BLOCK);
+    // True once the family's file is served from the remote store and its local copy is gone: set at construction for
+    // a family created from remote, otherwise by TieredDirectory.afterSyncToRemote after switchToRemote has returned.
+    // The trigger reads this, not an individual input's flag, so a promotion can never overlap the local-copy removal.
+    private volatile boolean remoteMode;
     private final AtomicReference<IndexInput> localMaster = new AtomicReference<>();
     private volatile long retryAt;
     private final AtomicInteger handleCount = new AtomicInteger(0);
@@ -114,6 +118,19 @@ public final class FullFileState {
         this.fileName = fileName;
         this.fileLength = fileLength;
         this.fullFilePath = fullFilePath;
+    }
+
+    /**
+     * Marks the family as served from the remote store. Called once the switch to remote mode has completed for the
+     * original and all of its clones and the local copy has been removed; remote mode is final, so this is never reset.
+     */
+    public void markRemoteMode() {
+        remoteMode = true;
+    }
+
+    /** @return true once the family is in remote (block) mode and may be promoted */
+    public boolean isRemoteMode() {
+        return remoteMode;
     }
 
     /** @return the current lifecycle state */

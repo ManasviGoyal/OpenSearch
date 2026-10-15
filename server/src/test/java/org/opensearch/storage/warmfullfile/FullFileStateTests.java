@@ -42,6 +42,16 @@ public class FullFileStateTests extends OpenSearchTestCase {
         }
     }
 
+    public void testRemoteModeIsOffUntilMarkedAndThenFinal() {
+        FullFileState st = newState();
+        assertFalse("a new family is not promotable until marked remote", st.isRemoteMode());
+        st.markRemoteMode();
+        assertTrue(st.isRemoteMode());
+        st.markRemoteMode();
+        assertTrue("marking is idempotent and never resets", st.isRemoteMode());
+        assertEquals("remote mode is independent of the promotion state", FullFileState.State.BLOCK, st.state());
+    }
+
     public void testCasTransitions() {
         FullFileState st = newState();
         assertTrue(st.casState(FullFileState.State.BLOCK, FullFileState.State.PROMOTING));

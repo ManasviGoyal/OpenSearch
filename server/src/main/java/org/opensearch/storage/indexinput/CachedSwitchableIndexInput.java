@@ -71,6 +71,11 @@ public class CachedSwitchableIndexInput implements CachedIndexInput {
             switchableIndexInput.fileLength(),
             getFilePath(localDirectory, fileName)
         );
+        if (cacheFromRemote) {
+            // Created for a file that is already in the remote store: promotable from the start. A family created for a
+            // just-written local file is marked remote by TieredDirectory.afterSyncToRemote once the switch completes.
+            this.fullFileState.markRemoteMode();
+        }
     }
 
     /**

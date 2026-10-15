@@ -174,10 +174,11 @@ public class SwitchableIndexInputWrapper extends FilterIndexInput implements Ran
             return;
         }
         // Remote mode is checked here rather than when the handle was opened: a handle opened at refresh time, before
-        // the upload, becomes promotable once switchToRemote has run. A not-yet-uploaded local file must never be
-        // promoted, because switchToRemote deletes the local copy. Remote mode is final, so a trigger that observes it
-        // cannot race that deletion.
-        if (switchableIndexInput.hasSwitchedToRemote() == false) {
+        // the upload, becomes promotable once the family has switched to remote. The family flag is set only after the
+        // switch has completed for the original and all clones and the local copy has been removed (an individual
+        // input's own flag flips earlier, while the switch is still in progress), so a promotion can never overlap the
+        // removal of the local copy. Remote mode is final.
+        if (st.isRemoteMode() == false) {
             return;
         }
         if (st.state() != FullFileState.State.BLOCK || manager.relativeTimeInMillis() < st.retryAt()) {
