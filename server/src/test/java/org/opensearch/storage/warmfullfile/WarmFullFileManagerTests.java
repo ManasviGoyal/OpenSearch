@@ -1025,4 +1025,154 @@ public class WarmFullFileManagerTests extends OpenSearchTestCase {
         }
         assertEquals(4 * callers, laterReader.readCount());
     }
+    // ---------- stats() and the promotion INFO line ----------
+
+    public void testStatsCountPromotionAndMeasureDownloadTimeAndLogAtInfo() throws Exception {
+        long length = 4096;
+        String name = "_stats.faiss";
+        CountDownLatch release = new CountDownLatch(1);
+        PositionDependentStreamReader reader = new PositionDependentStreamReader();
+        FileCache fileCache = FileCacheFactory.createConcurrentLRUFileCache(10_000_000, 1);
+        TransferManager tm = new TransferManager(blockingReader(release, reader), fileCache, threadPool);
+        AtomicLong clock = new AtomicLong(5_000);
+        WarmFullFileManager mgr = new WarmFullFileManager(fileCache, Runnable::run, clock::get, 2, 0.5, 1, 1024);
+
+        WarmFullFileStats before = mgr.stats();
+        assertEquals(0L, before.promoted());
+        assertEquals(0L, before.totalDeclined());
+        assertEquals(0L, before.reservedBytes());
+        assertEquals(0, before.activeDownloads());
+        assertEquals("every reason is present", WarmFullFileStats.DeclineReason.values().length, before.declined().size());
+
+        String loggerName = WarmFullFileManager.class.getName();
+        try (
+            org.opensearch.test.MockLogAppender appender = org.opensearch.test.MockLogAppender.createForLoggers(
+                org.apache.logging.log4j.LogManager.getLogger(WarmFullFileManager.class)
+            )
+        ) {
+            appender.addExpectation(
+                new org.opensearch.test.MockLogAppender.SeenEventExpectation(
+                    "INFO line with bytes, time and parts",
+                    loggerName,
+                    org.apache.logging.log4j.Level.INFO,
+                    "promoted [*" + name + "] to a whole file: 4096 bytes in 250 ms (4 parts of 1024 bytes, cache segment 0)"
+                )
+            );
+            FullFileState st = newState(tm, fileCache, name, length);
+            assertTrue(st.casState(FullFileState.State.BLOCK, FullFileState.State.PROMOTING));
+            mgr.promote(st); // the reader blocks on the latch, so the download is in flight
+
+            WarmFullFileStats inFlight = mgr.stats();
+            assertEquals("slot held while downloading", 1, inFlight.activeDownloads());
+            assertEquals("bytes reserved while downloading", length, inFlight.reservedBytes());
+            assertEquals(0L, inFlight.promoted());
+
+            clock.addAndGet(250); // all download time passes before the first byte is served
+            release.countDown();
+            awaitState(st, FullFileState.State.FULL);
+
+            // The counters and the INFO line follow the state change to FULL, so poll for them.
+            assertBusy(() -> {
+                WarmFullFileStats after = mgr.stats();
+                assertEquals(1L, after.requested());
+                assertEquals(1L, after.started());
+                assertEquals(1L, after.promoted());
+                assertEquals(0L, after.failed());
+                assertEquals(length, after.downloadedBytes());
+                assertEquals(length, after.promotedBytes());
+                assertArrayEquals("one segment, the file's bytes", new long[] { length }, after.reservedBytesPerSegment());
+                assertEquals("download time is measured with the manager clock", 250L, after.downloadMillis());
+                assertEquals("FULL keeps the budget reserved", length, after.reservedBytes());
+                assertEquals("slot released at FULL", 0, after.activeDownloads());
+                assertEquals(0L, after.totalDeclined());
+                appender.assertAllExpectationsMatched();
+            }, 10, TimeUnit.SECONDS);
+        }
+    }
+
+    public void testStatsCountDeclinesByReason() throws Exception {
+        long length = 4096;
+        FileCache fileCache = FileCacheFactory.createConcurrentLRUFileCache(10_000_000, 1);
+        PositionDependentStreamReader reader = new PositionDependentStreamReader();
+        TransferManager tm = new TransferManager(reader, fileCache, threadPool);
+
+        // Budget: fraction 0 declines every file before any read.
+        WarmFullFileManager budgetMgr = new WarmFullFileManager(fileCache, Runnable::run, new AtomicLong()::get, 4, 0.0, 1, 1024);
+        FullFileState overBudget = newState(tm, fileCache, "_budget.faiss", length);
+        assertTrue(overBudget.casState(FullFileState.State.BLOCK, FullFileState.State.PROMOTING));
+        budgetMgr.promote(overBudget);
+        assertEquals(FullFileState.State.BLOCK, overBudget.state());
+        assertEquals(1L, budgetMgr.stats().declined().get(WarmFullFileStats.DeclineReason.BUDGET_EXCEEDED).longValue());
+        assertEquals(1L, budgetMgr.stats().totalDeclined());
+        assertEquals("requested but never started", 1L, budgetMgr.stats().requested());
+        assertEquals(0L, budgetMgr.stats().started());
+        assertEquals("an admission decline is not a failure", 0L, budgetMgr.stats().failed());
+
+        WarmFullFileManager mgr = new WarmFullFileManager(fileCache, Runnable::run, new AtomicLong()::get, 4, 0.5, 1, 1024);
+
+        // Too large: at the mmap chunk size, declined before taking a slot or reserving bytes.
+        FullFileState huge = newState(tm, fileCache, "_huge.faiss", WarmFullFileManager.MAX_WHOLE_FILE_BYTES);
+        assertTrue(huge.casState(FullFileState.State.BLOCK, FullFileState.State.PROMOTING));
+        mgr.promote(huge);
+        assertEquals(FullFileState.State.BLOCK, huge.state());
+
+        // Not mmap: an NIO-served directory, declined permanently after the download.
+        try (org.apache.lucene.store.NIOFSDirectory nio = new org.apache.lucene.store.NIOFSDirectory(dir)) {
+            FullFileState onNio = new FullFileState(tm, nio, null, fileCache, "_nio.faiss", length, dir.resolve("_nio.faiss"));
+            assertTrue(onNio.casState(FullFileState.State.BLOCK, FullFileState.State.PROMOTING));
+            mgr.promote(onNio);
+            assertBusy(() -> assertEquals(Long.MAX_VALUE, onNio.retryAt()), 10, TimeUnit.SECONDS);
+        }
+
+        // Download failed: the second part read throws.
+        TransferManager failingTm = new TransferManager(new FailingPartStreamReader(2), fileCache, threadPool);
+        FullFileState failing = newState(failingTm, fileCache, "_failing.faiss", length);
+        assertTrue(failing.casState(FullFileState.State.BLOCK, FullFileState.State.PROMOTING));
+        mgr.promote(failing);
+        awaitState(failing, FullFileState.State.BLOCK);
+
+        WarmFullFileStats stats = mgr.stats();
+        assertEquals(1L, stats.declined().get(WarmFullFileStats.DeclineReason.TOO_LARGE).longValue());
+        assertEquals(1L, stats.declined().get(WarmFullFileStats.DeclineReason.NOT_MMAP).longValue());
+        assertEquals(1L, stats.declined().get(WarmFullFileStats.DeclineReason.DOWNLOAD_FAILED).longValue());
+        assertEquals(0L, stats.declined().get(WarmFullFileStats.DeclineReason.NO_SLOT).longValue());
+        assertEquals(3L, stats.totalDeclined());
+        assertEquals("three promote() calls", 3L, stats.requested());
+        assertEquals("the too-large file never started a download", 2L, stats.started());
+        assertEquals("NIO and the failed part both started and did not reach FULL", 2L, stats.failed());
+        assertEquals("only the NIO download completed", length, stats.downloadedBytes());
+        assertEquals("nothing promoted", 0L, stats.promoted());
+        assertEquals("every decline released its bytes", 0L, stats.reservedBytes());
+        assertEquals("every decline released its slot", 0, stats.activeDownloads());
+        assertNotNull(stats.toString());
+    }
+
+    public void testStatsCountNoSlotDecline() throws Exception {
+        long length = 4096;
+        FileCache fileCache = FileCacheFactory.createConcurrentLRUFileCache(10_000_000, 1);
+        CountDownLatch release = new CountDownLatch(1);
+        PositionDependentStreamReader reader = new PositionDependentStreamReader();
+        TransferManager tm = new TransferManager(blockingReader(release, reader), fileCache, threadPool);
+        WarmFullFileManager mgr = new WarmFullFileManager(fileCache, Runnable::run, new AtomicLong()::get, 1, 0.5, 1, 1024);
+
+        FullFileState holder = newState(tm, fileCache, "_holder.faiss", length);
+        assertTrue(holder.casState(FullFileState.State.BLOCK, FullFileState.State.PROMOTING));
+        mgr.promote(holder); // holds the only slot while the reader blocks
+        assertEquals(1, mgr.stats().activeDownloads());
+
+        FullFileState second = newState(tm, fileCache, "_second.faiss", length);
+        assertTrue(second.casState(FullFileState.State.BLOCK, FullFileState.State.PROMOTING));
+        mgr.promote(second);
+        assertEquals(FullFileState.State.BLOCK, second.state());
+        assertEquals(1L, mgr.stats().declined().get(WarmFullFileStats.DeclineReason.NO_SLOT).longValue());
+        assertEquals(2L, mgr.stats().requested());
+        assertEquals("only the holder started", 1L, mgr.stats().started());
+
+        release.countDown();
+        awaitState(holder, FullFileState.State.FULL);
+        assertBusy(() -> {
+            assertEquals(1L, mgr.stats().promoted());
+            assertEquals(0, mgr.stats().activeDownloads());
+        }, 10, TimeUnit.SECONDS);
+    }
 }
