@@ -56,8 +56,13 @@ public class WarmFullFileManager {
 
     /** Default download/read part size: one block (8 MiB), matching the block path. */
     static final long DEFAULT_PART_SIZE = 8L * 1024 * 1024;
-    /** Retry delay after a decline or failure. */
+    /** Retry delay after a failure or a budget decline. */
     static final long RETRY_DELAY_MILLIS = 60_000L;
+    /**
+     * Retry delay after a decline for lack of a free download slot. Short against a download, so a slot freed by a
+     * finishing download is reused quickly; each retry costs one semaphore attempt on a background thread.
+     */
+    static final long NO_SLOT_RETRY_DELAY_MILLIS = 5_000L;
     /** Whole-file bytes admitted per cache segment must stay at or below this fraction of the segment's capacity. */
     static final double DEFAULT_BUDGET_FRACTION = 0.5;
 
@@ -231,7 +236,7 @@ public class WarmFullFileManager {
 
         // Admission: a free slot AND the per-segment whole-file budget.
         if (slots.tryAcquire() == false) {
-            decline(st, DeclineReason.NO_SLOT, "no free download slot");
+            decline(st, DeclineReason.NO_SLOT, "no free download slot", clock.getAsLong() + NO_SLOT_RETRY_DELAY_MILLIS);
             return;
         }
         boolean bytesReserved = false;
