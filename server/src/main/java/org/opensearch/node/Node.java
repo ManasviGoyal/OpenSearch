@@ -1911,6 +1911,10 @@ public class Node implements Closeable {
                     b.bind(HotToWarmTieringService.class).asEagerSingleton();
                     b.bind(WarmToHotTieringService.class).asEagerSingleton();
                     b.bind(TierActionMetrics.class).toInstance(new TierActionMetrics(metricsRegistry));
+                    // Only warm nodes have a manager (it needs the node FileCache); Guice rejects a null instance.
+                    if (warmFullFileManager != null) {
+                        b.bind(WarmFullFileManager.class).toInstance(warmFullFileManager);
+                    }
                 }
             });
             injector = modules.createInjector();

@@ -37,7 +37,8 @@ import java.util.concurrent.atomic.AtomicReference;
  *   any --(family closes)--&gt;  CLOSED
  * </pre>
  *
- * The {@code localMaster} mapping is published (volatile) before the CAS to {@link State#FULL}. When the family
+ * The {@code localMaster} mapping is published (atomically, only if none is installed) before the CAS to
+ * {@link State#FULL}. When the family
  * closes while FULL ({@link #closeFamily()}), the budget is released at once, and the unmap plus the release of the
  * family's FileCache reference run exactly once, on the cleanup executor, after the last handle closes
  * ({@link #incHandles()}/{@link #decHandles()}). Whichever of "family closed" and "last handle closed" happens second
@@ -65,7 +66,7 @@ public final class FullFileState {
     }
 
     private final AtomicReference<State> state = new AtomicReference<>(State.BLOCK);
-    private volatile IndexInput localMaster;
+    private final AtomicReference<IndexInput> localMaster = new AtomicReference<>();
     private volatile long retryAt;
     private final AtomicInteger handleCount = new AtomicInteger(0);
 
@@ -139,7 +140,18 @@ public final class FullFileState {
 
     /** @return the local whole-file mapping, or null before promotion publishes it */
     public IndexInput localMaster() {
-        return localMaster;
+        return localMaster.get();
+    }
+
+    /**
+     * Atomically publishes or clears the mapping. The manager publishes with {@code (null, master)} so that only one
+     * completion handler can install a mapping for the family, and unwinds with {@code (master, null)} so that a handler
+     * can only clear the mapping it installed itself.
+     *
+     * @return true if the field held {@code expected} and now holds {@code update}
+     */
+    public boolean compareAndSetLocalMaster(IndexInput expected, IndexInput update) {
+        return localMaster.compareAndSet(expected, update);
     }
 
     /**
@@ -147,7 +159,7 @@ public final class FullFileState {
      * @param localMaster the family's own memory mapping
      */
     public void setLocalMaster(IndexInput localMaster) {
-        this.localMaster = localMaster;
+        this.localMaster.set(localMaster);
     }
 
     /** @return the earliest time (monotonic millis) a new promotion may be attempted */
@@ -251,8 +263,7 @@ public final class FullFileState {
     }
 
     private void runCleanup() {
-        IndexInput master = localMaster;
-        localMaster = null;
+        IndexInput master = localMaster.getAndSet(null);
         if (master != null) {
             try {
                 master.close(); // munmap: safe now, no handle (and so no view derived from one) remains

@@ -520,6 +520,102 @@ public class WarmFullFileManagerTests extends OpenSearchTestCase {
         awaitState(ok, FullFileState.State.FULL);
     }
 
+    public void testTwoCompletionsForOneFamilyKeepTheFirstMappingAndUnwindTheSecond() throws Exception {
+        // Two promote() calls for the same family join one in-flight download, so two completion handlers run for one
+        // completion. Exactly one mapping must be installed and kept; the other handler closes its own mapping and
+        // releases its own slot and budget without touching the installed one, the state ends FULL and retryAt is not
+        // set on a FULL family.
+        long length = 4096;
+        FileCache fileCache = FileCacheFactory.createConcurrentLRUFileCache(10_000_000, 1);
+        PositionDependentStreamReader reader = new PositionDependentStreamReader();
+        CountDownLatch release = new CountDownLatch(1);
+        TransferManager tm = new TransferManager(blockingReader(release, reader), fileCache, threadPool);
+        AtomicLong clock = new AtomicLong(1_000);
+        WarmFullFileManager mgr = new WarmFullFileManager(fileCache, Runnable::run, clock::get, 2, 0.5, 1, 1024);
+        Path path = dir.resolve("_twice.faiss");
+        FullFileState st = newState(tm, fileCache, "_twice.faiss", length);
+        assertTrue(st.casState(FullFileState.State.BLOCK, FullFileState.State.PROMOTING));
+
+        mgr.promote(st); // starts the download and holds slot 1
+        mgr.promote(st); // joins the in-flight download and holds slot 2
+        assertEquals("both calls reserved budget while in flight", 2 * length, mgr.perSegmentWholeFileBytes(0));
+        release.countDown();
+
+        awaitState(st, FullFileState.State.FULL);
+        assertBusy(() -> assertEquals("the losing handler released its budget", length, mgr.perSegmentWholeFileBytes(0)));
+        assertNotNull("the winning mapping is kept", st.localMaster());
+        assertArrayEquals(expectedBytes(length), readAll(st.localMaster(), length));
+        assertEquals("downloaded once", 4, reader.readCount());
+        assertEquals("exactly the family's reference", Integer.valueOf(1), fileCache.getRef(path));
+        assertEquals("no retry set on a FULL family", 0L, st.retryAt());
+
+        // Both slots are free again: two further families are admitted at the same time.
+        CountDownLatch release2 = new CountDownLatch(1);
+        TransferManager tm2 = new TransferManager(blockingReader(release2, new PositionDependentStreamReader()), fileCache, threadPool);
+        FullFileState a = newState(tm2, fileCache, "_a.faiss", length);
+        FullFileState b = newState(tm2, fileCache, "_b.faiss", length);
+        assertTrue(a.casState(FullFileState.State.BLOCK, FullFileState.State.PROMOTING));
+        assertTrue(b.casState(FullFileState.State.BLOCK, FullFileState.State.PROMOTING));
+        mgr.promote(a);
+        mgr.promote(b);
+        assertEquals("neither was declined for lack of a slot", FullFileState.State.PROMOTING, a.state());
+        assertEquals(FullFileState.State.PROMOTING, b.state());
+        release2.countDown();
+        awaitState(a, FullFileState.State.FULL);
+        awaitState(b, FullFileState.State.FULL);
+    }
+
+    public void testBeforeDownloadHookRunsOncePerDownloadAfterAdmissionAndBeforeAnyRead() throws Exception {
+        // A blocking hook holds the download at a known point: the slot and the budget are already held, nothing has
+        // been read from the remote store yet, and another family is declined for lack of a slot until the hook
+        // returns. The hook runs exactly once per download.
+        long length = 4096;
+        FileCache fileCache = FileCacheFactory.createConcurrentLRUFileCache(10_000_000, 1);
+        PositionDependentStreamReader reader = new PositionDependentStreamReader();
+        TransferManager tm = new TransferManager(reader, fileCache, threadPool);
+        AtomicLong clock = new AtomicLong(5_000);
+        WarmFullFileManager mgr = new WarmFullFileManager(fileCache, Runnable::run, clock::get, 1, 0.5, 1, 1024);
+        AtomicInteger hookRuns = new AtomicInteger();
+        CountDownLatch hookEntered = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        mgr.setBeforeDownloadHook(() -> {
+            hookRuns.incrementAndGet();
+            hookEntered.countDown();
+            try {
+                release.await();
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        });
+
+        FullFileState held = newState(tm, fileCache, "_held.faiss", length);
+        assertTrue(held.casState(FullFileState.State.BLOCK, FullFileState.State.PROMOTING));
+        threadPool.generic().execute(() -> mgr.promote(held));
+        assertTrue("hook entered", hookEntered.await(30, java.util.concurrent.TimeUnit.SECONDS));
+
+        assertEquals("nothing read while held", 0, reader.readCount());
+        assertEquals("budget held", length, mgr.perSegmentWholeFileBytes(0));
+        assertEquals(FullFileState.State.PROMOTING, held.state());
+        FullFileState other = newState(tm, fileCache, "_other.faiss", length);
+        assertTrue(other.casState(FullFileState.State.BLOCK, FullFileState.State.PROMOTING));
+        mgr.promote(other);
+        assertEquals("slot held, so the other family is declined", FullFileState.State.BLOCK, other.state());
+        assertEquals(5_000 + WarmFullFileManager.RETRY_DELAY_MILLIS, other.retryAt());
+        assertEquals("the declined family did not run the hook", 1, hookRuns.get());
+
+        release.countDown();
+        awaitState(held, FullFileState.State.FULL);
+        assertEquals("one download", 4, reader.readCount());
+        assertEquals("hook ran once for that download", 1, hookRuns.get());
+
+        mgr.setBeforeDownloadHook(null);
+        FullFileState plain = newState(tm, fileCache, "_plain.faiss", length);
+        assertTrue(plain.casState(FullFileState.State.BLOCK, FullFileState.State.PROMOTING));
+        mgr.promote(plain);
+        awaitState(plain, FullFileState.State.FULL);
+        assertEquals("no-op hook restored", 1, hookRuns.get());
+    }
+
     public void testExtensionOf() {
         assertEquals("faiss", WarmFullFileManager.extensionOf("_0.faiss"));
         assertEquals("veq", WarmFullFileManager.extensionOf("_0_Lucene104_0.veq"));
