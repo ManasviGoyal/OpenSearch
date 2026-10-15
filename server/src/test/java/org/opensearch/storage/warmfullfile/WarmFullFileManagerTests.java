@@ -600,7 +600,7 @@ public class WarmFullFileManagerTests extends OpenSearchTestCase {
         assertTrue(other.casState(FullFileState.State.BLOCK, FullFileState.State.PROMOTING));
         mgr.promote(other);
         assertEquals("slot held, so the other family is declined", FullFileState.State.BLOCK, other.state());
-        assertEquals(5_000 + WarmFullFileManager.RETRY_DELAY_MILLIS, other.retryAt());
+        assertEquals(5_000 + WarmFullFileManager.NO_SLOT_RETRY_DELAY_MILLIS, other.retryAt());
         assertEquals("the declined family did not run the hook", 1, hookRuns.get());
 
         release.countDown();
@@ -734,7 +734,7 @@ public class WarmFullFileManagerTests extends OpenSearchTestCase {
         mgr.promote(second);
 
         assertEquals("declined on the slot", FullFileState.State.BLOCK, second.state());
-        assertEquals(5_000 + WarmFullFileManager.RETRY_DELAY_MILLIS, second.retryAt());
+        assertEquals(5_000 + WarmFullFileManager.NO_SLOT_RETRY_DELAY_MILLIS, second.retryAt());
         assertEquals("only the first family's bytes are reserved", length, mgr.perSegmentWholeFileBytes(0));
         assertEquals("no remote read for the declined family", 0, secondReader.readCount());
         assertFalse("no file for the declined family", Files.exists(dir.resolve("_slot2.faiss")));
@@ -1147,6 +1147,37 @@ public class WarmFullFileManagerTests extends OpenSearchTestCase {
         assertNotNull(stats.toString());
     }
 
+    public void testNoSlotDeclineRetriesSoonerThanBudgetDecline() throws Exception {
+        long length = 4096;
+        FileCache fileCache = FileCacheFactory.createConcurrentLRUFileCache(10_000_000, 1);
+        CountDownLatch release = new CountDownLatch(1);
+        TransferManager tm = new TransferManager(blockingReader(release, new PositionDependentStreamReader()), fileCache, threadPool);
+        AtomicLong clock = new AtomicLong(1_000);
+        WarmFullFileManager mgr = new WarmFullFileManager(fileCache, Runnable::run, clock::get, 1, 0.5, 1, 1024);
+
+        FullFileState holder = newState(tm, fileCache, "_holder.faiss", length);
+        assertTrue(holder.casState(FullFileState.State.BLOCK, FullFileState.State.PROMOTING));
+        mgr.promote(holder); // holds the only slot while the reader blocks
+
+        FullFileState noSlot = newState(tm, fileCache, "_noslot.faiss", length);
+        assertTrue(noSlot.casState(FullFileState.State.BLOCK, FullFileState.State.PROMOTING));
+        mgr.promote(noSlot);
+        assertEquals(FullFileState.State.BLOCK, noSlot.state());
+        assertEquals(1_000 + WarmFullFileManager.NO_SLOT_RETRY_DELAY_MILLIS, noSlot.retryAt());
+        assertTrue("the slot retry is shorter than the failure retry", noSlot.retryAt() < 1_000 + WarmFullFileManager.RETRY_DELAY_MILLIS);
+
+        release.countDown();
+        awaitState(holder, FullFileState.State.FULL);
+
+        // Budget declines keep the long delay: a manager with no budget declines at once with 60 s.
+        WarmFullFileManager noBudget = new WarmFullFileManager(fileCache, Runnable::run, clock::get, 1, 0.0, 1, 1024);
+        FullFileState overBudget = newState(tm, fileCache, "_budget.faiss", length);
+        assertTrue(overBudget.casState(FullFileState.State.BLOCK, FullFileState.State.PROMOTING));
+        noBudget.promote(overBudget);
+        assertEquals(FullFileState.State.BLOCK, overBudget.state());
+        assertEquals(1_000 + WarmFullFileManager.RETRY_DELAY_MILLIS, overBudget.retryAt());
+    }
+
     public void testStatsCountNoSlotDecline() throws Exception {
         long length = 4096;
         FileCache fileCache = FileCacheFactory.createConcurrentLRUFileCache(10_000_000, 1);
@@ -1165,6 +1196,7 @@ public class WarmFullFileManagerTests extends OpenSearchTestCase {
         mgr.promote(second);
         assertEquals(FullFileState.State.BLOCK, second.state());
         assertEquals(1L, mgr.stats().declined().get(WarmFullFileStats.DeclineReason.NO_SLOT).longValue());
+        assertEquals("a no-slot decline retries after the short delay", WarmFullFileManager.NO_SLOT_RETRY_DELAY_MILLIS, second.retryAt());
         assertEquals(2L, mgr.stats().requested());
         assertEquals("only the holder started", 1L, mgr.stats().started());
 
