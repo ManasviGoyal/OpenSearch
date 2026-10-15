@@ -165,12 +165,19 @@ public class SwitchableIndexInputWrapper extends FilterIndexInput implements Ran
     }
 
     /**
-     * Requests promotion at most once per BLOCK period: only an eligible handle, only in BLOCK, only after retryAt, and
-     * only for the thread that wins the CAS. The trigger does a CAS and an executor submit and nothing else; promote()
-     * never runs on the search thread.
+     * Requests promotion at most once per BLOCK period: only an eligible handle whose file is in remote (block) mode,
+     * only in BLOCK, only after retryAt, and only for the thread that wins the CAS. The trigger does a CAS and an
+     * executor submit and nothing else; promote() never runs on the search thread.
      */
     private void maybeTrigger(FullFileState st) {
         if (eligible == false || manager == null) {
+            return;
+        }
+        // Remote mode is checked here rather than when the handle was opened: a handle opened at refresh time, before
+        // the upload, becomes promotable once switchToRemote has run. A not-yet-uploaded local file must never be
+        // promoted, because switchToRemote deletes the local copy. Remote mode is final, so a trigger that observes it
+        // cannot race that deletion.
+        if (switchableIndexInput.hasSwitchedToRemote() == false) {
             return;
         }
         if (st.state() != FullFileState.State.BLOCK || manager.relativeTimeInMillis() < st.retryAt()) {

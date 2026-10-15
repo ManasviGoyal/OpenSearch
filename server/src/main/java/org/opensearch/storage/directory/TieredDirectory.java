@@ -195,9 +195,14 @@ public class TieredDirectory extends CompositeDirectory {
 
     /**
      * Decides, once per opened handle, whether this handle may trigger whole-file promotion. All conditions must hold:
-     * the extension is configured as eligible; the file is in remote (block) mode; it is larger than one block; the
+     * the extension is configured as eligible; the file is larger than one block and below the mmap chunk size; the
      * context is a plain DEFAULT read (excludes merges and FLUSH); and it carries no ReadOnce/SEQUENTIAL hint
      * (excludes recovery checksum reads). Temp/corrupted files never reach here (handled earlier in openInput).
+     *
+     * <p>Remote (block) mode is NOT part of this decision: the searcher opens its handles at refresh time, before the
+     * segment is uploaded, and never reopens them, so a handle must be able to become promotable later. The wrapper
+     * checks {@code hasSwitchedToRemote()} at trigger time instead; remote mode is final, so once observed it cannot
+     * race the local-copy removal in {@code switchToRemote}.
      */
     // visible for testing
     boolean isEligibleForFullFile(String name, IOContext context, SwitchableIndexInput original) {
@@ -215,11 +220,6 @@ public class TieredDirectory extends CompositeDirectory {
         }
         // Not an ordinary Lucene special file.
         if (FileTypeUtils.isSegmentsFile(name) || FileTypeUtils.isLockFile(name) || name.endsWith(".cfs")) {
-            return false;
-        }
-        // Only promote files already uploaded and served from blocks; a not-yet-uploaded local file would be deleted
-        // out from under the mapping by switchToRemote.
-        if (original.hasSwitchedToRemote() == false) {
             return false;
         }
         // A file of one block or less is already a single block; a whole copy gains nothing.

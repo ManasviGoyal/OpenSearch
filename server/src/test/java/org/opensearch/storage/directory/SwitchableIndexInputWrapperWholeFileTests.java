@@ -279,6 +279,40 @@ public class SwitchableIndexInputWrapperWholeFileTests extends TieredStorageBase
         assertTrue("block slice, not a view", s instanceof SwitchableIndexInputWrapper);
     }
 
+    public void testLocalModeHandleTriggersOnlyAfterSwitchToRemote() throws IOException {
+        // The searcher opens its handle while the file is still local (before the upload). Clones and slices taken then
+        // must not request a promotion; the first clone after switchToRemote must.
+        syncLocalAndRemoteForFile(localDirectory, FILE_NAME);
+        SwitchableIndexInput in = new SwitchableIndexInput(
+            "switchable",
+            FILE_NAME,
+            getFilePath(localDirectory, FILE_NAME),
+            getFilePathSwitchable(localDirectory, FILE_NAME),
+            fileCache,
+            localDirectory,
+            remoteSegmentStoreDirectory,
+            transferManager,
+            false, // local mode: the file has not been uploaded yet
+            threadPool,
+            PREFETCH
+        );
+        FullFileState st = stateFor(in);
+        RecordingExecutor exec = new RecordingExecutor();
+        SwitchableIndexInputWrapper handle = new SwitchableIndexInputWrapper("h", in, st, true, manager(exec, new AtomicLong()));
+
+        handle.clone();
+        handle.slice("s", 0, Math.min(16, in.length()));
+        assertEquals("no request while the file is local", 0, exec.submitted.get());
+        assertEquals(FullFileState.State.BLOCK, st.state());
+
+        in.switchToRemote();
+
+        handle.clone();
+        assertEquals("the first clone after the switch requests promotion", 1, exec.submitted.get());
+        assertEquals(FullFileState.State.PROMOTING, st.state());
+        handle.close();
+    }
+
     public void testIneligibleHandleNeverRequests() throws IOException {
         SwitchableIndexInput in = remoteModeInput();
         FullFileState st = stateFor(in);
