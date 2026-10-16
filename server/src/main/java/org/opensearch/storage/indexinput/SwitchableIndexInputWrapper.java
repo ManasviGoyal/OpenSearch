@@ -33,6 +33,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 public class SwitchableIndexInputWrapper extends FilterIndexInput implements RandomAccessInput {
 
     private final String resourceDescription;
+    private final String fullCloneDescription;
     private final SwitchableIndexInput switchableIndexInput;
     private final FullFileState fullFileState;
     private final boolean eligible;
@@ -74,6 +75,7 @@ public class SwitchableIndexInputWrapper extends FilterIndexInput implements Ran
     ) {
         super(resourceDescription, in);
         this.resourceDescription = resourceDescription;
+        this.fullCloneDescription = "Full clone " + resourceDescription;
         this.switchableIndexInput = in;
         this.fullFileState = fullFileState;
         this.eligible = eligible;
@@ -81,9 +83,9 @@ public class SwitchableIndexInputWrapper extends FilterIndexInput implements Ran
         CLEANER.register(this, switchableIndexInput);
         if (countsHandle && fullFileState != null) {
             fullFileState.incHandles();
-            // Released only on close(), deliberately NOT by the Cleaner: a whole-file
-            // view does not reference this wrapper, so the wrapper can become unreachable while a view derived from it
-            // is still in use; a Cleaner release could then let the deferred close unmap under that live view (SIGSEGV).
+            // Released only on close(), deliberately NOT by the Cleaner: a whole-file view does not reference this
+            // wrapper, so the wrapper can become unreachable while a view derived from it is still in use; a Cleaner
+            // release could then let the deferred close unmap under that live view (SIGSEGV).
             this.handleCounted = new AtomicBoolean(true);
         } else {
             this.handleCounted = null;
@@ -95,11 +97,7 @@ public class SwitchableIndexInputWrapper extends FilterIndexInput implements Ran
         FullFileState st = fullFileState;
         if (st != null) {
             IndexInput view = viewOrNull(st, "clone", master -> {
-                IndexInput v = master.slice(
-                    "Full clone " + resourceDescription,
-                    switchableIndexInput.offset(),
-                    switchableIndexInput.fileLength()
-                );
+                IndexInput v = master.slice(fullCloneDescription, switchableIndexInput.offset(), switchableIndexInput.fileLength());
                 v.seek(switchableIndexInput.getFilePointer()); // Lucene's clone() keeps the position
                 return v;
             });

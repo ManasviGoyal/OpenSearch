@@ -201,7 +201,6 @@ public class WarmFullFileManagerTests extends OpenSearchTestCase {
     }
 
     private FullFileState newState(TransferManager tm, FileCache fileCache, String name, long length) {
-        // promote() never touches remoteDirectory, so null is safe here.
         return new FullFileState(tm, localDirectory, fileCache, name, length, localDirectory.getDirectory().resolve(name));
     }
 
@@ -805,6 +804,90 @@ public class WarmFullFileManagerTests extends OpenSearchTestCase {
     }
 
     // ---------- pre-existing entries at the whole-file key ----------
+
+    public void testEntryPutAfterAdmissionCheckDeclinesAndReleasesBudgetAndSlot() throws Exception {
+        // A completed whole-file entry lands at the key after promote() has checked the key and before the fetch is
+        // submitted. fetchBlobAsync then returns no future for it, and the promotion must decline, giving back its slot
+        // and its reserved bytes, with the family back in BLOCK.
+        String name = "_late_entry.faiss";
+        Path path = dir.resolve(name);
+        PositionDependentStreamReader reader = new PositionDependentStreamReader();
+        FileCache fileCache = newFileCache();
+        TransferManager tm = new TransferManager(reader, fileCache, threadPool);
+        WarmFullFileManager mgr = newManager(fileCache, 1, 0.5);
+        Files.write(path, wrongBytes(FILE_LENGTH));
+        IndexInput late = localDirectory.openInput(name, IOContext.DEFAULT);
+        mgr.setBeforeDownloadHook(() -> {
+            fileCache.put(path, new CachedFullFileIndexInput(fileCache, path, late));
+            fileCache.decRef(path);
+        });
+
+        FullFileState st = newState(tm, fileCache, name, FILE_LENGTH);
+        startPromotion(mgr, st);
+
+        assertEquals(FullFileState.State.BLOCK, st.state());
+        WarmFullFileStats stats = mgr.stats();
+        assertEquals("counted as an error decline", 1L, stats.declined().get(WarmFullFileStats.DeclineReason.ERROR).longValue());
+        assertEquals("reserved bytes given back", 0L, stats.reservedBytes());
+        assertEquals("slot given back", 0, stats.activeDownloads());
+        assertEquals("nothing read from the remote store", 0, reader.readCount());
+        fileCache.remove(path);
+    }
+
+    public void testStuckHandleWarningFiresOnlyWhileHandlesStayOpen() throws Exception {
+        // A FULL family that closes with a handle still open schedules one delayed check. The check warns if the handle
+        // is still open when it runs, and stays silent once the handle has closed and the cleanup has run.
+        String name = "_stuck.faiss";
+        List<Runnable> scheduled = new ArrayList<>();
+        List<Long> delays = new ArrayList<>();
+        FileCache fileCache = newFileCache();
+        TransferManager tm = new TransferManager(new PositionDependentStreamReader(), fileCache, threadPool);
+        WarmFullFileManager mgr = new WarmFullFileManager(
+            fileCache,
+            Runnable::run,
+            threadPool::relativeTimeInMillis,
+            4,
+            0.5,
+            1,
+            PART_SIZE,
+            (task, delay) -> {
+                scheduled.add(task);
+                delays.add(delay);
+            }
+        );
+        FullFileState st = newState(tm, fileCache, name, FILE_LENGTH);
+        startPromotion(mgr, st);
+        awaitState(st, FullFileState.State.FULL);
+        st.incHandles();
+
+        st.closeFamily();
+        assertEquals("one check scheduled when the family closes with a handle open", 1, scheduled.size());
+        assertEquals(WarmFullFileManager.STUCK_HANDLE_WARN_DELAY_MILLIS, delays.get(0).longValue());
+
+        String loggerName = WarmFullFileManager.class.getName();
+        try (MockLogAppender appender = MockLogAppender.createForLoggers(LogManager.getLogger(WarmFullFileManager.class))) {
+            appender.addExpectation(
+                new MockLogAppender.SeenEventExpectation(
+                    "warns while the handle is open",
+                    loggerName,
+                    Level.WARN,
+                    "*" + name + "*open handle*"
+                )
+            );
+            scheduled.get(0).run();
+            appender.assertAllExpectationsMatched();
+        }
+
+        st.decHandles(); // the last handle closes: the deferred cleanup runs on the (inline) executor
+        assertBusy(() -> assertTrue(st.cleanupDone()), 10, TimeUnit.SECONDS);
+        try (MockLogAppender appender = MockLogAppender.createForLoggers(LogManager.getLogger(WarmFullFileManager.class))) {
+            appender.addExpectation(
+                new MockLogAppender.UnseenEventExpectation("silent once cleaned up", loggerName, Level.WARN, "*" + name + "*open handle*")
+            );
+            scheduled.get(0).run();
+            appender.assertAllExpectationsMatched();
+        }
+    }
 
     public void testLiveCachedFullFileEntryAtKeyIsRemovedAndRedownloaded() throws Exception {
         // A completed whole-file entry with WRONG bytes sits at the key. It must be removed (not served), and the file

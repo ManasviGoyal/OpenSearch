@@ -85,9 +85,8 @@ public class WarmFullFileManager {
     private final DelayedScheduler scheduler;
     private final int maxConcurrentDownloads;
     private final Semaphore slots;
-    private final double budgetFraction;
     private final int segments;
-    private final long perSegmentCapacity;
+    private final long perSegmentBudgetBytes;
     private final long partSize;
     private final AtomicLongArray perSegmentWholeFileBytes;
     private final AtomicLong requested = new AtomicLong();
@@ -103,7 +102,12 @@ public class WarmFullFileManager {
     // No-op in production; tests install a blocking hook to hold a download at a known point.
     private volatile Runnable beforeDownloadHook = () -> {};
 
-    /** Runs a task once after a delay (injectable for tests; production uses the node ThreadPool). */
+    /**
+     * Runs a task once after a delay (injectable for tests; production uses the node ThreadPool).
+     *
+     * @opensearch.experimental
+     */
+    @ExperimentalApi
     @FunctionalInterface
     public interface DelayedScheduler {
         void schedule(Runnable task, long delayMillis);
@@ -158,7 +162,7 @@ public class WarmFullFileManager {
         this(fileCache, executor, clock, maxConcurrentDownloads, budgetFraction, segments, partSize, NO_OP_SCHEDULER);
     }
 
-    /** Package-private constructor for tests that also inject the scheduler. */
+    /** The constructor every other constructor delegates to. */
     WarmFullFileManager(
         FileCache fileCache,
         Executor executor,
@@ -175,9 +179,9 @@ public class WarmFullFileManager {
         this.scheduler = scheduler == null ? NO_OP_SCHEDULER : scheduler;
         this.maxConcurrentDownloads = Math.max(1, maxConcurrentDownloads);
         this.slots = new Semaphore(this.maxConcurrentDownloads);
-        this.budgetFraction = budgetFraction;
         this.segments = Math.max(1, segments);
-        this.perSegmentCapacity = (fileCache.capacity() + this.segments - 1) / this.segments;
+        long perSegmentCapacity = (fileCache.capacity() + this.segments - 1) / this.segments;
+        this.perSegmentBudgetBytes = (long) (perSegmentCapacity * budgetFraction);
         this.partSize = partSize > 0 ? partSize : DEFAULT_PART_SIZE;
         this.perSegmentWholeFileBytes = new AtomicLongArray(this.segments);
     }
@@ -218,7 +222,6 @@ public class WarmFullFileManager {
         final long length = st.fileLength();
         final Path path = st.fullFilePath();
         final int segment = segmentIndexFor(path);
-        final long cap = (long) (perSegmentCapacity * budgetFraction);
 
         // Single-chunk guard. Eligibility already excludes these; this also covers a
         // local directory configured with a smaller chunk size. Checked before taking a slot or reserving bytes.
@@ -234,7 +237,7 @@ public class WarmFullFileManager {
         }
         boolean bytesReserved = false;
         try {
-            if (reserveSegmentBytes(segment, length, cap) == false) {
+            if (reserveSegmentBytes(segment, length, perSegmentBudgetBytes) == false) {
                 slots.release(); // the slot was taken above; give it back or every budget decline leaks one
                 decline(st, DeclineReason.BUDGET_EXCEEDED, "per-segment whole-file budget exceeded");
                 return;
@@ -261,11 +264,15 @@ public class WarmFullFileManager {
             final long startedAt = clock.getAsLong();
             started.incrementAndGet();
             CompletableFuture<IndexInput> future = st.transferManager().fetchBlobAsync(request);
-            // Ownership of slot + reserved bytes passes to the completion handler; do not release them here.
-            bytesReserved = false;
+            if (future == null) {
+                // fetchBlobAsync found a live entry it cannot drive (one put at the key after the check above).
+                throw new IllegalStateException("whole-file entry at " + path + " cannot be downloaded into");
+            }
             // The future's value is the cache entry's own (non-clone) input; it must NOT be closed here (closing it
             // would close the entry's master input). The family serves from its own mapping opened below.
             future.whenComplete((indexInput, throwable) -> onDownloadComplete(st, segment, length, startedAt, throwable));
+            // Ownership of slot + reserved bytes has passed to the completion handler; do not release them here.
+            bytesReserved = false;
         } catch (Exception e) {
             logger.warn("whole-file promotion failed to start for {}", path, e);
             if (bytesReserved) {
@@ -337,9 +344,7 @@ public class WarmFullFileManager {
                 st.compareAndSetLocalMaster(master, null);
                 fileCache.decRef(path);
                 releaseAdmission(segment, length);
-                if (st.state() != FullFileState.State.FULL) {
-                    decline(st, DeclineReason.FAMILY_CLOSED, "family closed during publish");
-                }
+                decline(st, DeclineReason.FAMILY_CLOSED, "family closed during publish");
                 return;
             }
             slots.release();
@@ -478,7 +483,7 @@ public class WarmFullFileManager {
             downloadMillis.get(),
             declined,
             reservedPerSegment,
-            (long) (perSegmentCapacity * budgetFraction),
+            perSegmentBudgetBytes,
             maxConcurrentDownloads - slots.availablePermits()
         );
     }

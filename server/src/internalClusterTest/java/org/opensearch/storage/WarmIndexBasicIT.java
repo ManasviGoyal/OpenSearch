@@ -112,7 +112,7 @@ public class WarmIndexBasicIT extends RemoteStoreBaseIntegTestCase {
         IndexShard shard = internalTestCluster.getDataNodeInstance(IndicesService.class)
             .indexService(resolveIndex(INDEX_NAME))
             .getShardOrNull(0);
-        Directory directory = unwrapToCompositeDirectory(shard.store().directory());
+        Directory directory = unwrapTo(shard.store().directory(), CompositeDirectory.class);
 
         // Ingesting some docs
         indexBulk(INDEX_NAME, NUM_DOCS_IN_BULK);
@@ -171,7 +171,7 @@ public class WarmIndexBasicIT extends RemoteStoreBaseIntegTestCase {
             .indexService(resolveIndex(INDEX_NAME))
             .getShardOrNull(0);
 
-        TieredDirectory tieredDirectory = unwrapToTieredDirectory(shard.store().directory());
+        TieredDirectory tieredDirectory = unwrapTo(shard.store().directory(), TieredDirectory.class);
 
         indexBulk(INDEX_NAME, NUM_DOCS_IN_BULK);
         refresh(INDEX_NAME);
