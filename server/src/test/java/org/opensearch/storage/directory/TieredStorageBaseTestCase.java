@@ -17,6 +17,8 @@ import org.opensearch.index.store.BaseRemoteSegmentStoreDirectoryTests;
 import org.opensearch.index.store.RemoteDirectory;
 
 import java.io.IOException;
+import java.util.concurrent.Executor;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import static java.lang.Math.min;
 import static org.mockito.ArgumentMatchers.any;
@@ -32,6 +34,16 @@ public abstract class TieredStorageBaseTestCase extends BaseRemoteSegmentStoreDi
 
     protected static final int EIGHT_MB = 1024 * 1024 * 8;
     protected static final int FILE_CACHE_CAPACITY = 10000000;
+
+    /** Records promote() submissions without running them, so trigger behaviour is isolated from downloads. */
+    protected static final class RecordingExecutor implements Executor {
+        public final AtomicInteger submitted = new AtomicInteger();
+
+        @Override
+        public void execute(Runnable command) {
+            submitted.incrementAndGet();
+        }
+    }
 
     protected void populateData() throws IOException {
         long fileLength = remoteSegmentStoreDirectory.fileLength("_0.si");

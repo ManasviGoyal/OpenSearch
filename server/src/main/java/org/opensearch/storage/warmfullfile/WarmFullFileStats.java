@@ -58,6 +58,7 @@ public final class WarmFullFileStats {
     private final long downloadMillis;
     private final Map<DeclineReason, Long> declined;
     private final long[] reservedBytesPerSegment;
+    private final long perSegmentBudgetBytes;
     private final int activeDownloads;
 
     WarmFullFileStats(
@@ -69,6 +70,7 @@ public final class WarmFullFileStats {
         long downloadMillis,
         Map<DeclineReason, Long> declined,
         long[] reservedBytesPerSegment,
+        long perSegmentBudgetBytes,
         int activeDownloads
     ) {
         this.requested = requested;
@@ -79,6 +81,7 @@ public final class WarmFullFileStats {
         this.downloadMillis = downloadMillis;
         this.declined = Collections.unmodifiableMap(new EnumMap<>(declined));
         this.reservedBytesPerSegment = reservedBytesPerSegment.clone();
+        this.perSegmentBudgetBytes = perSegmentBudgetBytes;
         this.activeDownloads = activeDownloads;
     }
 
@@ -155,6 +158,11 @@ public final class WarmFullFileStats {
         return reservedBytesPerSegment.clone();
     }
 
+    /** @return the most whole-file bytes one cache segment may hold; a promotion that would exceed it is declined */
+    public long perSegmentBudgetBytes() {
+        return perSegmentBudgetBytes;
+    }
+
     /** @return downloads currently holding a slot */
     public int activeDownloads() {
         return activeDownloads;
@@ -180,6 +188,8 @@ public final class WarmFullFileStats {
             + declined
             + ", reservedBytes="
             + reservedBytes()
+            + ", perSegmentBudgetBytes="
+            + perSegmentBudgetBytes
             + ", activeDownloads="
             + activeDownloads
             + '}';

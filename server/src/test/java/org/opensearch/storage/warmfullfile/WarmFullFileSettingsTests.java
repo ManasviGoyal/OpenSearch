@@ -39,8 +39,8 @@ public class WarmFullFileSettingsTests extends OpenSearchTestCase {
 
     @Override
     public void tearDown() throws Exception {
-        super.tearDown();
         threadPool.shutdownNow();
+        super.tearDown();
     }
 
     public void testEmptyByDefault() {
@@ -72,12 +72,26 @@ public class WarmFullFileSettingsTests extends OpenSearchTestCase {
     public void testExtensionsAreNormalized() {
         WarmFullFileSettings settings = new WarmFullFileSettings(clusterService.getClusterSettings());
         Settings updated = Settings.builder()
-            // leading dots, mixed case, and a blank entry should all be normalized away
+            // leading dots, mixed case, and surrounding whitespace are all normalized away
             .putList(WarmFullFileSettings.EXTENSIONS.getKey(), List.of(".FAISS", "Veq", "  faissc  "))
             .build();
         clusterService.getClusterSettings().applySettings(updated);
 
         assertEquals(Set.of("faiss", "veq", "faissc"), settings.getExtensions());
         assertTrue(settings.isExtensionEligible("FAISS"));
+    }
+
+    public void testExtensionOf() {
+        assertEquals("faiss", WarmFullFileSettings.extensionOf("_0.faiss"));
+        assertEquals("veq", WarmFullFileSettings.extensionOf("_0_Lucene104_0.veq"));
+        assertEquals("only the last extension counts", "vec", WarmFullFileSettings.extensionOf("_0.faiss.vec"));
+        assertNull("no dot", WarmFullFileSettings.extensionOf("segments_5"));
+        assertNull("trailing dot", WarmFullFileSettings.extensionOf("_0.faiss."));
+        assertFalse(
+            "a name without an extension is never eligible",
+            new WarmFullFileSettings(clusterService.getClusterSettings()).isExtensionEligible(
+                WarmFullFileSettings.extensionOf("segments_5")
+            )
+        );
     }
 }

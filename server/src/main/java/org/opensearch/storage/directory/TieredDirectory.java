@@ -20,6 +20,7 @@ import org.apache.lucene.store.ReadOnceHint;
 import org.opensearch.common.annotation.ExperimentalApi;
 import org.opensearch.index.store.CompositeDirectory;
 import org.opensearch.index.store.RemoteSegmentStoreDirectory;
+import org.opensearch.index.store.remote.file.AbstractBlockIndexInput;
 import org.opensearch.index.store.remote.filecache.CachedIndexInput;
 import org.opensearch.index.store.remote.filecache.FileCache;
 import org.opensearch.index.store.remote.utils.FileTypeUtils;
@@ -56,7 +57,7 @@ public class TieredDirectory extends CompositeDirectory {
     private static final Logger logger = LogManager.getLogger(TieredDirectory.class);
 
     // A file at or below one block is already served as a single block; a whole-file copy gains nothing.
-    private static final long ONE_BLOCK_BYTES = 8L * 1024 * 1024;
+    static final long ONE_BLOCK_BYTES = AbstractBlockIndexInput.Builder.DEFAULT_BLOCK_SIZE;
 
     private final Supplier<TieredStoragePrefetchSettings> tieredStoragePrefetchSettingsSupplier;
     private final Supplier<WarmFullFileSettings> warmFullFileSettingsSupplier;
@@ -154,8 +155,8 @@ public class TieredDirectory extends CompositeDirectory {
         try {
             return openSwitchableHandle(name, context, key);
         } catch (AlreadyClosedException e) {
-            // Two openInput calls raced to create the family: cacheFile put a new entry over the one we had just looked
-            // up and closed it (cacheFile closes the entry it replaces). The new entry is live; look it up once more.
+            // Two openInput calls raced to create the family: cacheFile put a new entry over the one just looked up
+            // and closed it (cacheFile closes the entry it replaces). The new entry is live; look it up once more.
             return openSwitchableHandle(name, context, key);
         }
     }
@@ -201,8 +202,7 @@ public class TieredDirectory extends CompositeDirectory {
      *
      * <p>Remote (block) mode is NOT part of this decision: the searcher opens its handles at refresh time, before the
      * segment is uploaded, and never reopens them, so a handle must be able to become promotable later. The wrapper
-     * checks {@code hasSwitchedToRemote()} at trigger time instead; remote mode is final, so once observed it cannot
-     * race the local-copy removal in {@code switchToRemote}.
+     * checks the family's remote-mode flag at trigger time instead; see {@link FullFileState#markRemoteMode()}.
      */
     // visible for testing
     boolean isEligibleForFullFile(String name, IOContext context, SwitchableIndexInput original) {
@@ -210,12 +210,8 @@ public class TieredDirectory extends CompositeDirectory {
         if (settings == null || settings.getExtensions().isEmpty()) {
             return false;
         }
-        // Extension (part after the last dot, no leading dot); files with no dot are ineligible.
-        int dot = name.lastIndexOf('.');
-        if (dot < 0 || dot == name.length() - 1) {
-            return false;
-        }
-        if (settings.isExtensionEligible(name.substring(dot + 1)) == false) {
+        // A file without an extension is never eligible.
+        if (settings.isExtensionEligible(WarmFullFileSettings.extensionOf(name)) == false) {
             return false;
         }
         // The extension is configured, so a rejection by a later rule is worth a line when debugging a node that never
@@ -264,8 +260,7 @@ public class TieredDirectory extends CompositeDirectory {
         // perform the full file to block switch for the switchable index input (currently called here for testing)
         switchFileToRemote(file);
 
-        // Only now may whole-file promotion start for this family: the original and every clone are in remote mode and
-        // the local copy has been removed, so a download can no longer overlap that removal.
+        // Whole-file promotion may start only now that the local copy is gone; see FullFileState.markRemoteMode.
         markFamilyRemote(file);
     }
 
@@ -275,21 +270,36 @@ public class TieredDirectory extends CompositeDirectory {
      * whole-file promotion removes the family's local cache entry.
      */
     private void markFamilyRemote(String file) {
+        withSwitchableEntry(file, (entry, input) -> {
+            FullFileState fullFileState = entry.fullFileState();
+            if (fullFileState != null && input.hasSwitchedToRemote()) {
+                fullFileState.markRemoteMode();
+            }
+        }, "Failed to confirm the switch to remote; the family stays on blocks");
+    }
+
+    /** An action on the switchable input behind a family's cache entry. */
+    @FunctionalInterface
+    private interface SwitchableEntryAction {
+        void accept(CachedIndexInput entry, SwitchableIndexInput input) throws IOException;
+    }
+
+    /**
+     * Runs {@code action} on the switchable entry of {@code file}, holding a reference on the entry for the duration and
+     * releasing it afterwards. Does nothing when the entry is gone. A failure is logged with {@code failureMessage}.
+     */
+    private void withSwitchableEntry(String file, SwitchableEntryAction action, String failureMessage) {
         Path key = getFilePathSwitchable(localDirectory, file);
         CachedIndexInput entry = fileCache.get(key);
         if (entry == null) {
             return;
         }
         try {
-            FullFileState fullFileState = entry.fullFileState();
-            if (fullFileState != null
-                && entry.getIndexInput() instanceof SwitchableIndexInput switchable
-                && switchable.hasSwitchedToRemote()) {
-                fullFileState.markRemoteMode();
+            if (entry.getIndexInput() instanceof SwitchableIndexInput input) {
+                action.accept(entry, input);
             }
-        } catch (IOException e) {
-            // Cannot confirm the switch, so the family stays non-promotable.
-            logger.error("Failed to read switchable entry while marking family remote - " + file, e);
+        } catch (IOException | IllegalStateException e) {
+            logger.warn("{} - {}", failureMessage, file, e);
         } finally {
             fileCache.decRef(key);
         }
@@ -305,20 +315,7 @@ public class TieredDirectory extends CompositeDirectory {
      * @param file
      */
     public void switchFileToRemote(String file) {
-        Path filePath = getFilePathSwitchable(localDirectory, file);
-        CachedIndexInput entry = fileCache.get(filePath);
-        if (entry == null) {
-            // No switchable entry for this file (evicted or removed): nothing to switch.
-            return;
-        }
-        try {
-            SwitchableIndexInput switchableIndexInput = (SwitchableIndexInput) entry.getIndexInput();
-            switchableIndexInput.switchToRemote();
-        } catch (IOException | IllegalStateException e) {
-            logger.error("Failed to switch full file to blocked - " + file, e);
-        } finally {
-            fileCache.decRef(filePath);
-        }
+        withSwitchableEntry(file, (entry, input) -> input.switchToRemote(), "Failed to switch full file to blocked");
     }
 
     @Override

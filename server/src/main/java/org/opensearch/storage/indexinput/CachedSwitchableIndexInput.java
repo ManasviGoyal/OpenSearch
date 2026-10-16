@@ -65,7 +65,6 @@ public class CachedSwitchableIndexInput implements CachedIndexInput {
         this.fullFileState = new FullFileState(
             transferManager,
             localDirectory,
-            remoteDirectory,
             fileCache,
             fileName,
             switchableIndexInput.fileLength(),

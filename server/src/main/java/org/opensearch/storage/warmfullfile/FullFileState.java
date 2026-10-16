@@ -12,7 +12,6 @@ import org.apache.logging.log4j.Logger;
 import org.apache.lucene.store.FSDirectory;
 import org.apache.lucene.store.IndexInput;
 import org.opensearch.common.annotation.ExperimentalApi;
-import org.opensearch.index.store.RemoteSegmentStoreDirectory;
 import org.opensearch.index.store.remote.filecache.FileCache;
 import org.opensearch.index.store.remote.utils.TransferManager;
 
@@ -27,8 +26,7 @@ import java.util.concurrent.atomic.AtomicReference;
  * Per-file-family state for warm-tier whole-file promotion.
  *
  * <p>One instance is owned by each {@code CachedSwitchableIndexInput} (the family's cache entry). It tracks the
- * promotion lifecycle and holds everything the node-level manager needs to download the whole file and later unmap
- * it safely:
+ * promotion lifecycle and holds what the node-level manager needs to download the whole file and later unmap it:
  *
  * <pre>
  *   BLOCK  --(first eligible clone/slice triggers promotion)--&gt;  PROMOTING
@@ -37,13 +35,10 @@ import java.util.concurrent.atomic.AtomicReference;
  *   any --(family closes)--&gt;  CLOSED
  * </pre>
  *
- * The {@code localMaster} mapping is published (atomically, only if none is installed) before the CAS to
- * {@link State#FULL}. When the family
- * closes while FULL ({@link #closeFamily()}), the budget is released at once, and the unmap plus the release of the
- * family's FileCache reference run exactly once, on the cleanup executor, after the last handle closes
- * ({@link #incHandles()}/{@link #decHandles()}). Whichever of "family closed" and "last handle closed" happens second
- * schedules it, so no thread waits. Nothing here re-enters the FileCache inline, because {@link #closeFamily()} runs
- * inside the FileCache removal listener under a segment lock.
+ * The mapping is published before the CAS to {@link State#FULL}. When a FULL family closes, the budget is released at
+ * once and the unmap plus the release of the family's FileCache reference run exactly once on the cleanup executor,
+ * after the last handle closes; whichever of "family closed" and "last handle closed" happens second schedules it, so
+ * no thread waits and nothing re-enters the FileCache from the removal listener.
  *
  * @opensearch.experimental
  */
@@ -83,11 +78,10 @@ public final class FullFileState {
     private final AtomicBoolean cleanupScheduled = new AtomicBoolean(false);
     private volatile boolean cleanupDone;
 
-    // Everything promote() needs to build the download request and open the family's own mapping.
-    // All five are available from the CachedSwitchableIndexInput constructor.
+    // Everything promote() needs to build the download request and open the family's own mapping, all available from
+    // the CachedSwitchableIndexInput constructor.
     private final TransferManager transferManager;
     private final FSDirectory localDirectory;
-    private final RemoteSegmentStoreDirectory remoteDirectory;
     private final FileCache fileCache;
     private final String fileName;
     private final long fileLength;
@@ -96,7 +90,6 @@ public final class FullFileState {
     /**
      * @param transferManager used to download the whole file in parts
      * @param localDirectory  the shard's local FS directory (download target and mmap source)
-     * @param remoteDirectory the remote segment store directory (source of truth)
      * @param fileCache       the node file cache
      * @param fileName        the plain file name (no suffix)
      * @param fileLength       the whole-file length in bytes
@@ -105,7 +98,6 @@ public final class FullFileState {
     public FullFileState(
         TransferManager transferManager,
         FSDirectory localDirectory,
-        RemoteSegmentStoreDirectory remoteDirectory,
         FileCache fileCache,
         String fileName,
         long fileLength,
@@ -113,7 +105,6 @@ public final class FullFileState {
     ) {
         this.transferManager = transferManager;
         this.localDirectory = localDirectory;
-        this.remoteDirectory = remoteDirectory;
         this.fileCache = fileCache;
         this.fileName = fileName;
         this.fileLength = fileLength;
@@ -121,8 +112,11 @@ public final class FullFileState {
     }
 
     /**
-     * Marks the family as served from the remote store. Called once the switch to remote mode has completed for the
-     * original and all of its clones and the local copy has been removed; remote mode is final, so this is never reset.
+     * Marks the family as served from the remote store, which allows whole-file promotion. Set at construction for a
+     * family created from the remote store, otherwise by the directory after the switch to remote has completed for the
+     * original and every clone and the local copy has been removed; a promotion therefore never overlaps that removal.
+     * An input's own switched flag flips earlier, while the switch is still in progress, so it is not used for this.
+     * Remote mode is final.
      */
     public void markRemoteMode() {
         remoteMode = true;
@@ -146,15 +140,6 @@ public final class FullFileState {
         return state.compareAndSet(expect, next);
     }
 
-    /**
-     * Atomically marks the family CLOSED and returns the previous state (so the caller can run the FULL-teardown path
-     * exactly once).
-     * @return the state prior to closing
-     */
-    public State getAndSetClosed() {
-        return state.getAndSet(State.CLOSED);
-    }
-
     /** @return the local whole-file mapping, or null before promotion publishes it */
     public IndexInput localMaster() {
         return localMaster.get();
@@ -169,14 +154,6 @@ public final class FullFileState {
      */
     public boolean compareAndSetLocalMaster(IndexInput expected, IndexInput update) {
         return localMaster.compareAndSet(expected, update);
-    }
-
-    /**
-     * Publishes the local whole-file mapping. Must be set before the CAS to {@link State#FULL}.
-     * @param localMaster the family's own memory mapping
-     */
-    public void setLocalMaster(IndexInput localMaster) {
-        this.localMaster.set(localMaster);
     }
 
     /** @return the earliest time (monotonic millis) a new promotion may be attempted */
@@ -274,7 +251,7 @@ public final class FullFileState {
         try {
             executor.execute(this::runCleanup);
         } catch (RuntimeException e) {
-            // Only expected on node shutdown. Never run inline: we may be on the FileCache listener thread.
+            // Only expected on node shutdown. Never run inline: this may be the FileCache listener thread.
             logger.warn("could not schedule whole-file cleanup for {}; mapping kept until shutdown", fullFilePath, e);
         }
     }
@@ -313,16 +290,6 @@ public final class FullFileState {
     /** @return the shard's local FS directory */
     FSDirectory localDirectory() {
         return localDirectory;
-    }
-
-    /** @return the remote segment store directory */
-    RemoteSegmentStoreDirectory remoteDirectory() {
-        return remoteDirectory;
-    }
-
-    /** @return the node file cache */
-    FileCache fileCache() {
-        return fileCache;
     }
 
     /** @return the plain file name */

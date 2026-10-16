@@ -87,4 +87,14 @@ public class WarmFullFileSettings {
         }
         return extensions.contains(extension.toLowerCase(Locale.ROOT));
     }
+
+    /**
+     * The extension of a file name: the part after the last dot, without the dot.
+     * @param name the file name
+     * @return the extension, or null when the name has no dot or ends with one
+     */
+    public static String extensionOf(String name) {
+        int dot = name.lastIndexOf('.');
+        return dot < 0 || dot == name.length() - 1 ? null : name.substring(dot + 1);
+    }
 }

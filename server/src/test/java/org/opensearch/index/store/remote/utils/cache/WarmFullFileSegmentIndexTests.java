@@ -103,7 +103,7 @@ public class WarmFullFileSegmentIndexTests extends OpenSearchTestCase {
         SegmentedCache<Path, CachedIndexInput> cache = newDefaultCache();
         FileCache fileCache = new FileCache(cache);
         // Production constructor: segments derive from Runtime.availableProcessors(), slots from allocatedProcessors.
-        WarmFullFileManager manager = new WarmFullFileManager(fileCache, Runnable::run, () -> 0L, 8);
+        WarmFullFileManager manager = new WarmFullFileManager(fileCache, Runnable::run, () -> 0L, 8, (task, delayMillis) -> {});
 
         assertEquals("manager budgets over the same number of segments as the node cache", segmentCount(cache), manager.segments());
         assertSameIndexIffSameSegment(cache, manager.segments(), randomShardFilePaths(200));

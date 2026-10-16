@@ -15,6 +15,7 @@ import org.apache.lucene.store.FilterIndexInput;
 import org.apache.lucene.store.IOContext;
 import org.apache.lucene.store.IndexInput;
 import org.opensearch.common.lucene.store.InputStreamIndexInput;
+import org.opensearch.index.store.RemoteSegmentStoreDirectory;
 import org.opensearch.index.store.remote.file.CleanerDaemonThreadLeakFilter;
 import org.opensearch.index.store.remote.filecache.CachedIndexInput;
 import org.opensearch.index.store.remote.filecache.FileCache;
@@ -266,7 +267,7 @@ public class SwitchableIndexInputTests extends TieredStorageBaseTestCase {
     }
 
     public void testWrapperWithoutFullFileStateClonesAndSlicesToBlockWrappers() throws IOException {
-        // The two-argument wrapper carries no whole-file state: clone() and slice() return block wrappers over
+        // A wrapper without whole-file state (feature off): clone() and slice() return block wrappers over
         // SwitchableIndexInput clones, no whole-file entry appears in the cache, and the wrapper closes cleanly.
         populateData();
         SwitchableIndexInput switchableIndexInput = new SwitchableIndexInput(
@@ -282,7 +283,7 @@ public class SwitchableIndexInputTests extends TieredStorageBaseTestCase {
             threadPool,
             getPrefetchSettingsSupplier()
         );
-        SwitchableIndexInputWrapper wrapper = new SwitchableIndexInputWrapper("wrapper", switchableIndexInput);
+        SwitchableIndexInputWrapper wrapper = new SwitchableIndexInputWrapper("wrapper", switchableIndexInput, null, false, null);
 
         IndexInput clone = wrapper.clone();
         IndexInput slice = wrapper.slice("slice", 0, wrapper.length());
@@ -428,7 +429,7 @@ public class SwitchableIndexInputTests extends TieredStorageBaseTestCase {
             String fileName,
             FileCache fileCache,
             FSDirectory localDirectory,
-            org.opensearch.index.store.RemoteSegmentStoreDirectory remoteDirectory,
+            RemoteSegmentStoreDirectory remoteDirectory,
             TransferManager transferManager,
             boolean cacheFromRemote,
             ThreadPool threadPool
@@ -507,7 +508,7 @@ public class SwitchableIndexInputTests extends TieredStorageBaseTestCase {
         }
 
         @Override
-        public boolean tryLock(long time, java.util.concurrent.TimeUnit unit) throws InterruptedException {
+        public boolean tryLock(long time, TimeUnit unit) throws InterruptedException {
             return delegate.tryLock(time, unit);
         }
 

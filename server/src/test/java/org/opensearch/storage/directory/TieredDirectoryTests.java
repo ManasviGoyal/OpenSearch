@@ -10,6 +10,8 @@ package org.opensearch.storage.directory;
 
 import com.carrotsearch.randomizedtesting.annotations.ThreadLeakFilters;
 
+import org.apache.logging.log4j.Level;
+import org.apache.logging.log4j.LogManager;
 import org.apache.lucene.store.DataAccessHint;
 import org.apache.lucene.store.Directory;
 import org.apache.lucene.store.FSDirectory;
@@ -34,6 +36,8 @@ import org.opensearch.storage.prefetch.TieredStoragePrefetchSettings;
 import org.opensearch.storage.warmfullfile.FullFileState;
 import org.opensearch.storage.warmfullfile.WarmFullFileManager;
 import org.opensearch.storage.warmfullfile.WarmFullFileSettings;
+import org.opensearch.test.MockLogAppender;
+import org.opensearch.test.junit.annotations.TestLogging;
 import org.junit.Before;
 
 import java.io.IOException;
@@ -43,9 +47,7 @@ import java.util.Arrays;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
-import java.util.concurrent.Executor;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Supplier;
 
 import static org.opensearch.common.settings.ClusterSettings.BUILT_IN_CLUSTER_SETTINGS;
@@ -111,12 +113,11 @@ public class TieredDirectoryTests extends TieredStorageBaseTestCase {
         };
     }
 
-    // Feature OFF (empty extensions): these existing tests exercise the inert path, so nothing is ever promoted.
+    // Feature off (empty extensions): no file is eligible, so the fixture directory never promotes anything.
     private Supplier<WarmFullFileSettings> getMockWarmFullFileSettingsSupplier() {
         return () -> {
             WarmFullFileSettings settings = mock(WarmFullFileSettings.class);
             when(settings.getExtensions()).thenReturn(Set.of());
-            when(settings.isExtensionEligible(org.mockito.ArgumentMatchers.anyString())).thenReturn(false);
             return settings;
         };
     }
@@ -124,25 +125,22 @@ public class TieredDirectoryTests extends TieredStorageBaseTestCase {
     public void testCacheFilePutOverLiveEntryClosesTheReplacedFamily() throws Exception {
         // RemovalReason.REPLACED never calls close(), so two openInput calls racing to create a family would leak the
         // first family's mapping/reference/budget. cacheFile must close the entry it replaced.
-        java.nio.file.Path key = org.opensearch.storage.utils.DirectoryUtils.getFilePathSwitchable(
-            localDirectory,
-            FILE_PRESENT_IN_REMOTE_ONLY
-        );
+        Path key = getFilePathSwitchable(localDirectory, FILE_PRESENT_IN_REMOTE_ONLY);
         tieredDirectory.cacheFile(FILE_PRESENT_IN_REMOTE_ONLY, true);
-        org.opensearch.index.store.remote.filecache.CachedIndexInput first = fileCache.get(key);
+        CachedIndexInput first = fileCache.get(key);
         fileCache.decRef(key);
         assertNotNull(first);
         assertFalse(first.isClosed());
 
         tieredDirectory.cacheFile(FILE_PRESENT_IN_REMOTE_ONLY, true);
-        org.opensearch.index.store.remote.filecache.CachedIndexInput second = fileCache.get(key);
+        CachedIndexInput second = fileCache.get(key);
         fileCache.decRef(key);
 
         assertNotSame(first, second);
         assertTrue("replaced entry closed", first.isClosed());
-        assertEquals(org.opensearch.storage.warmfullfile.FullFileState.State.CLOSED, first.fullFileState().state());
+        assertEquals(FullFileState.State.CLOSED, first.fullFileState().state());
         assertFalse("new entry live", second.isClosed());
-        assertEquals(org.opensearch.storage.warmfullfile.FullFileState.State.BLOCK, second.fullFileState().state());
+        assertEquals(FullFileState.State.BLOCK, second.fullFileState().state());
     }
 
     public void testHandleOfReplacedFamilyKeepsReadingBlocksAndNeverPromotes() throws Exception {
@@ -154,19 +152,19 @@ public class TieredDirectoryTests extends TieredStorageBaseTestCase {
         Path key = getFilePathSwitchable(localDirectory, FILE_PRESENT_IN_REMOTE_ONLY);
 
         IndexInput first = tieredDirectory.openInput(FILE_PRESENT_IN_REMOTE_ONLY, IOContext.DEFAULT);
-        org.opensearch.index.store.remote.filecache.CachedIndexInput oldEntry = fileCache.get(key);
+        CachedIndexInput oldEntry = fileCache.get(key);
         fileCache.decRef(key);
-        org.opensearch.storage.warmfullfile.FullFileState oldState = oldEntry.fullFileState();
+        FullFileState oldState = oldEntry.fullFileState();
         assertTrue("fixture file must be readable", first.length() > 0);
         byte before = first.readByte();
 
         tieredDirectory.cacheFile(FILE_PRESENT_IN_REMOTE_ONLY, true); // the race: a second put over the live family
-        org.opensearch.index.store.remote.filecache.CachedIndexInput newEntry = fileCache.get(key);
+        CachedIndexInput newEntry = fileCache.get(key);
         fileCache.decRef(key);
         assertNotSame(oldEntry, newEntry);
         assertTrue("replaced entry closed", oldEntry.isClosed());
-        assertEquals(org.opensearch.storage.warmfullfile.FullFileState.State.CLOSED, oldState.state());
-        assertEquals(org.opensearch.storage.warmfullfile.FullFileState.State.BLOCK, newEntry.fullFileState().state());
+        assertEquals(FullFileState.State.CLOSED, oldState.state());
+        assertEquals(FullFileState.State.BLOCK, newEntry.fullFileState().state());
 
         // The old handle still reads blocks, and agrees with a handle from the live family.
         first.seek(0);
@@ -179,7 +177,7 @@ public class TieredDirectoryTests extends TieredStorageBaseTestCase {
         IndexInput clone = first.clone();
         assertTrue("block clone, not a whole-file view", clone instanceof SwitchableIndexInputWrapper);
         assertEquals(before, clone.readByte());
-        assertEquals(org.opensearch.storage.warmfullfile.FullFileState.State.CLOSED, oldState.state());
+        assertEquals(FullFileState.State.CLOSED, oldState.state());
 
         clone.close();
         fresh.close();
@@ -287,7 +285,7 @@ public class TieredDirectoryTests extends TieredStorageBaseTestCase {
         String localFile = "_0.si";
         addFilesToDirectory(new String[] { localFile });
         Path localKey = getFilePathSwitchable(localDirectory, localFile);
-        org.opensearch.index.store.remote.filecache.CachedIndexInput entry = fileCache.get(localKey);
+        CachedIndexInput entry = fileCache.get(localKey);
         try {
             assertFalse("local-mode family not yet promotable", entry.fullFileState().isRemoteMode());
         } finally {
@@ -392,18 +390,8 @@ public class TieredDirectoryTests extends TieredStorageBaseTestCase {
 
     // ---------------- whole-file eligibility ----------------
 
-    private static final long ONE_BLOCK_BYTES = 8L * 1024 * 1024;
+    private static final long ONE_BLOCK_BYTES = TieredDirectory.ONE_BLOCK_BYTES;
     private static final String FAISS_FILE = "_0_NativeEngines990KnnVectorsFormat_0.faiss";
-
-    /** Records promote() submissions without running them, so trigger behaviour is isolated from downloads. */
-    private static final class RecordingExecutor implements Executor {
-        final AtomicInteger submitted = new AtomicInteger();
-
-        @Override
-        public void execute(Runnable command) {
-            submitted.incrementAndGet();
-        }
-    }
 
     private static ClusterSettings newClusterSettings() {
         return new ClusterSettings(Settings.EMPTY, BUILT_IN_CLUSTER_SETTINGS);
@@ -437,7 +425,7 @@ public class TieredDirectoryTests extends TieredStorageBaseTestCase {
     }
 
     private WarmFullFileManager recordingManager(RecordingExecutor executor) {
-        return new WarmFullFileManager(fileCache, executor, () -> 0L, 8);
+        return new WarmFullFileManager(fileCache, executor, () -> 0L, 8, (task, delayMillis) -> {});
     }
 
     /** An original input in remote (block) mode whose whole-file length is {@code length}, as openInput passes it. */
@@ -483,47 +471,33 @@ public class TieredDirectoryTests extends TieredStorageBaseTestCase {
         assertFalse("write.lock", dir.isEligibleForFullFile("write.lock", IOContext.DEFAULT, original));
     }
 
-    @org.opensearch.test.junit.annotations.TestLogging(value = "org.opensearch.storage.directory.TieredDirectory:DEBUG", reason = "the rejection line is logged at DEBUG")
+    @TestLogging(value = "org.opensearch.storage.directory.TieredDirectory:DEBUG", reason = "the rejection line is logged at DEBUG")
     public void testEligibilityRejectionOfConfiguredExtensionIsLoggedAtDebug() throws Exception {
         TieredDirectory dir = directoryWith(() -> realSettings("faiss", "cfs"), null);
         SwitchableIndexInput original = remoteOriginal(ONE_BLOCK_BYTES + 1);
         String loggerName = TieredDirectory.class.getName();
-        try (
-            org.opensearch.test.MockLogAppender appender = org.opensearch.test.MockLogAppender.createForLoggers(
-                org.apache.logging.log4j.LogManager.getLogger(TieredDirectory.class)
-            )
-        ) {
+        try (MockLogAppender appender = MockLogAppender.createForLoggers(LogManager.getLogger(TieredDirectory.class))) {
             appender.addExpectation(
-                new org.opensearch.test.MockLogAppender.SeenEventExpectation(
+                new MockLogAppender.SeenEventExpectation(
                     "compound file rejection names the rule",
                     loggerName,
-                    org.apache.logging.log4j.Level.DEBUG,
+                    Level.DEBUG,
                     "*[_0.cfs]*not eligible: segments, lock or compound file*"
                 )
             );
             appender.addExpectation(
-                new org.opensearch.test.MockLogAppender.SeenEventExpectation(
+                new MockLogAppender.SeenEventExpectation(
                     "read-once rejection names the rule",
                     loggerName,
-                    org.apache.logging.log4j.Level.DEBUG,
+                    Level.DEBUG,
                     "*[_0.faiss]*not eligible: read-once or sequential hint*"
                 )
             );
             appender.addExpectation(
-                new org.opensearch.test.MockLogAppender.UnseenEventExpectation(
-                    "an unconfigured extension is not logged",
-                    loggerName,
-                    org.apache.logging.log4j.Level.DEBUG,
-                    "*[_0.vec]*"
-                )
+                new MockLogAppender.UnseenEventExpectation("an unconfigured extension is not logged", loggerName, Level.DEBUG, "*[_0.vec]*")
             );
             appender.addExpectation(
-                new org.opensearch.test.MockLogAppender.UnseenEventExpectation(
-                    "an eligible file is not logged",
-                    loggerName,
-                    org.apache.logging.log4j.Level.DEBUG,
-                    "*[_1.faiss]*"
-                )
+                new MockLogAppender.UnseenEventExpectation("an eligible file is not logged", loggerName, Level.DEBUG, "*[_1.faiss]*")
             );
             assertFalse(dir.isEligibleForFullFile("_0.cfs", IOContext.DEFAULT, original));
             assertFalse(dir.isEligibleForFullFile("_0.faiss", IOContext.READONCE, original));
