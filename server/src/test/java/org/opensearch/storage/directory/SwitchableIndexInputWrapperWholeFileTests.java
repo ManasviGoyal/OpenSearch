@@ -379,6 +379,43 @@ public class SwitchableIndexInputWrapperWholeFileTests extends TieredStorageBase
         handle.close();
     }
 
+    public void testMergeThreadNeverRequestsPromotion() throws Exception {
+        syncLocalAndRemoteForFile(localDirectory, FILE_NAME);
+        SwitchableIndexInput in = new SwitchableIndexInput(
+            "switchable",
+            FILE_NAME,
+            getFilePath(localDirectory, FILE_NAME),
+            getFilePathSwitchable(localDirectory, FILE_NAME),
+            fileCache,
+            localDirectory,
+            remoteSegmentStoreDirectory,
+            transferManager,
+            true,
+            threadPool,
+            PREFETCH
+        );
+        FullFileState st = stateFor(in);
+        st.markRemoteMode();
+        RecordingExecutor exec = new RecordingExecutor();
+        SwitchableIndexInputWrapper handle = new SwitchableIndexInputWrapper("h", in, st, true, manager(exec, new AtomicLong()));
+
+        // The same clone and slice calls a merge makes, on a thread named the way OpenSearch names merge threads.
+        Thread merge = new Thread(() -> {
+            handle.clone();
+            handle.slice("s", 0, Math.min(16, in.length()));
+        }, "opensearch[node1][[index][0]: Lucene Merge Thread #3]");
+        merge.start();
+        merge.join();
+        assertEquals("a merge thread never requests promotion", 0, exec.submitted.get());
+        assertEquals(FullFileState.State.BLOCK, st.state());
+
+        // A search thread does.
+        handle.clone();
+        assertEquals(1, exec.submitted.get());
+        assertEquals(FullFileState.State.PROMOTING, st.state());
+        handle.close();
+    }
+
     public void testIneligibleHandleNeverRequests() throws IOException {
         SwitchableIndexInput in = remoteModeInput();
         FullFileState st = stateFor(in);

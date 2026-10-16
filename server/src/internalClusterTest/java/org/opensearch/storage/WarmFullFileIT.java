@@ -31,6 +31,7 @@ import org.opensearch.core.common.unit.ByteSizeUnit;
 import org.opensearch.core.common.unit.ByteSizeValue;
 import org.opensearch.index.IndexModule;
 import org.opensearch.index.IndexNotFoundException;
+import org.opensearch.index.IndexSettings;
 import org.opensearch.index.TieredMergePolicyProvider;
 import org.opensearch.index.engine.Engine;
 import org.opensearch.index.engine.EngineConfig;
@@ -55,6 +56,7 @@ import org.opensearch.storage.utils.DirectoryUtils;
 import org.opensearch.storage.warmfullfile.FullFileState;
 import org.opensearch.storage.warmfullfile.WarmFullFileManager;
 import org.opensearch.storage.warmfullfile.WarmFullFileSettings;
+import org.opensearch.storage.warmfullfile.WarmFullFileStats;
 import org.opensearch.test.InternalTestCluster;
 import org.opensearch.test.OpenSearchIntegTestCase;
 
@@ -194,11 +196,11 @@ public class WarmFullFileIT extends RemoteStoreBaseIntegTestCase {
         );
     }
 
-    /** Indexes {@link #NUM_DOCS} large documents, force-merges to one segment and waits for block mode. */
-    private void populateAndMergeToBlocks(String index, WarmShard warmShard) throws Exception {
-        for (int from = 0; from < NUM_DOCS; from += BULK_SIZE) {
+    /** Indexes the large documents with sequence numbers in {@code [from, to)} in bulks of {@link #BULK_SIZE}. */
+    private void indexDocs(String index, int from, int to) {
+        for (int start = from; start < to; start += BULK_SIZE) {
             BulkRequest bulk = new BulkRequest();
-            for (int i = from; i < Math.min(NUM_DOCS, from + BULK_SIZE); i++) {
+            for (int i = start; i < Math.min(to, start + BULK_SIZE); i++) {
                 bulk.add(
                     client().prepareIndex(index)
                         .setId("doc-" + i)
@@ -209,6 +211,11 @@ public class WarmFullFileIT extends RemoteStoreBaseIntegTestCase {
             BulkResponse response = client().bulk(bulk).actionGet();
             assertFalse(response.buildFailureMessage(), response.hasFailures());
         }
+    }
+
+    /** Indexes {@link #NUM_DOCS} large documents, force-merges to one segment and waits for block mode. */
+    private void populateAndMergeToBlocks(String index, WarmShard warmShard) throws Exception {
+        indexDocs(index, 0, NUM_DOCS);
         flushAndRefresh(index);
         assertNoFailures(client().admin().indices().prepareForceMerge(index).setMaxNumSegments(1).get());
         flushAndRefresh(index);
@@ -255,9 +262,14 @@ public class WarmFullFileIT extends RemoteStoreBaseIntegTestCase {
         }
     }
 
+    /** The sorted stored-fields file names of the segments the shard's current reader is built from. */
+    private static List<String> fdts(IndexShard shard) throws IOException {
+        return segmentFiles(shard).stream().filter(f -> f.endsWith(FDT_SUFFIX)).sorted().collect(Collectors.toList());
+    }
+
     /** The single .fdt of the force-merged segment, checked to be eligible by size and to fit the whole-file budget. */
     private static String eligibleFdt(WarmShard warmShard) throws Exception {
-        List<String> fdts = segmentFiles(warmShard.shard).stream().filter(f -> f.endsWith(FDT_SUFFIX)).collect(Collectors.toList());
+        List<String> fdts = fdts(warmShard.shard);
         assertEquals("expected exactly one stored-fields file after the force merge: " + fdts, 1, fdts.size());
         String fdt = fdts.get(0);
         long length = warmShard.directory.fileLength(fdt);
@@ -428,6 +440,71 @@ public class WarmFullFileIT extends RemoteStoreBaseIntegTestCase {
             assertFalse(hasWholeFileCacheEntry(warmShard.fileCache, wholeFilePath));
             assertEquals(FullFileState.State.BLOCK, familyState(warmShard, fdt));
         }
+
+        deleteIndex(INDEX_NAME);
+    }
+
+    public void testRealMergeDoesNotPromoteSourceSegments() throws Exception {
+        String warmNode = startCluster();
+        setFullFileExtensions(FDT_EXTENSION);
+        // Automatic refreshes are off so that each flushed batch becomes exactly one segment.
+        Settings settings = Settings.builder()
+            .put(warmIndexSettings())
+            .put(IndexSettings.INDEX_REFRESH_INTERVAL_SETTING.getKey(), -1)
+            .build();
+        assertAcked(client().admin().indices().prepareCreate(INDEX_NAME).setSettings(settings).setMapping(MAPPING).get());
+        ensureGreen(INDEX_NAME);
+        WarmShard warmShard = warmShard(INDEX_NAME, warmNode);
+
+        // Two segments without a force merge, each with a stored-fields file above one block.
+        int half = NUM_DOCS / 2;
+        indexDocs(INDEX_NAME, 0, half);
+        flushAndRefresh(INDEX_NAME);
+        indexDocs(INDEX_NAME, half, NUM_DOCS);
+        flushAndRefresh(INDEX_NAME);
+        waitForBlockMode(warmShard);
+        List<String> sourceFdts = fdts(warmShard.shard);
+        assertEquals("expected two segments before the merge: " + sourceFdts, 2, sourceFdts.size());
+        for (String fdt : sourceFdts) {
+            assertThat(fdt + " must exceed one block", warmShard.directory.fileLength(fdt), greaterThan(ONE_BLOCK_BYTES));
+        }
+
+        // Re-open so that the reader handles of both segments are opened from blocks before the merge reads them.
+        reopenIndex(INDEX_NAME);
+        warmShard = warmShard(INDEX_NAME, warmNode);
+        waitForBlockMode(warmShard);
+        assertEquals(sourceFdts, fdts(warmShard.shard));
+        for (String fdt : sourceFdts) {
+            assertEquals(FullFileState.State.BLOCK, familyState(warmShard, fdt));
+        }
+        WarmFullFileStats before = warmShard.manager.stats();
+
+        assertNoFailures(client().admin().indices().prepareForceMerge(INDEX_NAME).setMaxNumSegments(1).get());
+        flushAndRefresh(INDEX_NAME);
+        List<String> mergedFdts = fdts(warmShard.shard);
+        assertEquals("expected one segment after the merge: " + mergedFdts, 1, mergedFdts.size());
+        assertFalse("merge kept a source segment: " + mergedFdts, sourceFdts.contains(mergedFdts.get(0)));
+        waitForBlockMode(warmShard);
+
+        // The merge read both source segments through the open reader but asked for no promotion.
+        WarmFullFileStats after = warmShard.manager.stats();
+        assertEquals("the merge requested a promotion: " + after, before.requested(), after.requested());
+        assertEquals(before.started(), after.started());
+        assertEquals(before.promoted(), after.promoted());
+        for (String fdt : sourceFdts) {
+            assertFalse(
+                fdt + " has a whole-file cache entry",
+                hasWholeFileCacheEntry(warmShard.fileCache, warmShard.directory.getFilePath(fdt))
+            );
+        }
+        String mergedFdt = eligibleFdt(warmShard);
+        assertFalse(hasWholeFileCacheEntry(warmShard.fileCache, warmShard.directory.getFilePath(mergedFdt)));
+        assertFalse(isPromoted(warmShard, mergedFdt));
+        assertTrue(wholeSegmentFiles(Arrays.asList(warmShard.directory.listLocalFiles())).isEmpty());
+
+        // A search promotes the merged file, so the index was eligible all along.
+        searchUntilPromoted(INDEX_NAME, warmShard, mergedFdt);
+        assertThat(warmShard.manager.stats().promoted(), greaterThan(before.promoted()));
 
         deleteIndex(INDEX_NAME);
     }

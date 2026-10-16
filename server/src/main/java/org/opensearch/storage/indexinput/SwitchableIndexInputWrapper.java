@@ -184,6 +184,13 @@ public class SwitchableIndexInputWrapper extends FilterIndexInput implements Ran
         if (st.state() != FullFileState.State.BLOCK || manager.relativeTimeInMillis() < st.retryAt()) {
             return;
         }
+        // A merge reads a source segment once and then deletes it, so promoting for it only spends a slot, budget and
+        // a download on a file with minutes to live. Merges usually read through the searcher's already-open reader,
+        // whose handles passed the open-time context check, so the merge is recognised here by its thread instead:
+        // Lucene names merge threads "Lucene Merge Thread #N" and OpenSearch keeps that fragment in its prefixed name.
+        if (Thread.currentThread().getName().contains("Lucene Merge Thread")) {
+            return;
+        }
         if (st.casState(FullFileState.State.BLOCK, FullFileState.State.PROMOTING)) {
             // Once per promotion attempt, not per clone or slice. The thread name shows what started it.
             logger.debug("whole-file promotion requested for {} on thread [{}]", resourceDescription, Thread.currentThread().getName());
