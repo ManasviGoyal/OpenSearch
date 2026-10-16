@@ -47,7 +47,11 @@ public final class FullFileState {
 
     private static final Logger logger = LogManager.getLogger(FullFileState.class);
 
-    /** Promotion lifecycle state. */
+    /**
+     * Promotion lifecycle state.
+     *
+     * @opensearch.experimental
+     */
     @ExperimentalApi
     public enum State {
         /** Served from 8 MiB blocks (default). */
@@ -92,7 +96,7 @@ public final class FullFileState {
      * @param localDirectory  the shard's local FS directory (download target and mmap source)
      * @param fileCache       the node file cache
      * @param fileName        the plain file name (no suffix)
-     * @param fileLength       the whole-file length in bytes
+     * @param fileLength      the whole-file length in bytes
      * @param fullFilePath    the FileCache key the whole file occupies ({@code <dir>/<name>})
      */
     public FullFileState(
@@ -278,9 +282,7 @@ public final class FullFileState {
         return cleanupDone;
     }
 
-    // Accessors for the fields promote() needs. These are package-private on purpose: they expose internal types
-    // (TransferManager, directories, FileCache) that are not public API, and only WarmFullFileManager (same package)
-    // consumes them. Keeping them non-public keeps those internal types off this class's public API surface.
+    // Accessors for the fields promote() needs; package-private because only WarmFullFileManager consumes them.
 
     /** @return the transfer manager used to download the whole file */
     TransferManager transferManager() {

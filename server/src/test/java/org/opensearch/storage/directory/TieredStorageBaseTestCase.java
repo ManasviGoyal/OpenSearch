@@ -37,7 +37,7 @@ public abstract class TieredStorageBaseTestCase extends BaseRemoteSegmentStoreDi
 
     /** Records promote() submissions without running them, so trigger behaviour is isolated from downloads. */
     protected static final class RecordingExecutor implements Executor {
-        public final AtomicInteger submitted = new AtomicInteger();
+        final AtomicInteger submitted = new AtomicInteger();
 
         @Override
         public void execute(Runnable command) {

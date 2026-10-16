@@ -79,7 +79,7 @@ public class WarmFullFileNioIT extends WarmFullFileBaseIT {
 
         String fdt = eligibleFdt(nio);
         Path wholeFileKey = nio.directory.getFilePath(fdt);
-        assertAdmissible(nio, fdt);
+        assertStateLengthMatchesDirectory(nio, fdt);
 
         AtomicInteger downloads = new AtomicInteger();
         manager.setBeforeDownloadHook(downloads::incrementAndGet);
@@ -146,8 +146,8 @@ public class WarmFullFileNioIT extends WarmFullFileBaseIT {
 
         String fdt1 = eligibleFdt(first);
         String fdt2 = eligibleFdt(second);
-        assertAdmissible(first, fdt1);
-        assertAdmissible(second, fdt2);
+        assertStateLengthMatchesDirectory(first, fdt1);
+        assertStateLengthMatchesDirectory(second, fdt2);
 
         AtomicInteger downloads = new AtomicInteger();
         manager.setBeforeDownloadHook(downloads::incrementAndGet);
@@ -230,8 +230,8 @@ public class WarmFullFileNioIT extends WarmFullFileBaseIT {
 
         String nioFdt = eligibleFdt(nio);
         String mmapFdt = eligibleFdt(mmap);
-        long nioLength = assertAdmissible(nio, nioFdt);
-        long mmapLength = assertAdmissible(mmap, mmapFdt);
+        long nioLength = assertStateLengthMatchesDirectory(nio, nioFdt);
+        long mmapLength = assertStateLengthMatchesDirectory(mmap, mmapFdt);
 
         AtomicInteger downloads = new AtomicInteger();
         manager.setBeforeDownloadHook(downloads::incrementAndGet);
@@ -323,13 +323,12 @@ public class WarmFullFileNioIT extends WarmFullFileBaseIT {
     }
 
     /**
-     * Checks, from the length recorded in the family's state, that the file is larger than one block and fits the
-     * per-segment whole-file budget, so a promotion attempt is admitted and reaches the download.
+     * Asserts that the length recorded in the family's state is the file's length in the shard directory.
      * @return the file length
      */
-    private static long assertAdmissible(WarmShard warmShard, String fdt) {
-        long length = requireFamilyState(warmShard, fdt).fileLength();
-        assertAdmissibleLength(fdt, length, perSegmentBudget(warmShard));
+    private static long assertStateLengthMatchesDirectory(WarmShard warmShard, String fdt) throws IOException {
+        long length = warmShard.directory.fileLength(fdt);
+        assertEquals("family state length for " + fdt, length, requireFamilyState(warmShard, fdt).fileLength());
         return length;
     }
 

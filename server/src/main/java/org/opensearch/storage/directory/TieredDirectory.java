@@ -230,7 +230,6 @@ public class TieredDirectory extends CompositeDirectory {
         if (FileTypeUtils.isSegmentsFile(name) || FileTypeUtils.isLockFile(name) || name.endsWith(".cfs")) {
             return "segments, lock or compound file";
         }
-        // A file of one block or less is already a single block; a whole copy gains nothing.
         if (original.length() <= ONE_BLOCK_BYTES) { // original input: offset 0, length == whole file length
             return "length " + original.length() + " is at most one block";
         }

@@ -84,7 +84,9 @@ public abstract class WarmFullFileBaseIT extends RemoteStoreBaseIntegTestCase {
 
     /** Upper bound for waits on a search, a download hook or a background thread. */
     protected static final TimeValue WAIT_TIMEOUT = TimeValue.timeValueSeconds(60);
+    /** Upper bound for the wait until a shard has uploaded its segments and serves them from block files. */
     protected static final TimeValue BLOCK_MODE_TIMEOUT = TimeValue.timeValueSeconds(90);
+    /** Upper bound for the wait until an index is green again after a close and open. */
     protected static final TimeValue ENSURE_GREEN_TIMEOUT = TimeValue.timeValueSeconds(90);
     protected static final TimeValue DOWNLOAD_TIMEOUT = TimeValue.timeValueSeconds(120);
 
@@ -264,7 +266,7 @@ public abstract class WarmFullFileBaseIT extends RemoteStoreBaseIntegTestCase {
 
     protected WarmShard warmShard(String index, String nodeName) {
         IndexShard shard = internalCluster().getInstance(IndicesService.class, nodeName).indexService(resolveIndex(index)).getShard(0);
-        TieredDirectory directory = unwrapToTieredDirectory(shard.store().directory());
+        TieredDirectory directory = unwrapTo(shard.store().directory(), TieredDirectory.class);
         FileCache fileCache = internalCluster().getInstance(Node.class, nodeName).fileCache();
         WarmFullFileManager manager = internalCluster().getInstance(WarmFullFileManager.class, nodeName);
         assertNotNull("warm node has no file cache", fileCache);
