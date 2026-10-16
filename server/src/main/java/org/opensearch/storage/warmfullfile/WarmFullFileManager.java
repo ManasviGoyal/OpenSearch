@@ -16,10 +16,13 @@ import org.apache.lucene.store.IndexInput;
 import org.apache.lucene.store.MMapDirectory;
 import org.apache.lucene.store.MemorySegmentAccessInput;
 import org.opensearch.common.annotation.ExperimentalApi;
+import org.opensearch.index.store.remote.file.AbstractBlockIndexInput;
+import org.opensearch.index.store.remote.filecache.CachedFullFileIndexInput;
 import org.opensearch.index.store.remote.filecache.CachedIndexInput;
 import org.opensearch.index.store.remote.filecache.FileCache;
 import org.opensearch.index.store.remote.utils.BlobFetchRequest;
 import org.opensearch.index.store.remote.utils.TransferManager;
+import org.opensearch.storage.indexinput.CachedSwitchableIndexInput;
 import org.opensearch.storage.warmfullfile.WarmFullFileStats.DeclineReason;
 
 import java.io.IOException;
@@ -36,16 +39,17 @@ import java.util.concurrent.Executor;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicLongArray;
+import java.util.function.LongSupplier;
 
 /**
  * Node-level coordinator for warm-tier whole-file promotion.
  *
  * <p>{@link #promote(FullFileState)} runs on a background executor (never the search thread). It admits a promotion
  * only when a download slot is free and the per-segment whole-file budget allows it, downloads the whole file in
- * hand-built 8 MiB parts via {@link TransferManager#fetchBlobAsync}, then opens the family's own memory mapping and
- * flips the state to {@link FullFileState.State#FULL}. On any decline or failure the state returns to
- * {@link FullFileState.State#BLOCK} with a retry time set. Every promotion that reaches FULL is logged at INFO with its
- * download time, and {@link #stats()} returns the node's promotion and decline counters.
+ * parts of {@code partSize} bytes (one block by default) via {@link TransferManager#fetchBlobAsync}, then opens the
+ * family's own memory mapping and flips the state to {@link FullFileState.State#FULL}. On any decline or failure the
+ * state returns to {@link FullFileState.State#BLOCK} with a retry time set. Every promotion that reaches FULL is
+ * logged at INFO with its download time, and {@link #stats()} returns the node's promotion and decline counters.
  *
  * @opensearch.experimental
  */
@@ -54,9 +58,9 @@ public class WarmFullFileManager {
 
     private static final Logger logger = LogManager.getLogger(WarmFullFileManager.class);
 
-    /** Default download/read part size: one block (8 MiB), matching the block path. */
-    static final long DEFAULT_PART_SIZE = 8L * 1024 * 1024;
-    /** Retry delay after a failure or a budget decline. */
+    /** Default download part size: one block, the same size the block path reads. */
+    static final long DEFAULT_PART_SIZE = AbstractBlockIndexInput.Builder.DEFAULT_BLOCK_SIZE;
+    /** Retry delay after a failure or any decline other than no-slot. */
     static final long RETRY_DELAY_MILLIS = 60_000L;
     /**
      * Retry delay after a decline for lack of a free download slot. Short against a download, so a slot freed by a
@@ -99,12 +103,6 @@ public class WarmFullFileManager {
     // No-op in production; tests install a blocking hook to hold a download at a known point.
     private volatile Runnable beforeDownloadHook = () -> {};
 
-    /** A monotonic millisecond clock (injectable for tests). */
-    @FunctionalInterface
-    public interface LongSupplier {
-        long getAsLong();
-    }
-
     /** Runs a task once after a delay (injectable for tests; production uses the node ThreadPool). */
     @FunctionalInterface
     public interface DelayedScheduler {
@@ -113,11 +111,6 @@ public class WarmFullFileManager {
 
     /** A scheduler that drops tasks; used where leak warnings are not needed. */
     static final DelayedScheduler NO_OP_SCHEDULER = (task, delayMillis) -> {};
-
-    /** Production constructor without leak warnings (no scheduler). */
-    public WarmFullFileManager(FileCache fileCache, Executor executor, LongSupplier clock, int allocatedProcessors) {
-        this(fileCache, executor, clock, allocatedProcessors, NO_OP_SCHEDULER);
-    }
 
     /**
      * Production constructor.
@@ -248,11 +241,9 @@ public class WarmFullFileManager {
             }
             bytesReserved = true;
 
-            // Handle any pre-existing entry at the whole-file key before downloading. fetchBlobAsync can only drive
-            // its own in-flight placeholder (DelayedCreationCachedIndexInput, a private type); on any other live
-            // entry its asyncLoadIndexInput default returns null and leaks the compute ref. We cannot name that
-            // private type, so we remove any live entry of a KNOWN non-reusable type and leave anything else (the
-            // placeholder) for fetchBlobAsync to reuse.
+            // An entry already at the whole-file key: fetchBlobAsync can only drive its own in-flight placeholder (a
+            // private type); on any other live entry its asyncLoadIndexInput returns null and leaks the compute
+            // reference. Known non-reusable entry types are removed first; anything else is left for fetchBlobAsync.
             CachedIndexInput existing = fileCache.get(path);
             if (existing != null) {
                 boolean nonReusable = isKnownNonReusableEntry(existing);
@@ -303,10 +294,9 @@ public class WarmFullFileManager {
             refTaken = true;
             FSDirectory localDirectory = st.localDirectory();
             if (localDirectory.fileLength(st.fileName()) != length) {
-                fileCache.decRef(path);
                 // Remove the entry (closes it and deletes the truncated file). Without this, the completed
                 // DelayedCreation entry stays live and the next retry reuses the same truncated file and fails again.
-                fileCache.remove(path);
+                dropEntry(path);
                 failPromotion(st, segment, length, DeclineReason.LENGTH_MISMATCH, "downloaded length mismatch");
                 return;
             }
@@ -317,10 +307,9 @@ public class WarmFullFileManager {
             // extension is on the local directory's NIO list (hybridfs), so it will not change for this family.
             if ((master instanceof MemorySegmentAccessInput) == false) {
                 closeQuietly(master);
-                fileCache.decRef(path);
                 // Drop the useless whole file so it is not charged against the cache until eviction, and so nothing
                 // reuses it.
-                fileCache.remove(path);
+                dropEntry(path);
                 declinePermanently(
                     st,
                     segment,
@@ -337,19 +326,17 @@ public class WarmFullFileManager {
                 // the same download). Keep theirs and unwind only what this handler holds.
                 closeQuietly(master);
                 fileCache.decRef(path);
-                releaseSegmentBytes(segment, length);
-                slots.release();
+                releaseAdmission(segment, length);
                 logger.debug("whole-file mapping for {} was already published by another completion", path);
                 return;
             }
             if (st.casState(FullFileState.State.PROMOTING, FullFileState.State.FULL) == false) {
-                // The family closed while we were publishing (closeFamily saw PROMOTING, so it owes no cleanup). Unwind
-                // this handler's own mapping only; never touch a mapping installed by someone else.
+                // The family closed during the publish (closeFamily saw PROMOTING, so it owes no cleanup). Unwind this
+                // handler's own mapping only; never touch a mapping installed by another handler.
                 closeQuietly(master);
                 st.compareAndSetLocalMaster(master, null);
                 fileCache.decRef(path);
-                releaseSegmentBytes(segment, length);
-                slots.release();
+                releaseAdmission(segment, length);
                 if (st.state() != FullFileState.State.FULL) {
                     decline(st, DeclineReason.FAMILY_CLOSED, "family closed during publish");
                 }
@@ -409,11 +396,10 @@ public class WarmFullFileManager {
      * later files of that extension are logged at DEBUG by {@link #decline(FullFileState, DeclineReason, String, long)}.
      */
     private void declinePermanently(FullFileState st, int segment, long length, String reason) {
-        releaseSegmentBytes(segment, length);
-        slots.release();
+        releaseAdmission(segment, length);
         if (decline(st, DeclineReason.NOT_MMAP, reason, Long.MAX_VALUE)) {
-            String extension = extensionOf(st.fileName());
-            if (permanentlyDeclinedExtensions.add(extension)) {
+            String extension = WarmFullFileSettings.extensionOf(st.fileName());
+            if (extension != null && permanentlyDeclinedExtensions.add(extension)) {
                 logger.warn(
                     "whole-file promotion of [.{}] files is permanently declined on this node: {} (first file [{}]). "
                         + "Remove the extension from [{}] or take it off the local directory's NIO list; "
@@ -429,9 +415,20 @@ public class WarmFullFileManager {
     }
 
     private void failPromotion(FullFileState st, int segment, long length, DeclineReason reason, String detail) {
+        releaseAdmission(segment, length);
+        decline(st, reason, detail);
+    }
+
+    /** Gives back what admission granted a promotion: its reserved budget bytes and its download slot. */
+    private void releaseAdmission(int segment, long length) {
         releaseSegmentBytes(segment, length);
         slots.release();
-        decline(st, reason, detail);
+    }
+
+    /** Releases this handler's reference on the whole-file entry and removes the entry, closing it and deleting its file. */
+    private void dropEntry(Path path) {
+        fileCache.decRef(path);
+        fileCache.remove(path);
     }
 
     private void decline(FullFileState st, DeclineReason reason, String detail) {
@@ -442,8 +439,8 @@ public class WarmFullFileManager {
      * Returns the family to BLOCK with the given retry time and counts the decline under {@code reason}. Sets
      * {@code retryAt} BEFORE the CAS so a trigger racing this decline cannot start a new promotion in between.
      *
-     * @return true if the family went back to BLOCK; false if it closed meanwhile (then a WARN is logged:
-     *         the slot and bytes were held for the whole download because fetchBlobAsync cannot be cancelled)
+     * @return true if the family went back to BLOCK; false if it closed meanwhile, which is logged at WARN because a
+     *         download in flight cannot be cancelled and runs to completion for a family nobody will use
      */
     private boolean decline(FullFileState st, DeclineReason reason, String detail, long retryAt) {
         declinedByReason.incrementAndGet(reason.ordinal());
@@ -453,7 +450,7 @@ public class WarmFullFileManager {
             return true;
         }
         if (st.state() == FullFileState.State.CLOSED) {
-            logger.warn("whole-file download for [{}] completed after its family closed ({})", st.fullFilePath(), detail);
+            logger.warn("whole-file promotion of [{}] ended after its family closed ({})", st.fullFilePath(), detail);
         }
         return false;
     }
@@ -481,23 +478,18 @@ public class WarmFullFileManager {
             downloadMillis.get(),
             declined,
             reservedPerSegment,
+            (long) (perSegmentCapacity * budgetFraction),
             maxConcurrentDownloads - slots.availablePermits()
         );
     }
 
     /** The number of parts a download of {@code length} bytes is split into. */
-    long partCount(long length) {
+    private long partCount(long length) {
         return (length + partSize - 1) / partSize;
     }
 
-    /** The part of the name after the last dot (no leading dot); the whole name if it has no dot. */
-    static String extensionOf(String name) {
-        int dot = name.lastIndexOf('.');
-        return dot < 0 ? name : name.substring(dot + 1);
-    }
-
     /** Builds the download request by hand: ceil(length / partSize) parts at absolute offsets, last clipped, no zero tail. */
-    BlobFetchRequest buildRequest(FullFileState st, long length) {
+    private BlobFetchRequest buildRequest(FullFileState st, long length) {
         List<BlobFetchRequest.BlobPart> parts = buildParts(st.fileName(), length, partSize);
         return BlobFetchRequest.builder().directory(st.localDirectory()).fileName(st.fileName()).blobParts(parts).build();
     }
@@ -525,7 +517,7 @@ public class WarmFullFileManager {
         }
     }
 
-    void releaseSegmentBytes(int segment, long length) {
+    private void releaseSegmentBytes(int segment, long length) {
         perSegmentWholeFileBytes.addAndGet(segment, -length);
     }
 
@@ -563,10 +555,6 @@ public class WarmFullFileManager {
         return segments;
     }
 
-    long perSegmentWholeFileBytes(int segment) {
-        return perSegmentWholeFileBytes.get(segment);
-    }
-
     /** The local directory's mmap chunk size if it is an MMapDirectory, else Lucene's default. */
     static long maxChunkSize(FSDirectory directory) {
         if (directory instanceof MMapDirectory mmap) {
@@ -576,14 +564,14 @@ public class WarmFullFileManager {
     }
 
     /**
-     * True for live cache entries we must never reuse or serve from (and therefore remove before re-downloading): a
-     * completed whole-file entry, a restore-placeholder, or a switchable family entry. The one entry we DO reuse is
+     * True for live cache entries that are never reused or served from, and so are removed before re-downloading: a
+     * completed whole-file entry, a restore placeholder, or a switchable family entry. The one reusable entry is
      * fetchBlobAsync's own in-flight placeholder (a private type), which is not in this set.
      */
     private static boolean isKnownNonReusableEntry(CachedIndexInput entry) {
-        return entry instanceof org.opensearch.index.store.remote.filecache.CachedFullFileIndexInput
-            || entry instanceof org.opensearch.index.store.remote.filecache.FileCache.RestoredCachedIndexInput
-            || entry instanceof org.opensearch.storage.indexinput.CachedSwitchableIndexInput;
+        return entry instanceof CachedFullFileIndexInput
+            || entry instanceof FileCache.RestoredCachedIndexInput
+            || entry instanceof CachedSwitchableIndexInput;
     }
 
     private static void closeQuietly(IndexInput input) {

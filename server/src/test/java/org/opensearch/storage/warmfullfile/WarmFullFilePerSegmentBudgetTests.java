@@ -95,7 +95,7 @@ public class WarmFullFilePerSegmentBudgetTests extends OpenSearchTestCase {
     }
 
     private FullFileState newState(String name) {
-        return new FullFileState(transferManager, localDirectory, null, fileCache, name, FILE_LENGTH, dir.resolve(name));
+        return new FullFileState(transferManager, localDirectory, fileCache, name, FILE_LENGTH, dir.resolve(name));
     }
 
     private void awaitState(FullFileState st, FullFileState.State state) throws Exception {
@@ -115,7 +115,7 @@ public class WarmFullFilePerSegmentBudgetTests extends OpenSearchTestCase {
             awaitState(st, FullFileState.State.FULL);
             full.add(st);
         }
-        assertEquals(admitted * FILE_LENGTH, manager.perSegmentWholeFileBytes(target));
+        assertEquals(admitted * FILE_LENGTH, manager.stats().reservedBytesPerSegment()[target]);
         assertEquals("one read per part per file", admitted * (FILE_LENGTH / PART_SIZE), reader.readCount());
 
         // The next file in the same segment would push the segment past half its capacity: declined.
@@ -134,14 +134,14 @@ public class WarmFullFilePerSegmentBudgetTests extends OpenSearchTestCase {
     public void testAdmissionStopsAtHalfTheSegment() throws Exception {
         List<FullFileState> full = fillTargetSegmentToBudget();
 
-        long wholeFileBytes = manager.perSegmentWholeFileBytes(target);
+        long wholeFileBytes = manager.stats().reservedBytesPerSegment()[target];
         assertTrue("whole-file bytes " + wholeFileBytes + " must stay within the budget " + cap, wholeFileBytes <= cap);
         assertTrue("budget is strictly below the segment capacity", cap < perSegmentCapacity);
         assertEquals(full.size() * FILE_LENGTH, wholeFileBytes);
         // Other segments are untouched.
         for (int s = 0; s < SEGMENTS; s++) {
             if (s != target) {
-                assertEquals("segment " + s, 0L, manager.perSegmentWholeFileBytes(s));
+                assertEquals("segment " + s, 0L, manager.stats().reservedBytesPerSegment()[s]);
             }
         }
         for (FullFileState st : full) {
@@ -187,6 +187,10 @@ public class WarmFullFilePerSegmentBudgetTests extends OpenSearchTestCase {
             assertNotNull("whole file still cached: " + st.fullFilePath(), fileCache.get(st.fullFilePath()));
             fileCache.decRef(st.fullFilePath());
         }
-        assertEquals("whole-file budget unchanged by the block fetch", full.size() * FILE_LENGTH, manager.perSegmentWholeFileBytes(target));
+        assertEquals(
+            "whole-file budget unchanged by the block fetch",
+            full.size() * FILE_LENGTH,
+            manager.stats().reservedBytesPerSegment()[target]
+        );
     }
 }

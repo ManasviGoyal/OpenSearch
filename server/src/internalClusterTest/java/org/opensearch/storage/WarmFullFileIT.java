@@ -8,63 +8,35 @@
 
 package org.opensearch.storage;
 
-import com.carrotsearch.randomizedtesting.annotations.ThreadLeakFilters;
-
-import org.apache.lucene.index.LeafReaderContext;
 import org.apache.lucene.store.AlreadyClosedException;
 import org.opensearch.action.NoShardAvailableActionException;
 import org.opensearch.action.admin.cluster.health.ClusterHealthResponse;
 import org.opensearch.action.admin.indices.close.CloseIndexResponse;
 import org.opensearch.action.admin.indices.open.OpenIndexResponse;
-import org.opensearch.action.bulk.BulkRequest;
-import org.opensearch.action.bulk.BulkResponse;
 import org.opensearch.action.search.SearchPhaseExecutionException;
 import org.opensearch.action.search.SearchResponse;
 import org.opensearch.action.search.ShardSearchFailure;
-import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.cluster.node.DiscoveryNode;
-import org.opensearch.common.lucene.Lucene;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.common.unit.TimeValue;
-import org.opensearch.common.util.FeatureFlags;
-import org.opensearch.core.common.unit.ByteSizeUnit;
-import org.opensearch.core.common.unit.ByteSizeValue;
-import org.opensearch.index.IndexModule;
 import org.opensearch.index.IndexNotFoundException;
 import org.opensearch.index.IndexSettings;
-import org.opensearch.index.TieredMergePolicyProvider;
-import org.opensearch.index.engine.Engine;
-import org.opensearch.index.engine.EngineConfig;
 import org.opensearch.index.query.QueryBuilders;
 import org.opensearch.index.shard.IllegalIndexShardStateException;
-import org.opensearch.index.shard.IndexShard;
 import org.opensearch.index.shard.ShardNotFoundException;
-import org.opensearch.index.store.remote.file.CleanerDaemonThreadLeakFilter;
-import org.opensearch.index.store.remote.filecache.CachedIndexInput;
 import org.opensearch.index.store.remote.filecache.FileCache;
-import org.opensearch.index.store.remote.utils.FileTypeUtils;
 import org.opensearch.indices.IndexClosedException;
-import org.opensearch.indices.IndicesService;
 import org.opensearch.indices.ShardLimitValidator;
-import org.opensearch.node.Node;
-import org.opensearch.remotestore.RemoteStoreBaseIntegTestCase;
 import org.opensearch.search.SearchContextMissingException;
 import org.opensearch.search.SearchHit;
 import org.opensearch.search.sort.SortOrder;
-import org.opensearch.storage.directory.TieredDirectory;
-import org.opensearch.storage.utils.DirectoryUtils;
 import org.opensearch.storage.warmfullfile.FullFileState;
-import org.opensearch.storage.warmfullfile.WarmFullFileManager;
-import org.opensearch.storage.warmfullfile.WarmFullFileSettings;
 import org.opensearch.storage.warmfullfile.WarmFullFileStats;
 import org.opensearch.test.InternalTestCluster;
-import org.opensearch.test.OpenSearchIntegTestCase;
 
-import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
@@ -80,256 +52,24 @@ import static org.opensearch.test.hamcrest.OpenSearchAssertions.assertHitCount;
 import static org.opensearch.test.hamcrest.OpenSearchAssertions.assertNoFailures;
 import static org.hamcrest.Matchers.greaterThan;
 import static org.hamcrest.Matchers.greaterThanOrEqualTo;
-import static org.hamcrest.Matchers.lessThan;
 import static org.hamcrest.Matchers.lessThanOrEqualTo;
 
 /**
  * Integration tests for warm-tier whole-file promotion of {@code .fdt} (stored fields) files served by mmap.
- *
- * @opensearch.experimental
  */
-@ThreadLeakFilters(filters = CleanerDaemonThreadLeakFilter.class)
-@OpenSearchIntegTestCase.ClusterScope(scope = OpenSearchIntegTestCase.Scope.TEST, numDataNodes = 0, supportsDedicatedMasters = false)
-public class WarmFullFileIT extends RemoteStoreBaseIntegTestCase {
+public class WarmFullFileIT extends WarmFullFileBaseIT {
 
     private static final String INDEX_NAME = "warm-full-file-idx";
     private static final String SECOND_INDEX_NAME = "warm-full-file-idx-2";
-    private static final String FDT_EXTENSION = "fdt";
-    private static final String FDT_SUFFIX = "." + FDT_EXTENSION;
 
-    // 1100 documents with a 16 KiB random alphanumeric body give a stored-fields file of roughly 18 MB after a force
-    // merge to one segment: above one 8 MiB block and below the per-cache-segment whole-file budget for up to 64
-    // segments (4 GB cache / 64 segments / 2 = 32 MiB).
-    private static final int NUM_DOCS = 1100;
-    private static final int BODY_LENGTH = 16 * 1024;
-    private static final int BULK_SIZE = 220;
-    private static final long ONE_BLOCK_BYTES = 8L * 1024 * 1024;
-
-    private static final TimeValue BLOCK_MODE_TIMEOUT = TimeValue.timeValueSeconds(90);
-    private static final TimeValue DOWNLOAD_TIMEOUT = TimeValue.timeValueSeconds(120);
-
-    private static final String MAPPING = "{\"properties\":{"
-        + "\"body\":{\"type\":\"keyword\",\"index\":false,\"doc_values\":false},"
-        + "\"tag\":{\"type\":\"keyword\"},"
-        + "\"seq\":{\"type\":\"integer\"}}}";
-
-    @Override
-    protected boolean addMockIndexStorePlugin() {
-        return false;
-    }
-
-    @Override
-    protected boolean ignoreExternalCluster() {
-        return true;
-    }
-
-    @Override
-    protected Settings featureFlagSettings() {
-        return Settings.builder().put(FeatureFlags.WRITABLE_WARM_INDEX_EXPERIMENTAL_FLAG, true).build();
-    }
-
-    @Override
-    protected Settings nodeSettings(int nodeOrdinal) {
-        ByteSizeValue cacheSize = new ByteSizeValue(4, ByteSizeUnit.GB);
-        return Settings.builder()
-            .put(super.nodeSettings(nodeOrdinal))
-            .put(Node.NODE_SEARCH_CACHE_SIZE_SETTING.getKey(), cacheSize.toString())
-            .build();
-    }
-
-    /** A warm shard and the node-level objects the tests inspect on the node that hosts it. */
-    private static final class WarmShard {
-        final String nodeName;
-        final IndexShard shard;
-        final TieredDirectory directory;
-        final FileCache fileCache;
-        final WarmFullFileManager manager;
-
-        WarmShard(String nodeName, IndexShard shard, TieredDirectory directory, FileCache fileCache, WarmFullFileManager manager) {
-            this.nodeName = nodeName;
-            this.shard = shard;
-            this.directory = directory;
-            this.fileCache = fileCache;
-            this.manager = manager;
-        }
-    }
-
-    /** Settings for a 1p0r tiered-storage warm index: no compound segments, and the .fdt served by mmap. */
-    private static Settings warmIndexSettings() {
-        List<String> nioExtensions = IndexModule.INDEX_STORE_HYBRID_NIO_EXTENSIONS.getDefault(Settings.EMPTY)
-            .stream()
-            .filter(extension -> extension.equals(FDT_EXTENSION) == false)
-            .collect(Collectors.toList());
-        return Settings.builder()
-            .put(IndexMetadata.SETTING_NUMBER_OF_SHARDS, 1)
-            .put(IndexMetadata.SETTING_NUMBER_OF_REPLICAS, 0)
-            .put(IndexModule.IS_WARM_INDEX_SETTING.getKey(), true)
-            .put(IndexModule.INDEX_COMPOSITE_STORE_TYPE_SETTING.getKey(), "tiered-storage")
-            .put(EngineConfig.INDEX_USE_COMPOUND_FILE.getKey(), false)
-            .put(TieredMergePolicyProvider.INDEX_COMPOUND_FORMAT_SETTING.getKey(), false)
-            .putList(IndexModule.INDEX_STORE_HYBRID_NIO_EXTENSIONS.getKey(), nioExtensions)
-            .build();
-    }
-
-    private void createWarmIndex(String index) {
-        assertAcked(client().admin().indices().prepareCreate(index).setSettings(warmIndexSettings()).setMapping(MAPPING).get());
-        ensureGreen(index);
-    }
-
-    private void setFullFileExtensions(String... extensions) {
-        assertAcked(
-            client().admin()
-                .cluster()
-                .prepareUpdateSettings()
-                .setPersistentSettings(Settings.builder().putList(WarmFullFileSettings.EXTENSIONS.getKey(), extensions))
-                .get()
-        );
-    }
-
-    private void clearFullFileExtensions() {
-        assertAcked(
-            client().admin()
-                .cluster()
-                .prepareUpdateSettings()
-                .setPersistentSettings(Settings.builder().putNull(WarmFullFileSettings.EXTENSIONS.getKey()))
-                .get()
-        );
-    }
-
-    /** Indexes the large documents with sequence numbers in {@code [from, to)} in bulks of {@link #BULK_SIZE}. */
-    private void indexDocs(String index, int from, int to) {
-        for (int start = from; start < to; start += BULK_SIZE) {
-            BulkRequest bulk = new BulkRequest();
-            for (int i = start; i < Math.min(to, start + BULK_SIZE); i++) {
-                bulk.add(
-                    client().prepareIndex(index)
-                        .setId("doc-" + i)
-                        .setSource("body", randomAlphaOfLength(BODY_LENGTH), "tag", "t" + (i % 10), "seq", i)
-                        .request()
-                );
-            }
-            BulkResponse response = client().bulk(bulk).actionGet();
-            assertFalse(response.buildFailureMessage(), response.hasFailures());
-        }
-    }
+    // The cluster holds two shards, far below the default limit of 1000 per node. Updating this setting is only a way
+    // to publish a cluster state change while a download is held, so any value other than the default works.
+    private static final int RAISED_MAX_SHARDS_PER_NODE = 1500;
 
     /** Indexes {@link #NUM_DOCS} large documents, force-merges to one segment and waits for block mode. */
     private void populateAndMergeToBlocks(String index, WarmShard warmShard) throws Exception {
         indexDocs(index, 0, NUM_DOCS);
-        flushAndRefresh(index);
-        assertNoFailures(client().admin().indices().prepareForceMerge(index).setMaxNumSegments(1).get());
-        flushAndRefresh(index);
-        waitForBlockMode(warmShard);
-    }
-
-    /** Waits until block files exist locally and no plain (whole) segment file remains in the shard directory. */
-    private static void waitForBlockMode(WarmShard warmShard) throws Exception {
-        assertBusy(() -> {
-            List<String> localFiles = Arrays.asList(warmShard.directory.listLocalFiles());
-            assertTrue("no block file yet in " + localFiles, localFiles.stream().anyMatch(FileTypeUtils::isBlockFile));
-            assertTrue("whole segment files still local: " + localFiles, wholeSegmentFiles(localFiles).isEmpty());
-        }, BLOCK_MODE_TIMEOUT.seconds(), TimeUnit.SECONDS);
-    }
-
-    /** The plain segment file names in a local listing: no block files, lock files, segments_N or temporary files. */
-    private static List<String> wholeSegmentFiles(List<String> localFiles) {
-        return localFiles.stream()
-            .filter(file -> FileTypeUtils.isBlockFile(file) == false)
-            .filter(file -> FileTypeUtils.isLockFile(file) == false)
-            .filter(file -> FileTypeUtils.isSegmentsFile(file) == false)
-            .filter(file -> FileTypeUtils.isTempFile(file) == false)
-            .collect(Collectors.toList());
-    }
-
-    private WarmShard warmShard(String index, String nodeName) {
-        IndexShard shard = internalCluster().getInstance(IndicesService.class, nodeName).indexService(resolveIndex(index)).getShard(0);
-        TieredDirectory directory = unwrapToTieredDirectory(shard.store().directory());
-        FileCache fileCache = internalCluster().getInstance(Node.class, nodeName).fileCache();
-        WarmFullFileManager manager = internalCluster().getInstance(WarmFullFileManager.class, nodeName);
-        assertNotNull("warm node has no file cache", fileCache);
-        assertNotNull("warm node has no whole-file manager", manager);
-        return new WarmShard(nodeName, shard, directory, fileCache, manager);
-    }
-
-    /** The files of every segment the shard's current reader is built from. */
-    private static Set<String> segmentFiles(IndexShard shard) throws IOException {
-        try (Engine.Searcher searcher = shard.acquireSearcher("warm-full-file-it")) {
-            Set<String> files = new HashSet<>();
-            for (LeafReaderContext leaf : searcher.getDirectoryReader().leaves()) {
-                files.addAll(Lucene.segmentReader(leaf.reader()).getSegmentInfo().files());
-            }
-            return files;
-        }
-    }
-
-    /** The sorted stored-fields file names of the segments the shard's current reader is built from. */
-    private static List<String> fdts(IndexShard shard) throws IOException {
-        return segmentFiles(shard).stream().filter(f -> f.endsWith(FDT_SUFFIX)).sorted().collect(Collectors.toList());
-    }
-
-    /** The single .fdt of the force-merged segment, checked to be eligible by size and to fit the whole-file budget. */
-    private static String eligibleFdt(WarmShard warmShard) throws Exception {
-        List<String> fdts = fdts(warmShard.shard);
-        assertEquals("expected exactly one stored-fields file after the force merge: " + fdts, 1, fdts.size());
-        String fdt = fdts.get(0);
-        long length = warmShard.directory.fileLength(fdt);
-        assertThat("stored-fields file must exceed one block", length, greaterThan(ONE_BLOCK_BYTES));
-        long perSegmentCapacity = (warmShard.fileCache.capacity() + warmShard.manager.segments() - 1) / warmShard.manager.segments();
-        long budget = perSegmentCapacity / 2;
-        assertThat("stored-fields file must fit the per-segment whole-file budget", length, lessThan(budget));
-        return fdt;
-    }
-
-    /**
-     * True once the whole file is in the shard directory under its plain name with its full size, the cache entry at the
-     * whole-file key reports the full length, and the family is FULL.
-     */
-    private static boolean isPromoted(WarmShard warmShard, String fileName) throws IOException {
-        if (Arrays.asList(warmShard.directory.listLocalFiles()).contains(fileName) == false) {
-            return false;
-        }
-        long length = warmShard.directory.fileLength(fileName);
-        Path key = warmShard.directory.getFilePath(fileName);
-        if (Files.exists(key) == false || Files.size(key) != length) {
-            return false;
-        }
-        CachedIndexInput entry = warmShard.fileCache.get(key);
-        if (entry == null) {
-            return false;
-        }
-        try {
-            if (entry.length() != length) {
-                return false;
-            }
-        } finally {
-            warmShard.fileCache.decRef(key);
-        }
-        return familyState(warmShard, fileName) == FullFileState.State.FULL;
-    }
-
-    /** True if the cache holds any entry at the whole-file key of the given file. */
-    private static boolean hasWholeFileCacheEntry(FileCache fileCache, Path wholeFilePath) {
-        CachedIndexInput entry = fileCache.get(wholeFilePath);
-        if (entry == null) {
-            return false;
-        }
-        fileCache.decRef(wholeFilePath);
-        return true;
-    }
-
-    /** The family's promotion state, or null if the file has no switchable entry. */
-    private static FullFileState.State familyState(WarmShard warmShard, String fileName) {
-        Path key = warmShard.directory.getFilePath(fileName + DirectoryUtils.SWITCHABLE_PREFIX);
-        CachedIndexInput entry = warmShard.fileCache.get(key);
-        if (entry == null) {
-            return null;
-        }
-        try {
-            FullFileState state = entry.fullFileState();
-            return state == null ? null : state.state();
-        } finally {
-            warmShard.fileCache.decRef(key);
-        }
+        mergeToBlocks(index, warmShard);
     }
 
     private SearchResponse searchWithSource(String index) {
@@ -342,17 +82,8 @@ public class WarmFullFileIT extends RemoteStoreBaseIntegTestCase {
     private void searchUntilPromoted(String index, WarmShard warmShard, String fdt) throws Exception {
         assertBusy(() -> {
             searchWithSource(index);
-            assertTrue("whole file not promoted yet, family state " + familyState(warmShard, fdt), isPromoted(warmShard, fdt));
+            assertTrue("whole file not promoted yet, family state " + stateOf(warmShard, fdt), isPromoted(warmShard, fdt));
         }, DOWNLOAD_TIMEOUT.seconds(), TimeUnit.SECONDS);
-    }
-
-    /** Closes and re-opens the index so that the reader opens its file handles from the remote (block) copy. */
-    private void reopenIndex(String index) {
-        CloseIndexResponse close = client().admin().indices().prepareClose(index).get();
-        assertTrue(close.isShardsAcknowledged());
-        OpenIndexResponse open = client().admin().indices().prepareOpen(index).get();
-        assertTrue(open.isShardsAcknowledged());
-        ensureGreen(TimeValue.timeValueSeconds(90), index);
     }
 
     /**
@@ -394,13 +125,6 @@ public class WarmFullFileIT extends RemoteStoreBaseIntegTestCase {
         return sb.toString();
     }
 
-    /** Starts a cluster-manager node and one data+warm node; returns the warm node's name. */
-    private String startCluster() {
-        InternalTestCluster cluster = internalCluster();
-        cluster.startClusterManagerOnlyNode();
-        return cluster.startDataAndWarmNodes(1).get(0);
-    }
-
     /**
      * Creates the index, fills it, waits for block mode, enables promotion of .fdt files and re-opens the index so the
      * reader's handles are opened from blocks. Returns the warm shard after the re-open.
@@ -415,8 +139,16 @@ public class WarmFullFileIT extends RemoteStoreBaseIntegTestCase {
         return warmShard;
     }
 
-    private void deleteIndex(String index) {
-        assertAcked(client().admin().indices().prepareDelete(index).get());
+    /** A download hook that signals {@code entered} and then blocks until {@code release} is counted down. */
+    private static Runnable holdDownload(CountDownLatch entered, CountDownLatch release) {
+        return () -> {
+            entered.countDown();
+            try {
+                release.await(DOWNLOAD_TIMEOUT.seconds(), TimeUnit.SECONDS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        };
     }
 
     public void testNoPromotionOnOpenRefreshOrForceMerge() throws Exception {
@@ -436,9 +168,9 @@ public class WarmFullFileIT extends RemoteStoreBaseIntegTestCase {
             refresh(INDEX_NAME);
             assertNoFailures(client().admin().indices().prepareForceMerge(INDEX_NAME).setMaxNumSegments(1).get());
             flushAndRefresh(INDEX_NAME);
-            assertTrue(wholeSegmentFiles(Arrays.asList(warmShard.directory.listLocalFiles())).isEmpty());
+            assertTrue(wholeSegmentFiles(localFiles(warmShard)).isEmpty());
             assertFalse(hasWholeFileCacheEntry(warmShard.fileCache, wholeFilePath));
-            assertEquals(FullFileState.State.BLOCK, familyState(warmShard, fdt));
+            assertEquals(FullFileState.State.BLOCK, stateOf(warmShard, fdt));
         }
 
         deleteIndex(INDEX_NAME);
@@ -452,8 +184,7 @@ public class WarmFullFileIT extends RemoteStoreBaseIntegTestCase {
             .put(warmIndexSettings())
             .put(IndexSettings.INDEX_REFRESH_INTERVAL_SETTING.getKey(), -1)
             .build();
-        assertAcked(client().admin().indices().prepareCreate(INDEX_NAME).setSettings(settings).setMapping(MAPPING).get());
-        ensureGreen(INDEX_NAME);
+        createWarmIndex(INDEX_NAME, settings);
         WarmShard warmShard = warmShard(INDEX_NAME, warmNode);
 
         // Two segments without a force merge, each with a stored-fields file above one block.
@@ -475,7 +206,7 @@ public class WarmFullFileIT extends RemoteStoreBaseIntegTestCase {
         waitForBlockMode(warmShard);
         assertEquals(sourceFdts, fdts(warmShard.shard));
         for (String fdt : sourceFdts) {
-            assertEquals(FullFileState.State.BLOCK, familyState(warmShard, fdt));
+            assertEquals(FullFileState.State.BLOCK, stateOf(warmShard, fdt));
         }
         WarmFullFileStats before = warmShard.manager.stats();
 
@@ -500,7 +231,7 @@ public class WarmFullFileIT extends RemoteStoreBaseIntegTestCase {
         String mergedFdt = eligibleFdt(warmShard);
         assertFalse(hasWholeFileCacheEntry(warmShard.fileCache, warmShard.directory.getFilePath(mergedFdt)));
         assertFalse(isPromoted(warmShard, mergedFdt));
-        assertTrue(wholeSegmentFiles(Arrays.asList(warmShard.directory.listLocalFiles())).isEmpty());
+        assertTrue(wholeSegmentFiles(localFiles(warmShard)).isEmpty());
 
         // A search promotes the merged file, so the index was eligible all along.
         searchUntilPromoted(INDEX_NAME, warmShard, mergedFdt);
@@ -523,7 +254,7 @@ public class WarmFullFileIT extends RemoteStoreBaseIntegTestCase {
         waitForBlockMode(warmShard);
         String fdt = eligibleFdt(warmShard);
         assertFalse(isPromoted(warmShard, fdt));
-        assertEquals(FullFileState.State.BLOCK, familyState(warmShard, fdt));
+        assertEquals(FullFileState.State.BLOCK, stateOf(warmShard, fdt));
 
         List<String> beforePromotion = queryFingerprint(INDEX_NAME);
         assertEquals(featureOff, beforePromotion);
@@ -532,7 +263,7 @@ public class WarmFullFileIT extends RemoteStoreBaseIntegTestCase {
 
         List<String> afterPromotion = queryFingerprint(INDEX_NAME);
         assertEquals(beforePromotion, afterPromotion);
-        assertEquals(FullFileState.State.FULL, familyState(warmShard, fdt));
+        assertEquals(FullFileState.State.FULL, stateOf(warmShard, fdt));
 
         deleteIndex(INDEX_NAME);
     }
@@ -551,7 +282,7 @@ public class WarmFullFileIT extends RemoteStoreBaseIntegTestCase {
         List<String> beforePromotion = queryFingerprint(INDEX_NAME);
         searchUntilPromoted(INDEX_NAME, warmShard, fdt);
 
-        assertEquals(FullFileState.State.FULL, familyState(warmShard, fdt));
+        assertEquals(FullFileState.State.FULL, stateOf(warmShard, fdt));
         assertEquals(beforePromotion, queryFingerprint(INDEX_NAME));
         deleteIndex(INDEX_NAME);
     }
@@ -570,12 +301,12 @@ public class WarmFullFileIT extends RemoteStoreBaseIntegTestCase {
             queryFingerprint(INDEX_NAME);
         }
 
-        List<String> wholeLocalFiles = wholeSegmentFiles(Arrays.asList(warmShard.directory.listLocalFiles()));
+        List<String> wholeLocalFiles = wholeSegmentFiles(localFiles(warmShard));
         assertEquals("only the stored-fields file may be a whole local file: " + wholeLocalFiles, List.of(fdt), wholeLocalFiles);
         for (String other : otherFiles) {
             Path otherWholeFilePath = warmShard.directory.getFilePath(other);
             assertFalse(other + " has a whole-file cache entry", hasWholeFileCacheEntry(warmShard.fileCache, otherWholeFilePath));
-            FullFileState.State state = familyState(warmShard, other);
+            FullFileState.State state = stateOf(warmShard, other);
             assertTrue(other + " is in state " + state, state == null || state == FullFileState.State.BLOCK);
         }
 
@@ -600,13 +331,13 @@ public class WarmFullFileIT extends RemoteStoreBaseIntegTestCase {
         for (int i = 0; i < 20; i++) {
             searchWithSource(SECOND_INDEX_NAME);
             assertFalse("second index promoted with the feature off", isPromoted(second, secondFdt));
-            assertEquals(FullFileState.State.BLOCK, familyState(second, secondFdt));
+            assertEquals(FullFileState.State.BLOCK, stateOf(second, secondFdt));
         }
-        assertTrue(wholeSegmentFiles(Arrays.asList(second.directory.listLocalFiles())).isEmpty());
+        assertTrue(wholeSegmentFiles(localFiles(second)).isEmpty());
 
         // The already promoted family keeps serving from its whole file.
         assertTrue(isPromoted(first, firstFdt));
-        assertEquals(FullFileState.State.FULL, familyState(first, firstFdt));
+        assertEquals(FullFileState.State.FULL, stateOf(first, firstFdt));
         assertEquals(firstFingerprint, queryFingerprint(INDEX_NAME));
 
         deleteIndex(INDEX_NAME);
@@ -622,18 +353,11 @@ public class WarmFullFileIT extends RemoteStoreBaseIntegTestCase {
 
         CountDownLatch entered = new CountDownLatch(1);
         CountDownLatch release = new CountDownLatch(1);
-        warmShard.manager.setBeforeDownloadHook(() -> {
-            entered.countDown();
-            try {
-                release.await(2, TimeUnit.MINUTES);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-            }
-        });
+        warmShard.manager.setBeforeDownloadHook(holdDownload(entered, release));
         long usageBeforeDownload;
         try {
             searchWithSource(INDEX_NAME);
-            assertTrue("download never reached the hook", entered.await(60, TimeUnit.SECONDS));
+            assertTrue("download never reached the hook", entered.await(WAIT_TIMEOUT.seconds(), TimeUnit.SECONDS));
             usageBeforeDownload = warmShard.fileCache.usage();
             deleteIndex(INDEX_NAME);
         } finally {
@@ -686,12 +410,16 @@ public class WarmFullFileIT extends RemoteStoreBaseIntegTestCase {
             thread.start();
         }
         try {
-            assertBusy(() -> assertThat(completedSearches.get(), greaterThanOrEqualTo(threadCount * 3)), 60, TimeUnit.SECONDS);
+            assertBusy(
+                () -> assertThat(completedSearches.get(), greaterThanOrEqualTo(threadCount * 3)),
+                WAIT_TIMEOUT.seconds(),
+                TimeUnit.SECONDS
+            );
             deleteIndex(INDEX_NAME);
         } finally {
             stop.set(true);
             for (Thread thread : searchers) {
-                thread.join(TimeUnit.SECONDS.toMillis(60));
+                thread.join(WAIT_TIMEOUT.millis());
                 assertFalse("search thread did not finish: " + thread.getName(), thread.isAlive());
             }
         }
@@ -705,8 +433,8 @@ public class WarmFullFileIT extends RemoteStoreBaseIntegTestCase {
         createWarmIndex(SECOND_INDEX_NAME);
         for (int i = 0; i < 10; i++) {
             client().prepareIndex(SECOND_INDEX_NAME)
-                .setId("doc-" + i)
-                .setSource("body", randomAlphaOfLength(32), "tag", "t1", "seq", i)
+                .setId(docId(i))
+                .setSource(BODY_FIELD, randomAlphaOfLength(32), "tag", "t1", "seq", i)
                 .get();
         }
         refresh(SECOND_INDEX_NAME);
@@ -721,24 +449,20 @@ public class WarmFullFileIT extends RemoteStoreBaseIntegTestCase {
 
         CountDownLatch entered = new CountDownLatch(1);
         CountDownLatch release = new CountDownLatch(1);
-        warmShard.manager.setBeforeDownloadHook(() -> {
-            entered.countDown();
-            try {
-                release.await(2, TimeUnit.MINUTES);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-            }
-        });
+        warmShard.manager.setBeforeDownloadHook(holdDownload(entered, release));
         try {
             searchWithSource(INDEX_NAME);
-            assertTrue("download never reached the hook", entered.await(60, TimeUnit.SECONDS));
+            assertTrue("download never reached the hook", entered.await(WAIT_TIMEOUT.seconds(), TimeUnit.SECONDS));
 
+            // Cluster state updates must complete within this limit while the download is held.
             TimeValue limit = TimeValue.timeValueSeconds(30);
             assertAcked(
                 client().admin()
                     .cluster()
                     .prepareUpdateSettings()
-                    .setPersistentSettings(Settings.builder().put(ShardLimitValidator.SETTING_CLUSTER_MAX_SHARDS_PER_NODE.getKey(), 1500))
+                    .setPersistentSettings(
+                        Settings.builder().put(ShardLimitValidator.SETTING_CLUSTER_MAX_SHARDS_PER_NODE.getKey(), RAISED_MAX_SHARDS_PER_NODE)
+                    )
                     .get(limit)
             );
             assertAcked(client().admin().indices().prepareCreate(SECOND_INDEX_NAME).setSettings(warmIndexSettings()).get(limit));
@@ -775,7 +499,7 @@ public class WarmFullFileIT extends RemoteStoreBaseIntegTestCase {
         // overwrite that leftover with zeros: if it were ever served, searches would no longer return the original
         // documents.
         CloseIndexResponse close = client().admin().indices().prepareClose(INDEX_NAME).get();
-        assertTrue(close.isShardsAcknowledged());
+        assertShardsAcknowledged(close);
         AtomicBoolean leftoverSeen = new AtomicBoolean(false);
         internalCluster().restartNode(warmNode, new InternalTestCluster.RestartCallback() {
             @Override
@@ -789,8 +513,8 @@ public class WarmFullFileIT extends RemoteStoreBaseIntegTestCase {
         });
         assertTrue("the whole file should have survived the shutdown", leftoverSeen.get());
         OpenIndexResponse open = client().admin().indices().prepareOpen(INDEX_NAME).get();
-        assertTrue(open.isShardsAcknowledged());
-        ensureGreen(TimeValue.timeValueSeconds(90), INDEX_NAME);
+        assertShardsAcknowledged(open);
+        ensureGreen(ENSURE_GREEN_TIMEOUT, INDEX_NAME);
 
         WarmShard restarted = warmShard(INDEX_NAME, warmNode);
         AtomicInteger downloads = new AtomicInteger();

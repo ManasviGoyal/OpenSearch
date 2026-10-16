@@ -7,15 +7,28 @@
  */
 package org.opensearch.storage.warmfullfile;
 
+import org.apache.lucene.store.IndexInput;
+import org.opensearch.common.lucene.store.ByteArrayIndexInput;
+import org.opensearch.index.store.remote.filecache.FileCache;
+import org.opensearch.index.store.remote.filecache.FileCacheFactory;
 import org.opensearch.test.OpenSearchTestCase;
 
 import java.nio.file.Path;
+import java.util.List;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.CyclicBarrier;
+import java.util.concurrent.Executor;
+import java.util.concurrent.atomic.AtomicInteger;
+
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.verify;
 
 public class FullFileStateTests extends OpenSearchTestCase {
 
     private FullFileState newState() {
         // The reference-type fields are only consumed by the manager; null is fine for state-machine tests.
-        return new FullFileState(null, null, null, null, "_5.faiss", 1_700_000_000L, Path.of("/cache/_5.faiss"));
+        return new FullFileState(null, null, null, "_5.faiss", 1_700_000_000L, Path.of("/cache/_5.faiss"));
     }
 
     public void testStartsInBlock() {
@@ -29,8 +42,8 @@ public class FullFileStateTests extends OpenSearchTestCase {
     public void testCompareAndSetLocalMasterInstallsOnceAndClearsOnlyTheInstalledMapping() throws Exception {
         FullFileState st = newState();
         try (
-            org.apache.lucene.store.IndexInput first = new org.opensearch.common.lucene.store.ByteArrayIndexInput("first", new byte[4]);
-            org.apache.lucene.store.IndexInput second = new org.opensearch.common.lucene.store.ByteArrayIndexInput("second", new byte[4])
+            IndexInput first = new ByteArrayIndexInput("first", new byte[4]);
+            IndexInput second = new ByteArrayIndexInput("second", new byte[4])
         ) {
             assertTrue("first publish installs", st.compareAndSetLocalMaster(null, first));
             assertFalse("second publish is rejected while one is installed", st.compareAndSetLocalMaster(null, second));
@@ -63,14 +76,6 @@ public class FullFileStateTests extends OpenSearchTestCase {
         assertEquals(FullFileState.State.FULL, st.state());
     }
 
-    public void testGetAndSetClosedReturnsPrevious() {
-        FullFileState st = newState();
-        st.casState(FullFileState.State.BLOCK, FullFileState.State.PROMOTING);
-        st.casState(FullFileState.State.PROMOTING, FullFileState.State.FULL);
-        assertEquals(FullFileState.State.FULL, st.getAndSetClosed());
-        assertEquals(FullFileState.State.CLOSED, st.state());
-    }
-
     public void testHandleCount() {
         FullFileState st = newState();
         assertEquals(1, st.incHandles());
@@ -94,8 +99,8 @@ public class FullFileStateTests extends OpenSearchTestCase {
     // ---------------- deferred close ----------------
 
     /** Records tasks instead of running them, so a test can prove the cleanup never runs on the calling thread. */
-    private static final class RecordingExecutor implements java.util.concurrent.Executor {
-        final java.util.List<Runnable> tasks = new java.util.concurrent.CopyOnWriteArrayList<>();
+    private static final class RecordingExecutor implements Executor {
+        final List<Runnable> tasks = new CopyOnWriteArrayList<>();
 
         @Override
         public void execute(Runnable command) {
@@ -110,24 +115,23 @@ public class FullFileStateTests extends OpenSearchTestCase {
     }
 
     private static final class Fixture {
-        final org.opensearch.index.store.remote.filecache.FileCache fileCache = org.opensearch.index.store.remote.filecache.FileCacheFactory
-            .createConcurrentLRUFileCache(1_000_000, 1);
+        final FileCache fileCache = FileCacheFactory.createConcurrentLRUFileCache(1_000_000, 1);
         final Path path = Path.of("/cache/_5.faiss");
-        final org.apache.lucene.store.IndexInput master = org.mockito.Mockito.mock(org.apache.lucene.store.IndexInput.class);
+        final IndexInput master = mock(IndexInput.class);
         final RecordingExecutor executor = new RecordingExecutor();
-        final java.util.concurrent.atomic.AtomicInteger budgetReleases = new java.util.concurrent.atomic.AtomicInteger();
-        final java.util.concurrent.atomic.AtomicInteger stuckReports = new java.util.concurrent.atomic.AtomicInteger();
+        final AtomicInteger budgetReleases = new AtomicInteger();
+        final AtomicInteger stuckReports = new AtomicInteger();
         final FullFileState st;
 
         Fixture() {
             // The family's reference on the whole-file entry (put takes one, as the manager's get() does).
-            fileCache.put(path, new org.opensearch.index.store.remote.filecache.FileCache.RestoredCachedIndexInput(10));
-            st = new FullFileState(null, null, null, fileCache, "_5.faiss", 10, path);
+            fileCache.put(path, new FileCache.RestoredCachedIndexInput(10));
+            st = new FullFileState(null, null, fileCache, "_5.faiss", 10, path);
         }
 
         void goFull() {
             st.attachCleanup(executor, budgetReleases::incrementAndGet, stuckReports::incrementAndGet);
-            st.setLocalMaster(master);
+            assertTrue(st.compareAndSetLocalMaster(null, master));
             assertTrue(st.casState(FullFileState.State.BLOCK, FullFileState.State.PROMOTING));
             assertTrue(st.casState(FullFileState.State.PROMOTING, FullFileState.State.FULL));
         }
@@ -143,12 +147,12 @@ public class FullFileStateTests extends OpenSearchTestCase {
         assertEquals("budget released at close", 1, f.budgetReleases.get());
         assertEquals("cleanup scheduled once", 1, f.executor.tasks.size());
         // Not run inline: the caller may be the FileCache removal listener holding a segment lock.
-        org.mockito.Mockito.verify(f.master, org.mockito.Mockito.never()).close();
+        verify(f.master, never()).close();
         assertEquals(Integer.valueOf(1), f.fileCache.getRef(f.path));
         assertFalse(f.st.cleanupDone());
 
         f.executor.runAll();
-        org.mockito.Mockito.verify(f.master).close();
+        verify(f.master).close();
         assertEquals("family reference released", Integer.valueOf(0), f.fileCache.getRef(f.path));
         assertTrue(f.st.cleanupDone());
         assertNull(f.st.localMaster());
@@ -172,7 +176,7 @@ public class FullFileStateTests extends OpenSearchTestCase {
         f.st.decHandles();
         assertEquals("last close schedules the cleanup", 1, f.executor.tasks.size());
         f.executor.runAll();
-        org.mockito.Mockito.verify(f.master).close();
+        verify(f.master).close();
         assertEquals(Integer.valueOf(0), f.fileCache.getRef(f.path));
     }
 
@@ -188,7 +192,7 @@ public class FullFileStateTests extends OpenSearchTestCase {
         // completion handler sees the lost CAS and unwinds; closeFamily must not ALSO clean up (double close/decRef).
         Fixture promoting = new Fixture();
         promoting.st.attachCleanup(promoting.executor, promoting.budgetReleases::incrementAndGet, () -> {});
-        promoting.st.setLocalMaster(promoting.master);
+        assertTrue(promoting.st.compareAndSetLocalMaster(null, promoting.master));
         assertTrue(promoting.st.casState(FullFileState.State.BLOCK, FullFileState.State.PROMOTING));
         promoting.st.incHandles();
         promoting.st.closeFamily();
@@ -196,7 +200,7 @@ public class FullFileStateTests extends OpenSearchTestCase {
         promoting.st.decHandles();
         assertEquals(0, promoting.budgetReleases.get());
         assertTrue(promoting.executor.tasks.isEmpty());
-        org.mockito.Mockito.verify(promoting.master, org.mockito.Mockito.never()).close();
+        verify(promoting.master, never()).close();
     }
 
     public void testRepeatedCloseFamilyIsIdempotent() throws Exception {
@@ -213,7 +217,7 @@ public class FullFileStateTests extends OpenSearchTestCase {
             Fixture f = new Fixture();
             f.goFull();
             f.st.incHandles();
-            java.util.concurrent.CyclicBarrier barrier = new java.util.concurrent.CyclicBarrier(2);
+            CyclicBarrier barrier = new CyclicBarrier(2);
             Thread closer = new Thread(() -> {
                 await(barrier);
                 f.st.closeFamily();
@@ -231,7 +235,7 @@ public class FullFileStateTests extends OpenSearchTestCase {
         }
     }
 
-    private static void await(java.util.concurrent.CyclicBarrier barrier) {
+    private static void await(CyclicBarrier barrier) {
         try {
             barrier.await();
         } catch (Exception e) {
