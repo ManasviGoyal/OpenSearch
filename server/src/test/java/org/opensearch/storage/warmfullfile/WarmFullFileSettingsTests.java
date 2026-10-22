@@ -16,6 +16,7 @@ import org.opensearch.threadpool.TestThreadPool;
 import org.opensearch.threadpool.ThreadPool;
 import org.junit.Before;
 
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Set;
 
@@ -67,6 +68,20 @@ public class WarmFullFileSettingsTests extends OpenSearchTestCase {
         assertTrue(settings.isExtensionEligible("faiss"));
         assertTrue(settings.isExtensionEligible("veq"));
         assertFalse(settings.isExtensionEligible("vec"));
+    }
+
+    public void testListenerSeesTheCurrentSetAndEveryUpdate() {
+        WarmFullFileSettings settings = new WarmFullFileSettings(clusterService.getClusterSettings());
+        List<Set<String>> seen = new ArrayList<>();
+        settings.addListener(seen::add);
+        assertEquals("called once on registration with the current set", List.of(Set.of()), seen);
+
+        clusterService.getClusterSettings()
+            .applySettings(Settings.builder().putList(WarmFullFileSettings.EXTENSIONS.getKey(), List.of("faiss", ".VEQ")).build());
+        assertEquals(List.of(Set.of(), Set.of("faiss", "veq")), seen);
+
+        clusterService.getClusterSettings().applySettings(Settings.builder().putNull(WarmFullFileSettings.EXTENSIONS.getKey()).build());
+        assertEquals("clearing the setting is reported as an empty set", Set.of(), seen.get(seen.size() - 1));
     }
 
     public void testExtensionsAreNormalized() {

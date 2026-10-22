@@ -17,6 +17,7 @@ import org.apache.lucene.store.RandomAccessInput;
 import org.opensearch.common.util.concurrent.OpenSearchExecutors;
 import org.opensearch.storage.warmfullfile.FullFileState;
 import org.opensearch.storage.warmfullfile.WarmFullFileManager;
+import org.opensearch.storage.warmfullfile.WarmFullFileSettings;
 
 import java.io.IOException;
 import java.lang.ref.Cleaner;
@@ -37,6 +38,8 @@ public class SwitchableIndexInputWrapper extends FilterIndexInput implements Ran
     private final SwitchableIndexInput switchableIndexInput;
     private final FullFileState fullFileState;
     private final boolean eligible;
+    // The file's extension, checked against the setting at trigger time; null when the name has none.
+    private final String extension;
     private final WarmFullFileManager manager;
     // Non-null only for handles opened by openInput: true while this handle holds its one count on the family state.
     private final AtomicBoolean handleCounted;
@@ -52,7 +55,8 @@ public class SwitchableIndexInputWrapper extends FilterIndexInput implements Ran
      * @param resourceDescription a human-readable description
      * @param in                  the underlying switchable input
      * @param fullFileState       the family's whole-file promotion state (may be null when the feature is off)
-     * @param eligible            whether this handle may trigger whole-file promotion (decided once in openInput)
+     * @param eligible            whether this handle may trigger whole-file promotion (the open-time rules, decided
+     *                            once in openInput; the setting itself is read at trigger time)
      * @param manager             the node-level promotion manager (may be null when the feature is off)
      */
     public SwitchableIndexInputWrapper(
@@ -79,6 +83,7 @@ public class SwitchableIndexInputWrapper extends FilterIndexInput implements Ran
         this.switchableIndexInput = in;
         this.fullFileState = fullFileState;
         this.eligible = eligible;
+        this.extension = fullFileState == null ? null : WarmFullFileSettings.extensionOf(fullFileState.fileName());
         this.manager = manager;
         CLEANER.register(this, switchableIndexInput);
         if (countsHandle && fullFileState != null) {
@@ -181,7 +186,8 @@ public class SwitchableIndexInputWrapper extends FilterIndexInput implements Ran
 
     /**
      * Requests promotion at most once per BLOCK period: only an eligible handle whose file is in remote (block) mode,
-     * only in BLOCK, only after retryAt, never on a Lucene merge thread, and only for the thread that wins the CAS. The
+     * only in BLOCK, only after retryAt, only while the setting still lists the extension, never while a demoted
+     * family's old mapping is still held, never on a Lucene merge thread, and only for the thread that wins the CAS. The
      * trigger does a CAS and an executor submit and nothing else; promote() never runs on the search thread.
      */
     private void maybeTrigger(FullFileState st) {
@@ -194,6 +200,11 @@ public class SwitchableIndexInputWrapper extends FilterIndexInput implements Ran
             return;
         }
         if (st.state() != FullFileState.State.BLOCK || manager.relativeTimeInMillis() < st.retryAt()) {
+            return;
+        }
+        // Read the setting now, not only at open: an extension removed since this handle was opened must not promote,
+        // and one added since must. A demoted family waits until its previous mapping is released before mapping again.
+        if (manager.isExtensionEligible(extension) == false || st.isMappingReleasePending()) {
             return;
         }
         // A merge reads a source segment once and then deletes it, so promoting for it only spends a slot, budget and

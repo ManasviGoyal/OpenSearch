@@ -43,6 +43,7 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
+import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
@@ -1179,6 +1180,108 @@ public class WarmFullFileManagerTests extends OpenSearchTestCase {
         assertNotNull(fileCache.get(path));
         fileCache.decRef(path);
         assertEquals(Integer.valueOf(1), fileCache.getRef(path));
+    }
+
+    // ---------- demotion when the setting drops an extension ----------
+
+    /** Promotes {@code name} to FULL through a real download of footered content and returns its family. */
+    private FullFileState promoteToFull(WarmFullFileManager mgr, FileCache fileCache, String name, byte[] content, TransferManager tm)
+        throws Exception {
+        FullFileState st = newStateWithChecksum(tm, fileCache, name, content.length, footerChecksum(content));
+        startPromotion(mgr, st);
+        awaitState(st, FullFileState.State.FULL);
+        return st;
+    }
+
+    public void testDemotionWithoutHandlesReleasesMappingFileAndBudget() throws Exception {
+        // The setting drops the family's extension while no handle is open: the family goes back to BLOCK at once and
+        // the mapping, the cache entry with its file, and the budget are released; with the extension back, the next
+        // promotion downloads the file again.
+        String name = "_demote.faiss";
+        Path path = dir.resolve(name);
+        byte[] content = footeredContent(FILE_LENGTH);
+        FixedContentStreamReader reader = new FixedContentStreamReader(content);
+        FileCache fileCache = newFileCache();
+        TransferManager tm = new TransferManager(reader, fileCache, threadPool);
+        WarmFullFileManager mgr = newManager(fileCache, 4, 0.5);
+        mgr.onExtensionsChanged(Set.of("faiss"));
+        FullFileState st = promoteToFull(mgr, fileCache, name, content, tm);
+        int parts = partsFor(name, content.length);
+        assertEquals(parts, reader.readCount());
+        assertEquals(content.length, mgr.stats().reservedBytesPerSegment()[0]);
+
+        mgr.onExtensionsChanged(Set.of());
+
+        assertEquals(FullFileState.State.BLOCK, st.state());
+        assertBusy(() -> {
+            assertTrue("deferred release ran", st.cleanupDone());
+            assertNull("mapping closed", st.localMaster());
+            assertEquals("budget released", 0L, mgr.stats().reservedBytesPerSegment()[0]);
+            assertNull("whole file dropped from the cache", fileCache.get(path));
+            assertFalse("whole file deleted", Files.exists(path));
+        }, 30, TimeUnit.SECONDS);
+        assertFalse(st.isMappingReleasePending());
+        assertEquals(1L, mgr.stats().demoted());
+
+        mgr.onExtensionsChanged(Set.of("faiss"));
+        startPromotion(mgr, st);
+        awaitState(st, FullFileState.State.FULL);
+        assertEquals("downloaded again after the demotion", 2 * parts, reader.readCount());
+        assertEquals(content.length, mgr.stats().reservedBytesPerSegment()[0]);
+        assertEquals(2L, mgr.stats().promoted());
+    }
+
+    public void testDemotionWithOpenHandleWaitsForItsClose() throws Exception {
+        // A handle is open when the extension is dropped: the family is BLOCK at once, but the mapping, the entry and
+        // the budget stay until that handle closes, and the family cannot be promoted again in between.
+        String name = "_demote_handle.faiss";
+        Path path = dir.resolve(name);
+        byte[] content = footeredContent(FILE_LENGTH);
+        FileCache fileCache = newFileCache();
+        TransferManager tm = new TransferManager(new FixedContentStreamReader(content), fileCache, threadPool);
+        WarmFullFileManager mgr = newManager(fileCache, 4, 0.5);
+        mgr.onExtensionsChanged(Set.of("faiss"));
+        FullFileState st = promoteToFull(mgr, fileCache, name, content, tm);
+        st.incHandles();
+
+        mgr.onExtensionsChanged(Set.of());
+
+        assertEquals(FullFileState.State.BLOCK, st.state());
+        assertTrue("release waits for the handle", st.isMappingReleasePending());
+        assertNotNull("mapping kept under the open handle", st.localMaster());
+        assertEquals("budget still held", content.length, mgr.stats().reservedBytesPerSegment()[0]);
+        assertNotNull(fileCache.get(path));
+        fileCache.decRef(path);
+        assertFalse(st.cleanupDone());
+
+        st.decHandles();
+        assertBusy(() -> {
+            assertTrue(st.cleanupDone());
+            assertNull(st.localMaster());
+            assertEquals(0L, mgr.stats().reservedBytesPerSegment()[0]);
+            assertNull(fileCache.get(path));
+        }, 30, TimeUnit.SECONDS);
+        assertFalse(st.isMappingReleasePending());
+    }
+
+    public void testOnlyFamiliesOfRemovedExtensionsAreDemoted() throws Exception {
+        // Two FULL families of different extensions; the setting keeps one: only the other is demoted.
+        byte[] content = footeredContent(FILE_LENGTH);
+        FileCache fileCache = newFileCache();
+        TransferManager tm = new TransferManager(new FixedContentStreamReader(content), fileCache, threadPool);
+        WarmFullFileManager mgr = newManager(fileCache, 4, 0.5);
+        mgr.onExtensionsChanged(Set.of("faiss", "veq"));
+        FullFileState graph = promoteToFull(mgr, fileCache, "_7.faiss", content, tm);
+        FullFileState codes = promoteToFull(mgr, fileCache, "_7.veq", content, tm);
+
+        mgr.onExtensionsChanged(Set.of("veq"));
+
+        assertEquals(FullFileState.State.BLOCK, graph.state());
+        assertEquals(FullFileState.State.FULL, codes.state());
+        assertEquals(1L, mgr.stats().demoted());
+        assertBusy(() -> assertTrue(graph.cleanupDone()), 30, TimeUnit.SECONDS);
+        assertNotNull("the kept family still serves its mapping", codes.localMaster());
+        assertEquals("the kept family's bytes stay reserved", content.length, mgr.stats().reservedBytesPerSegment()[0]);
     }
 
     // ---------- whole files left on disk, validated against the remote checksum ----------

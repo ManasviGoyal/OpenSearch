@@ -151,6 +151,28 @@ public class WarmFullFileIT extends WarmFullFileBaseIT {
         };
     }
 
+    public void testEnablingExtensionsAfterOpenPromotesWithoutReopen() throws Exception {
+        // The reader's handles are opened while the setting is empty. Adding the extension afterwards is enough: the
+        // next search promotes, with no index close/open.
+        String warmNode = startCluster();
+        createWarmIndex(INDEX_NAME);
+        populateAndMergeToBlocks(INDEX_NAME, warmShard(INDEX_NAME, warmNode));
+        reopenIndex(INDEX_NAME);
+        WarmShard warmShard = warmShard(INDEX_NAME, warmNode);
+        waitForBlockMode(warmShard);
+        String fdt = eligibleFdt(warmShard);
+        for (int i = 0; i < 5; i++) {
+            searchWithSource(INDEX_NAME);
+            assertEquals("nothing promotes while the setting is empty", FullFileState.State.BLOCK, stateOf(warmShard, fdt));
+        }
+
+        setFullFileExtensions(FDT_EXTENSION);
+        searchUntilPromoted(INDEX_NAME, warmShard, fdt);
+        assertEquals(FullFileState.State.FULL, stateOf(warmShard, fdt));
+
+        deleteIndex(INDEX_NAME);
+    }
+
     public void testNoPromotionOnOpenRefreshOrForceMerge() throws Exception {
         String warmNode = startCluster();
         setFullFileExtensions(FDT_EXTENSION);
@@ -335,9 +357,17 @@ public class WarmFullFileIT extends WarmFullFileBaseIT {
         }
         assertTrue(wholeSegmentFiles(localFiles(second)).isEmpty());
 
-        // The already promoted family keeps serving from its whole file.
-        assertTrue(isPromoted(first, firstFdt));
-        assertEquals(FullFileState.State.FULL, stateOf(first, firstFdt));
+        // The already promoted family was demoted by the settings change: it serves blocks again with the same
+        // results, and its mapping, whole file and budget are released once the reader's handles close (on reopen).
+        assertEquals(FullFileState.State.BLOCK, stateOf(first, firstFdt));
+        assertEquals(1L, first.manager.stats().demoted());
+        assertEquals(firstFingerprint, queryFingerprint(INDEX_NAME));
+        reopenIndex(INDEX_NAME);
+        WarmShard reopened = warmShard(INDEX_NAME, warmNode);
+        assertBusy(() -> {
+            assertTrue("whole file released after the reopen: " + localFiles(reopened), wholeSegmentFiles(localFiles(reopened)).isEmpty());
+            assertEquals("budget released", 0L, reopened.manager.stats().reservedBytes());
+        }, DOWNLOAD_TIMEOUT.seconds(), TimeUnit.SECONDS);
         assertEquals(firstFingerprint, queryFingerprint(INDEX_NAME));
 
         deleteIndex(INDEX_NAME);

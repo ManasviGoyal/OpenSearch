@@ -14,6 +14,8 @@ import org.opensearch.common.settings.Setting;
 import java.util.List;
 import java.util.Locale;
 import java.util.Set;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.function.Consumer;
 import java.util.function.Function;
 import java.util.stream.Collectors;
 
@@ -45,6 +47,7 @@ public class WarmFullFileSettings {
     );
 
     private volatile Set<String> extensions;
+    private final List<Consumer<Set<String>>> listeners = new CopyOnWriteArrayList<>();
 
     /**
      * Creates a new WarmFullFileSettings instance and registers a dynamic update consumer.
@@ -66,6 +69,19 @@ public class WarmFullFileSettings {
             .map(v -> v.startsWith(".") ? v.substring(1) : v)
             .filter(v -> v.isEmpty() == false)
             .collect(Collectors.toUnmodifiableSet());
+        for (Consumer<Set<String>> listener : listeners) {
+            listener.accept(extensions);
+        }
+    }
+
+    /**
+     * Registers a listener for the eligible extensions, called once now with the current set and again after every
+     * update, with the normalized set.
+     * @param listener receives the eligible extensions
+     */
+    public void addListener(Consumer<Set<String>> listener) {
+        listeners.add(listener);
+        listener.accept(extensions);
     }
 
     /**

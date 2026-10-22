@@ -184,35 +184,32 @@ public class TieredDirectory extends CompositeDirectory {
 
     /**
      * Decides, once per opened handle, whether this handle may trigger whole-file promotion. All conditions must hold:
-     * the extension is configured as eligible; the file is larger than one block and below the mmap chunk size; the
-     * context is a plain DEFAULT read (excludes merges and FLUSH); and it carries no ReadOnce/SEQUENTIAL hint
-     * (excludes recovery checksum reads). Temp/corrupted files never reach here (handled earlier in openInput).
+     * the file is larger than one block and below the mmap chunk size; the context is a plain DEFAULT read (excludes
+     * merges and FLUSH); and it carries no ReadOnce/SEQUENTIAL hint (excludes recovery checksum reads). Temp/corrupted
+     * files never reach here (handled earlier in openInput).
      *
-     * <p>Remote (block) mode is NOT part of this decision: the searcher opens its handles at refresh time, before the
-     * segment is uploaded, and never reopens them, so a handle must be able to become promotable later. The wrapper
-     * checks the family's remote-mode flag at trigger time instead; see {@link FullFileState#markRemoteMode(String)}.
+     * <p>Neither the extension setting nor remote (block) mode is part of this decision: the searcher opens its
+     * handles at refresh time and never reopens them for an unchanged segment, so a handle must be able to become
+     * promotable later, when the segment is uploaded or the extension is added to the setting, and must stop being
+     * promotable when the extension is removed. The wrapper checks both at trigger time instead; see
+     * {@link FullFileState#markRemoteMode(String)} and {@link WarmFullFileManager#isExtensionEligible(String)}.
      */
     // visible for testing
     boolean isEligibleForFullFile(String name, IOContext context, SwitchableIndexInput original) {
-        WarmFullFileSettings settings = warmFullFileSettingsSupplier == null ? null : warmFullFileSettingsSupplier.get();
-        if (settings == null || settings.getExtensions().isEmpty()) {
-            return false;
-        }
-        // A file without an extension is never eligible.
-        if (settings.isExtensionEligible(WarmFullFileSettings.extensionOf(name)) == false) {
-            return false;
-        }
-        // The extension is configured, so a rejection by a later rule is worth a line when debugging a node that never
-        // promotes. This runs once per openInput, never on a read.
         String rejection = ineligibleReason(name, context, original);
-        if (rejection != null) {
-            logger.debug("whole-file promotion: [{}] opened with {} is not eligible: {}", name, context, rejection);
-            return false;
+        if (rejection == null) {
+            return true;
         }
-        return true;
+        // A rejection is worth a line only for an extension the setting lists, when debugging a node that never
+        // promotes. This runs once per openInput, never on a read.
+        WarmFullFileSettings settings = warmFullFileSettingsSupplier == null ? null : warmFullFileSettingsSupplier.get();
+        if (settings != null && settings.isExtensionEligible(WarmFullFileSettings.extensionOf(name))) {
+            logger.debug("whole-file promotion: [{}] opened with {} is not eligible: {}", name, context, rejection);
+        }
+        return false;
     }
 
-    /** The rule that rejects a file whose extension is configured, or null when the file is eligible. */
+    /** The rule that rejects a file at open, or null when its handles may trigger a promotion. */
     private static String ineligibleReason(String name, IOContext context, SwitchableIndexInput original) {
         // Not an ordinary Lucene special file.
         if (FileTypeUtils.isSegmentsFile(name) || FileTypeUtils.isLockFile(name) || name.endsWith(".cfs")) {

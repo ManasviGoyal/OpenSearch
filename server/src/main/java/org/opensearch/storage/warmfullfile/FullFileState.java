@@ -89,8 +89,10 @@ public final class FullFileState {
     private volatile Executor cleanupExecutor;
     private volatile Runnable budgetRelease;
     private volatile Runnable onClosedWithLiveHandles;
-    // Set only when the family closed while FULL: the deferred cleanup is owed exactly in that case.
-    private volatile boolean closedWhileFull;
+    // Set when the family left FULL (closed or demoted) with a mapping still published: the deferred unmap and decRef
+    // are owed exactly in that case.
+    private volatile boolean mappingReleaseOwed;
+    private final AtomicBoolean budgetReleased = new AtomicBoolean(false);
     private final AtomicBoolean cleanupScheduled = new AtomicBoolean(false);
     private volatile boolean cleanupDone;
 
@@ -246,7 +248,8 @@ public final class FullFileState {
      * Attaches the teardown for a FULL family. Called by the manager before it publishes FULL.
      *
      * @param cleanupExecutor          pool the unmap + decRef run on (never the FileCache listener thread)
-     * @param budgetRelease            returns this file's reserved per-segment budget bytes
+     * @param budgetRelease            returns this file's reserved per-segment budget bytes; run once, at close or
+     *                                 when a demoted family's mapping is released
      * @param onClosedWithLiveHandles  called if the family closes while handles are still open (leak detection)
      */
     void attachCleanup(Executor cleanupExecutor, Runnable budgetRelease, Runnable onClosedWithLiveHandles) {
@@ -273,11 +276,8 @@ public final class FullFileState {
         if (prev != State.FULL) {
             return;
         }
-        Runnable release = budgetRelease;
-        if (release != null) {
-            release.run();
-        }
-        closedWhileFull = true;
+        releaseBudgetOnce();
+        mappingReleaseOwed = true;
         if (handleCount.get() > 0) {
             Runnable report = onClosedWithLiveHandles;
             if (report != null) {
@@ -288,12 +288,44 @@ public final class FullFileState {
     }
 
     /**
-     * Schedules the cleanup exactly once, and only when the family closed while FULL and no handle remains. Both
-     * {@link #closeFamily()} and {@link #decHandles()} call this after their own write, so whichever runs second sees
-     * both conditions true.
+     * Takes a FULL family back to BLOCK: no new whole-file view is handed out from now on, and once no handle remains
+     * the mapping is closed, the whole file is removed from the cache and the budget is released, through the same
+     * deferred cleanup a close uses. Views already cut keep reading the mapping until then. Until the release has run
+     * the family cannot be promoted again (see {@link #isMappingReleasePending()}).
+     *
+     * @return true if the family was FULL and is now BLOCK; false if it was in any other state
+     */
+    public boolean demote() {
+        if (state.compareAndSet(State.FULL, State.BLOCK) == false) {
+            return false;
+        }
+        mappingReleaseOwed = true;
+        maybeScheduleCleanup();
+        return true;
+    }
+
+    /**
+     * @return true while a demoted family still holds its previous mapping, i.e. between {@link #demote()} and the
+     *         deferred release; a promotion in that window would map the file a second time
+     */
+    public boolean isMappingReleasePending() {
+        return mappingReleaseOwed && cleanupDone == false && state.get() != State.CLOSED;
+    }
+
+    private void releaseBudgetOnce() {
+        Runnable release = budgetRelease;
+        if (release != null && budgetReleased.compareAndSet(false, true)) {
+            release.run();
+        }
+    }
+
+    /**
+     * Schedules the cleanup exactly once, and only when the family left FULL with a mapping and no handle remains.
+     * {@link #closeFamily()}, {@link #demote()} and {@link #decHandles()} call this after their own write, so whichever
+     * runs second sees both conditions true.
      */
     private void maybeScheduleCleanup() {
-        if (closedWhileFull == false || handleCount.get() != 0) {
+        if (mappingReleaseOwed == false || handleCount.get() != 0) {
             return;
         }
         Executor executor = cleanupExecutor;
@@ -319,9 +351,15 @@ public final class FullFileState {
         }
         try {
             fileCache.decRef(fullFilePath); // release the family's reference; the whole file becomes evictable
+            if (state.get() != State.CLOSED) {
+                // Demoted, not closed: the file is no longer served, so drop it from the cache now rather than leave it
+                // to eviction. A closing family leaves that to the directory's close.
+                fileCache.remove(fullFilePath);
+            }
         } catch (RuntimeException e) {
             logger.warn("failed to release whole-file cache reference for {}", fullFilePath, e);
         }
+        releaseBudgetOnce(); // already done at close; this is the demotion case, where the bytes were held until now
         cleanupDone = true;
     }
 
@@ -343,7 +381,7 @@ public final class FullFileState {
     }
 
     /** @return the plain file name */
-    String fileName() {
+    public String fileName() {
         return fileName;
     }
 

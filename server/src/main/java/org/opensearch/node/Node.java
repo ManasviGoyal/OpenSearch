@@ -1001,6 +1001,9 @@ public class Node implements Closeable {
                         OpenSearchExecutors.allocatedProcessors(settings),
                         (task, delayMillis) -> threadPool.schedule(task, TimeValue.timeValueMillis(delayMillis), ThreadPool.Names.GENERIC)
                     );
+                if (warmFullFileManager != null) {
+                    warmFullFileSettings.addListener(warmFullFileManager::onExtensionsChanged);
+                }
             } else {
                 tieredStoragePrefetchSettings = null;
                 tieredStoragePrefetchSettingsSupplier = () -> null;

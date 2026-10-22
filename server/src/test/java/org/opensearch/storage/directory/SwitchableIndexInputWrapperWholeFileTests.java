@@ -34,6 +34,7 @@ import org.opensearch.storage.indexinput.SwitchableIndexInputWrapper;
 import org.opensearch.storage.prefetch.TieredStoragePrefetchSettings;
 import org.opensearch.storage.warmfullfile.FullFileState;
 import org.opensearch.storage.warmfullfile.WarmFullFileManager;
+import org.opensearch.storage.warmfullfile.WarmFullFileSettings;
 import org.opensearch.test.MockLogAppender;
 import org.opensearch.test.junit.annotations.TestLogging;
 import org.opensearch.threadpool.ThreadPool;
@@ -50,6 +51,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Queue;
 import java.util.Random;
+import java.util.Set;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
@@ -150,8 +152,11 @@ public class SwitchableIndexInputWrapperWholeFileTests extends TieredStorageBase
         return state;
     }
 
+    /** A manager whose setting lists the fixture file's extension, so eligible handles trigger. */
     private WarmFullFileManager manager(Executor executor, AtomicLong clock) {
-        return new WarmFullFileManager(fileCache, executor, clock::get, 8, (task, delayMillis) -> {});
+        WarmFullFileManager manager = new WarmFullFileManager(fileCache, executor, clock::get, 8, (task, delayMillis) -> {});
+        manager.onExtensionsChanged(Set.of(WarmFullFileSettings.extensionOf(FILE_NAME)));
+        return manager;
     }
 
     /** Writes a local whole-file copy whose byte at position p is p mod 251, and opens it as the family master. */
@@ -748,6 +753,7 @@ public class SwitchableIndexInputWrapperWholeFileTests extends TieredStorageBase
             1,
             (task, delayMillis) -> {}
         );
+        realManager.onExtensionsChanged(Set.of(WarmFullFileSettings.extensionOf(FILE_NAME)));
         SwitchableIndexInputWrapper handle = new SwitchableIndexInputWrapper("h", in, st, true, realManager);
 
         // First clone: still blocks, and it starts the real promotion.
@@ -808,6 +814,108 @@ public class SwitchableIndexInputWrapperWholeFileTests extends TieredStorageBase
 
     // ---------------- ownership and deferred close ----------------
 
+    public void testTriggerFollowsTheSettingAtTriggerTime() throws IOException {
+        // The handle was opened as eligible, but the setting is read again at trigger time: with the extension gone
+        // nothing is requested, and once it is back the next clone requests the promotion.
+        SwitchableIndexInput in = remoteModeInput();
+        FullFileState st = stateFor(in);
+        RecordingExecutor exec = new RecordingExecutor();
+        WarmFullFileManager manager = manager(exec, new AtomicLong());
+        SwitchableIndexInputWrapper handle = new SwitchableIndexInputWrapper("h", in, st, true, manager);
+
+        manager.onExtensionsChanged(Set.of());
+        IndexInput off = handle.clone();
+        assertEquals("no request while the extension is not configured", 0, exec.submitted.get());
+        assertEquals(FullFileState.State.BLOCK, st.state());
+
+        manager.onExtensionsChanged(Set.of(WarmFullFileSettings.extensionOf(FILE_NAME)));
+        IndexInput on = handle.clone();
+        assertEquals("requested once the extension is configured again", 1, exec.submitted.get());
+        assertEquals(FullFileState.State.PROMOTING, st.state());
+        IOUtils.close(off, on, handle);
+    }
+
+    public void testDemotedFamilyServesBlocksReleasesAfterItsHandleAndPromotesAgain() throws Exception {
+        // A FULL family loses its extension from the setting while a handle and a view are open: new clones go back
+        // to blocks at once and nothing is requested, the open view keeps reading, and once the handle closes the
+        // mapping, the whole file and the budget are released. With the extension back, a new handle promotes again.
+        Path switchKey = getFilePathSwitchable(localDirectory, FILE_NAME);
+        Path fullPath = getFilePath(localDirectory, FILE_NAME);
+        byte[] content = footeredContent();
+        CachedSwitchableIndexInput entry = new CachedSwitchableIndexInput(
+            fileCache,
+            FILE_NAME,
+            localDirectory,
+            remoteSegmentStoreDirectory,
+            downloadTransferManager(content),
+            true,
+            threadPool,
+            PREFETCH
+        );
+        fileCache.put(switchKey, entry);
+        fileCache.decRef(switchKey);
+        FullFileState st = entry.fullFileState();
+        st.markRemoteMode(footerChecksum(content)); // the fixture metadata's checksum belongs to no real bytes
+        WarmFullFileManager realManager = new WarmFullFileManager(
+            fileCache,
+            threadPool.executor(ThreadPool.Names.REMOTE_RECOVERY),
+            threadPool::relativeTimeInMillis,
+            1,
+            (task, delayMillis) -> {}
+        );
+        realManager.onExtensionsChanged(Set.of(WarmFullFileSettings.extensionOf(FILE_NAME)));
+        SwitchableIndexInputWrapper handle = new SwitchableIndexInputWrapper(
+            "h",
+            (SwitchableIndexInput) entry.getIndexInput().clone(),
+            st,
+            true,
+            realManager
+        );
+        handle.clone(); // trigger
+        assertBusy(() -> assertEquals(FullFileState.State.FULL, st.state()), 30, TimeUnit.SECONDS);
+        IndexInput view = handle.clone();
+        assertTrue(view instanceof MemorySegmentAccessInput);
+        long requestedBefore = realManager.stats().requested();
+
+        realManager.onExtensionsChanged(Set.of());
+
+        assertEquals(FullFileState.State.BLOCK, st.state());
+        assertEquals(1L, realManager.stats().demoted());
+        assertTrue("release waits for the open handle", st.isMappingReleasePending());
+        IndexInput block = handle.clone();
+        assertTrue("new clones read blocks", block instanceof SwitchableIndexInputWrapper);
+        assertEquals("no promotion requested while the old mapping is held", requestedBefore, realManager.stats().requested());
+        assertEquals("the open view keeps reading", 0, view.readByte());
+        assertEquals("the family still holds its reference", Integer.valueOf(1), fileCache.getRef(fullPath));
+        assertEquals(content.length, realManager.stats().reservedBytes());
+
+        block.close();
+        handle.close();
+        assertBusy(() -> assertTrue(st.cleanupDone()), 30, TimeUnit.SECONDS);
+        assertNull("mapping released", st.localMaster());
+        assertNull("whole file dropped from the cache", fileCache.getRef(fullPath));
+        assertFalse(Files.exists(fullPath));
+        assertEquals("budget released", 0L, realManager.stats().reservedBytes());
+        assertFalse(st.isMappingReleasePending());
+
+        realManager.onExtensionsChanged(Set.of(WarmFullFileSettings.extensionOf(FILE_NAME)));
+        SwitchableIndexInputWrapper again = new SwitchableIndexInputWrapper(
+            "h2",
+            (SwitchableIndexInput) entry.getIndexInput().clone(),
+            st,
+            true,
+            realManager
+        );
+        again.clone(); // trigger
+        assertBusy(() -> assertEquals(FullFileState.State.FULL, st.state()), 30, TimeUnit.SECONDS);
+        assertEquals(2L, realManager.stats().promoted());
+        IndexInput viewAgain = again.clone();
+        assertTrue(viewAgain instanceof MemorySegmentAccessInput);
+        IOUtils.close(viewAgain, again);
+        fileCache.remove(switchKey);
+        assertBusy(() -> assertTrue(st.cleanupDone()), 30, TimeUnit.SECONDS);
+    }
+
     public void testDeferredCloseKeepsMappingUntilLastHandleThenReleasesEverything() throws Exception {
         Path switchKey = getFilePathSwitchable(localDirectory, FILE_NAME);
         Path fullPath = getFilePath(localDirectory, FILE_NAME);
@@ -835,6 +943,7 @@ public class SwitchableIndexInputWrapperWholeFileTests extends TieredStorageBase
             1,
             (task, delayMillis) -> {}
         );
+        realManager.onExtensionsChanged(Set.of(WarmFullFileSettings.extensionOf(FILE_NAME)));
         SwitchableIndexInputWrapper handle = new SwitchableIndexInputWrapper(
             "h",
             (SwitchableIndexInput) entry.getIndexInput().clone(),
@@ -908,6 +1017,7 @@ public class SwitchableIndexInputWrapperWholeFileTests extends TieredStorageBase
             1,
             (task, delayMillis) -> {}
         );
+        realManager.onExtensionsChanged(Set.of(WarmFullFileSettings.extensionOf(FILE_NAME)));
         SwitchableIndexInputWrapper handle = new SwitchableIndexInputWrapper(
             "h",
             (SwitchableIndexInput) entry.getIndexInput().clone(),

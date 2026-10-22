@@ -465,17 +465,24 @@ public class TieredDirectoryTests extends TieredStorageBaseTestCase {
         return entry.fullFileState();
     }
 
-    public void testEligibilityRequiresConfiguredExtension() {
-        TieredDirectory dir = directoryWith(() -> realSettings(".FAISS", "veq"), null);
+    public void testEligibilityIgnoresTheExtensionAtOpen() {
+        // The setting is read at trigger time, not at open, so a handle opened before an extension is configured can
+        // promote later and one opened while it was configured stops when it is removed. Open-time eligibility is the
+        // same with the setting empty, with the file's extension listed, and with another extension listed.
         SwitchableIndexInput original = remoteOriginal(ONE_BLOCK_BYTES + 1);
-
-        assertTrue(dir.isEligibleForFullFile(FAISS_FILE, IOContext.DEFAULT, original));
-        assertTrue("extension match ignores case", dir.isEligibleForFullFile("_0.FAISS", IOContext.DEFAULT, original));
-        assertTrue(dir.isEligibleForFullFile("_0_Lucene99_0.veq", IOContext.DEFAULT, original));
-        assertFalse("extension not configured", dir.isEligibleForFullFile("_0_Lucene99_0.vec", IOContext.DEFAULT, original));
-        assertFalse("only the last extension counts", dir.isEligibleForFullFile("_0.faiss.vec", IOContext.DEFAULT, original));
-        assertFalse("no extension", dir.isEligibleForFullFile("faiss", IOContext.DEFAULT, original));
-        assertFalse("trailing dot", dir.isEligibleForFullFile("_0.faiss.", IOContext.DEFAULT, original));
+        for (TieredDirectory dir : List.of(
+            directoryWith(() -> realSettings(), null),
+            directoryWith(() -> realSettings(".FAISS", "veq"), null),
+            directoryWith(() -> realSettings("vec"), null)
+        )) {
+            assertTrue(dir.isEligibleForFullFile(FAISS_FILE, IOContext.DEFAULT, original));
+            assertTrue(dir.isEligibleForFullFile("_0_Lucene99_0.veq", IOContext.DEFAULT, original));
+            assertTrue(dir.isEligibleForFullFile("_0_Lucene99_0.vec", IOContext.DEFAULT, original));
+            assertTrue(
+                "a file without an extension passes the open-time rules",
+                dir.isEligibleForFullFile("faiss", IOContext.DEFAULT, original)
+            );
+        }
     }
 
     public void testEligibilityExcludesLuceneSpecialFiles() {
@@ -522,7 +529,10 @@ public class TieredDirectoryTests extends TieredStorageBaseTestCase {
             );
             assertFalse(dir.isEligibleForFullFile("_0.cfs", IOContext.DEFAULT, original));
             assertFalse(dir.isEligibleForFullFile("_0.faiss", IOContext.READONCE, original));
-            assertFalse(dir.isEligibleForFullFile("_0.vec", IOContext.DEFAULT, original));
+            assertFalse(
+                "rejected, but its extension is not configured, so not logged",
+                dir.isEligibleForFullFile("_0.vec", IOContext.READONCE, original)
+            );
             assertTrue(dir.isEligibleForFullFile("_1.faiss", IOContext.DEFAULT, original));
             appender.assertAllExpectationsMatched();
         }
@@ -591,35 +601,35 @@ public class TieredDirectoryTests extends TieredStorageBaseTestCase {
         );
     }
 
-    public void testEligibilityOffWithoutConfiguredExtensions() {
+    public void testOpenTimeEligibilityDoesNotNeedTheSetting() {
+        // The open-time rules are structural; whether the feature is on for a file is the trigger's check against the
+        // manager's current extensions (a null manager means the feature is off and nothing ever triggers).
         SwitchableIndexInput original = remoteOriginal(ONE_BLOCK_BYTES + 1);
 
-        assertFalse(
+        assertTrue(
             "real settings, default (empty)",
             directoryWith(() -> realSettings(), null).isEligibleForFullFile(FAISS_FILE, IOContext.DEFAULT, original)
         );
-        assertFalse(
+        assertTrue(
             "mock settings, empty",
             directoryWith(getMockWarmFullFileSettingsSupplier(), null).isEligibleForFullFile(FAISS_FILE, IOContext.DEFAULT, original)
         );
-        assertFalse(
-            "supplier returns null",
-            directoryWith(() -> null, null).isEligibleForFullFile(FAISS_FILE, IOContext.DEFAULT, original)
-        );
-        assertFalse("no supplier", directoryWith(null, null).isEligibleForFullFile(FAISS_FILE, IOContext.DEFAULT, original));
+        assertTrue("supplier returns null", directoryWith(() -> null, null).isEligibleForFullFile(FAISS_FILE, IOContext.DEFAULT, original));
+        assertTrue("no supplier", directoryWith(null, null).isEligibleForFullFile(FAISS_FILE, IOContext.DEFAULT, original));
     }
 
-    public void testDynamicExtensionUpdateChangesEligibilityDecidedAfterwards() {
+    public void testDynamicExtensionUpdateLeavesOpenTimeEligibilityUnchanged() {
+        // Adding or removing the extension changes what the trigger does with a handle, never the open-time decision.
         ClusterSettings clusterSettings = newClusterSettings();
         WarmFullFileSettings settings = new WarmFullFileSettings(clusterSettings);
         TieredDirectory dir = directoryWith(() -> settings, null);
         SwitchableIndexInput original = remoteOriginal(9L * 1024 * 1024);
 
-        assertFalse("before the update", dir.isEligibleForFullFile(FAISS_FILE, IOContext.DEFAULT, original));
+        assertTrue("before the update", dir.isEligibleForFullFile(FAISS_FILE, IOContext.DEFAULT, original));
         setExtensions(clusterSettings, "faiss");
         assertTrue("after the update", dir.isEligibleForFullFile(FAISS_FILE, IOContext.DEFAULT, original));
         clusterSettings.applySettings(Settings.EMPTY);
-        assertFalse("after the extension is removed again", dir.isEligibleForFullFile(FAISS_FILE, IOContext.DEFAULT, original));
+        assertTrue("after the extension is removed again", dir.isEligibleForFullFile(FAISS_FILE, IOContext.DEFAULT, original));
     }
 
     public void testDynamicExtensionUpdateNeverPromotesFileOfOneBlockOrLess() throws Exception {

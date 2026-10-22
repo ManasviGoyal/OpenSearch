@@ -102,7 +102,12 @@ public class WarmFullFileManager {
     private final AtomicLong requested = new AtomicLong();
     private final AtomicLong started = new AtomicLong();
     private final AtomicLong reused = new AtomicLong();
+    private final AtomicLong demoted = new AtomicLong();
     private final AtomicLong downloadedBytes = new AtomicLong();
+    // The families currently FULL on this node, so a settings change can find the ones to demote.
+    private final Set<FullFileState> fullFamilies = ConcurrentHashMap.newKeySet();
+    // The extensions the setting currently allows; the trigger re-checks this so a change applies to open handles too.
+    private volatile Set<String> eligibleExtensions = Set.of();
     private final AtomicLong promoted = new AtomicLong();
     private final AtomicLong promotedBytes = new AtomicLong();
     private final AtomicLong downloadMillis = new AtomicLong();
@@ -383,7 +388,10 @@ public class WarmFullFileManager {
             }
             // Attach the teardown, then publish localMaster, then CAS to FULL (all three before the CAS). If the family
             // closes after the CAS, closeFamily() releases the budget and the deferred cleanup unmaps + decRefs.
-            st.attachCleanup(executor, () -> releaseSegmentBytes(segment, length), () -> scheduleStuckHandleWarning(st));
+            st.attachCleanup(executor, () -> {
+                releaseSegmentBytes(segment, length);
+                fullFamilies.remove(st);
+            }, () -> scheduleStuckHandleWarning(st));
             if (st.compareAndSetLocalMaster(null, master) == false) {
                 // Another completion handler for this family already installed its mapping (two promote() calls joined
                 // the same download). Keep theirs and unwind only what this handler holds.
@@ -403,6 +411,7 @@ public class WarmFullFileManager {
                 decline(st, DeclineReason.FAMILY_CLOSED, "family closed during publish");
                 return;
             }
+            fullFamilies.add(st);
             slots.release();
             final long elapsedMillis = clock.getAsLong() - startedAt;
             promoted.incrementAndGet();
@@ -596,6 +605,41 @@ public class WarmFullFileManager {
     }
 
     /**
+     * Applies a new set of eligible extensions: remembers it for the trigger's check and demotes every FULL family
+     * whose extension is no longer in it. A demoted family serves blocks from its next clone or slice; its mapping,
+     * cache reference and budget are released once its handles are gone.
+     *
+     * @param extensions the eligible extensions, normalized as {@link WarmFullFileSettings#getExtensions()} returns them
+     */
+    public void onExtensionsChanged(Set<String> extensions) {
+        eligibleExtensions = extensions;
+        for (FullFileState st : fullFamilies) {
+            String extension = WarmFullFileSettings.extensionOf(st.fileName());
+            if (extension != null && extensions.contains(extension)) {
+                continue;
+            }
+            if (st.demote()) {
+                fullFamilies.remove(st);
+                demoted.incrementAndGet();
+                logger.info(
+                    "demoted [{}] back to blocks: extension [{}] is no longer configured; its mapping is released once its {} handle(s) close",
+                    st.fullFilePath(),
+                    extension,
+                    st.handleCount()
+                );
+            }
+        }
+    }
+
+    /**
+     * @param extension a file extension without the leading dot
+     * @return whether the setting currently allows whole-file promotion for it
+     */
+    public boolean isExtensionEligible(String extension) {
+        return extension != null && eligibleExtensions.contains(extension);
+    }
+
+    /**
      * A snapshot of this node's promotion counters.
      *
      * @return the current counters
@@ -614,6 +658,7 @@ public class WarmFullFileManager {
             started.get(),
             reused.get(),
             promoted.get(),
+            demoted.get(),
             downloadedBytes.get(),
             promotedBytes.get(),
             downloadMillis.get(),
