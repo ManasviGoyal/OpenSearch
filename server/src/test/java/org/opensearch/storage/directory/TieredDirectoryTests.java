@@ -47,6 +47,8 @@ import java.util.Arrays;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.CyclicBarrier;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Supplier;
 
@@ -122,66 +124,85 @@ public class TieredDirectoryTests extends TieredStorageBaseTestCase {
         };
     }
 
-    public void testCacheFilePutOverLiveEntryClosesTheReplacedFamily() throws Exception {
-        // RemovalReason.REPLACED never calls close(), so two openInput calls racing to create a family would leak the
-        // first family's mapping/reference/budget. cacheFile must close the entry it replaced.
+    public void testSecondCacheFileForLiveFamilyReturnsItUnchanged() throws Exception {
+        // cacheFile creates a family only when the key has no live entry: a second call for the same file returns the
+        // first family, closes nothing, and takes one more reference on it, as a put would have.
         Path key = getFilePathSwitchable(localDirectory, FILE_PRESENT_IN_REMOTE_ONLY);
-        tieredDirectory.cacheFile(FILE_PRESENT_IN_REMOTE_ONLY, true);
-        CachedIndexInput first = fileCache.get(key);
-        fileCache.decRef(key);
+        CachedIndexInput first = tieredDirectory.cacheFile(FILE_PRESENT_IN_REMOTE_ONLY, true);
         assertNotNull(first);
         assertFalse(first.isClosed());
+        assertEquals(Integer.valueOf(1), fileCache.getRef(key));
 
-        tieredDirectory.cacheFile(FILE_PRESENT_IN_REMOTE_ONLY, true);
-        CachedIndexInput second = fileCache.get(key);
+        CachedIndexInput second = tieredDirectory.cacheFile(FILE_PRESENT_IN_REMOTE_ONLY, true);
+        assertSame("the live family is kept", first, second);
+        assertFalse("nothing was closed", first.isClosed());
+        assertEquals(FullFileState.State.BLOCK, first.fullFileState().state());
+        assertEquals("each call leaves one reference for its caller", Integer.valueOf(2), fileCache.getRef(key));
         fileCache.decRef(key);
-
-        assertNotSame(first, second);
-        assertTrue("replaced entry closed", first.isClosed());
-        assertEquals(FullFileState.State.CLOSED, first.fullFileState().state());
-        assertFalse("new entry live", second.isClosed());
-        assertEquals(FullFileState.State.BLOCK, second.fullFileState().state());
+        fileCache.decRef(key);
     }
 
-    public void testHandleOfReplacedFamilyKeepsReadingBlocksAndNeverPromotes() throws Exception {
-        // The losing side of the two-thread openInput race: a handle returned just before a racing cacheFile replaced
-        // the family keeps reading blocks correctly, but it belongs to the CLOSED old family, so it never triggers a
-        // promotion and never gets a whole-file view. Only handles opened afterwards belong to the live family. (All
-        // reads stay inside block 0, which the fixture serves once.)
+    public void testCacheFileReplacesClosedEntry() throws Exception {
+        // A closed entry at the key stands for nothing: cacheFile replaces it with a live family.
+        Path key = getFilePathSwitchable(localDirectory, FILE_PRESENT_IN_REMOTE_ONLY);
+        CachedIndexInput stale = tieredDirectory.cacheFile(FILE_PRESENT_IN_REMOTE_ONLY, true);
+        fileCache.decRef(key);
+        stale.close();
+        assertTrue(stale.isClosed());
+
+        CachedIndexInput live = tieredDirectory.cacheFile(FILE_PRESENT_IN_REMOTE_ONLY, true);
+        assertNotSame(stale, live);
+        assertFalse(live.isClosed());
+        assertEquals(FullFileState.State.BLOCK, live.fullFileState().state());
+        fileCache.decRef(key);
+    }
+
+    public void testConcurrentOpenInputForMissingFamilyCreatesOneEntry() throws Exception {
+        // n threads open the same remote-only file at once while the cache has no entry for it: exactly one family is
+        // created, every handle reads the same bytes, and after all handles close the family holds no reference.
         populateData();
         Path key = getFilePathSwitchable(localDirectory, FILE_PRESENT_IN_REMOTE_ONLY);
+        assertNull(fileCache.get(key));
+        int threads = scaledRandomIntBetween(4, 12);
+        CyclicBarrier start = new CyclicBarrier(threads);
+        List<IndexInput> handles = new CopyOnWriteArrayList<>();
+        List<Throwable> failures = new CopyOnWriteArrayList<>();
+        Thread[] openers = new Thread[threads];
+        for (int i = 0; i < threads; i++) {
+            openers[i] = new Thread(() -> {
+                try {
+                    start.await();
+                    handles.add(tieredDirectory.openInput(FILE_PRESENT_IN_REMOTE_ONLY, IOContext.DEFAULT));
+                } catch (Throwable t) {
+                    failures.add(t);
+                }
+            }, "opener-" + i);
+            openers[i].start();
+        }
+        for (Thread opener : openers) {
+            opener.join();
+        }
+        assertTrue("no opener failed: " + failures, failures.isEmpty());
+        assertEquals(threads, handles.size());
 
-        IndexInput first = tieredDirectory.openInput(FILE_PRESENT_IN_REMOTE_ONLY, IOContext.DEFAULT);
-        CachedIndexInput oldEntry = fileCache.get(key);
+        CachedIndexInput family = fileCache.get(key);
+        assertNotNull("one family was created", family);
+        assertFalse(family.isClosed());
+        assertEquals(FullFileState.State.BLOCK, family.fullFileState().state());
         fileCache.decRef(key);
-        FullFileState oldState = oldEntry.fullFileState();
-        assertTrue("fixture file must be readable", first.length() > 0);
-        byte before = first.readByte();
+        assertEquals("one reference per open handle, none left by openInput itself", Integer.valueOf(threads), fileCache.getRef(key));
 
-        tieredDirectory.cacheFile(FILE_PRESENT_IN_REMOTE_ONLY, true); // the race: a second put over the live family
-        CachedIndexInput newEntry = fileCache.get(key);
+        byte expected = handles.get(0).readByte();
+        for (IndexInput handle : handles.subList(1, handles.size())) {
+            assertEquals("every handle reads the same family", expected, handle.readByte());
+        }
+        for (IndexInput handle : handles) {
+            handle.close();
+        }
+        assertSame("the family is unchanged after the handles close", family, fileCache.get(key));
         fileCache.decRef(key);
-        assertNotSame(oldEntry, newEntry);
-        assertTrue("replaced entry closed", oldEntry.isClosed());
-        assertEquals(FullFileState.State.CLOSED, oldState.state());
-        assertEquals(FullFileState.State.BLOCK, newEntry.fullFileState().state());
-
-        // The old handle still reads blocks, and agrees with a handle from the live family.
-        first.seek(0);
-        assertEquals(before, first.readByte());
-        IndexInput fresh = tieredDirectory.openInput(FILE_PRESENT_IN_REMOTE_ONLY, IOContext.DEFAULT);
-        assertEquals(before, fresh.readByte());
-
-        // But it never promotes: its clone is a block wrapper, reads the same bytes, and the old family stays CLOSED.
-        first.seek(0);
-        IndexInput clone = first.clone();
-        assertTrue("block clone, not a whole-file view", clone instanceof SwitchableIndexInputWrapper);
-        assertEquals(before, clone.readByte());
-        assertEquals(FullFileState.State.CLOSED, oldState.state());
-
-        clone.close();
-        fresh.close();
-        first.close();
+        assertEquals("the handles released their references", Integer.valueOf(0), fileCache.getRef(key));
+        assertFalse(family.isClosed());
     }
 
     public void testListAll() throws IOException {

@@ -14,6 +14,7 @@ import org.apache.lucene.store.AlreadyClosedException;
 import org.apache.lucene.store.IOContext;
 import org.apache.lucene.store.IndexInput;
 import org.opensearch.common.annotation.ExperimentalApi;
+import org.opensearch.common.util.CancellableThreads;
 import org.opensearch.index.store.remote.filecache.CachedIndexInput;
 import org.opensearch.index.store.remote.filecache.FileCache;
 import org.opensearch.index.store.remote.filecache.FileCachedIndexInput;
@@ -82,7 +83,7 @@ public class TransferManager {
                     if (cachedIndexInput == null || cachedIndexInput.isClosed()) {
                         logger.trace("Transfer Manager - IndexInput closed or not in cache");
                         // Doesn't exist or is closed, either way create a new one
-                        return new DelayedCreationCachedIndexInput(fileCache, streamReader, blobFetchRequest);
+                        return new DelayedCreationCachedIndexInput(fileCache, streamReader, blobFetchRequest, null);
                     } else {
                         logger.trace("Transfer Manager - Already in cache");
                         // already in the cache and ready to be used (open)
@@ -112,6 +113,23 @@ public class TransferManager {
 
     @ExperimentalApi
     public CompletableFuture<IndexInput> fetchBlobAsync(BlobFetchRequest blobFetchRequest) throws IOException {
+        return fetchBlobAsync(blobFetchRequest, null);
+    }
+
+    /**
+     * As {@link #fetchBlobAsync(BlobFetchRequest)}, with the download running under {@code cancellableThreads} when it
+     * is not null: {@link CancellableThreads#cancel(String)} interrupts the part being written and the loop stops before
+     * the next part, the future fails with {@link CancellableThreads.ExecutionCancelledException}, and the cache entry
+     * and partial file are removed as for any other failure. A download that another caller is already running for the
+     * same key is joined as is; only the caller that starts the download attaches its cancellation.
+     *
+     * @param blobFetchRequest   to fetch
+     * @param cancellableThreads the cancellation handle for a download this call starts, or null for none
+     * @return future of IndexInput augmented with internal caching maintenance tasks
+     */
+    @ExperimentalApi
+    public CompletableFuture<IndexInput> fetchBlobAsync(BlobFetchRequest blobFetchRequest, CancellableThreads cancellableThreads)
+        throws IOException {
         final Path key = blobFetchRequest.getFilePath();
         logger.trace("Asynchronous fetchBlob called for {}", key.toString());
         try {
@@ -119,7 +137,7 @@ public class TransferManager {
                 if (cachedIndexInput == null || cachedIndexInput.isClosed()) {
                     logger.trace("Transfer Manager - IndexInput closed or not in cache");
                     // Doesn't exist or is closed, either way create a new one
-                    return new DelayedCreationCachedIndexInput(fileCache, streamReader, blobFetchRequest);
+                    return new DelayedCreationCachedIndexInput(fileCache, streamReader, blobFetchRequest, cancellableThreads);
                 } else {
                     logger.trace("Transfer Manager - Required blob Already in cache: {}", blobFetchRequest.toString());
                     // already in the cache and ready to be used (open)
@@ -142,7 +160,12 @@ public class TransferManager {
         }
     }
 
-    private static FileCachedIndexInput createIndexInput(FileCache fileCache, StreamReader streamReader, BlobFetchRequest request) {
+    private static FileCachedIndexInput createIndexInput(
+        FileCache fileCache,
+        StreamReader streamReader,
+        BlobFetchRequest request,
+        CancellableThreads cancellableThreads
+    ) {
         try {
             // This local file cache is ref counted and may not strictly enforce configured capacity.
             // If we find available capacity is exceeded, deny further BlobFetchRequests.
@@ -159,27 +182,43 @@ public class TransferManager {
             }
             if (Files.exists(request.getFilePath()) == false) {
                 logger.trace("Fetching from Remote in createIndexInput of Transfer Manager");
-                try (
-                    OutputStream fileOutputStream = Files.newOutputStream(request.getFilePath());
-                    OutputStream localFileOutputStream = new BufferedOutputStream(fileOutputStream)
-                ) {
-                    for (BlobFetchRequest.BlobPart blobPart : request.blobParts()) {
-                        try (
-                            InputStream snapshotFileInputStream = streamReader.read(
-                                blobPart.getBlobName(),
-                                blobPart.getPosition(),
-                                blobPart.getLength()
-                            );
-                        ) {
-                            snapshotFileInputStream.transferTo(localFileOutputStream);
-                        }
-                    }
+                if (cancellableThreads == null) {
+                    downloadParts(streamReader, request, null);
+                } else {
+                    cancellableThreads.executeIO(() -> downloadParts(streamReader, request, cancellableThreads));
                 }
             }
             final IndexInput luceneIndexInput = request.getDirectory().openInput(request.getFileName(), IOContext.DEFAULT);
             return new FileCachedIndexInput(fileCache, request.getFilePath(), luceneIndexInput);
         } catch (IOException e) {
             throw new UncheckedIOException(e);
+        }
+    }
+
+    /**
+     * Writes the request's parts to its file in order. With a cancellation handle, stops before the next part once the
+     * handle is cancelled; the interrupt the cancel sends fails the write in progress on its own.
+     */
+    private static void downloadParts(StreamReader streamReader, BlobFetchRequest request, CancellableThreads cancellableThreads)
+        throws IOException {
+        try (
+            OutputStream fileOutputStream = Files.newOutputStream(request.getFilePath());
+            OutputStream localFileOutputStream = new BufferedOutputStream(fileOutputStream)
+        ) {
+            for (BlobFetchRequest.BlobPart blobPart : request.blobParts()) {
+                if (cancellableThreads != null) {
+                    cancellableThreads.checkForCancel();
+                }
+                try (
+                    InputStream snapshotFileInputStream = streamReader.read(
+                        blobPart.getBlobName(),
+                        blobPart.getPosition(),
+                        blobPart.getLength()
+                    )
+                ) {
+                    snapshotFileInputStream.transferTo(localFileOutputStream);
+                }
+            }
         }
     }
 
@@ -194,14 +233,22 @@ public class TransferManager {
         private final FileCache fileCache;
         private final StreamReader streamReader;
         private final BlobFetchRequest request;
+        // Cancels the download this entry runs; null when the caller did not ask for cancellation.
+        private final CancellableThreads cancellableThreads;
         private final CompletableFuture<IndexInput> result = new CompletableFuture<>();
         private final AtomicBoolean isStarted = new AtomicBoolean(false);
         private final AtomicBoolean isClosed = new AtomicBoolean(false);
 
-        private DelayedCreationCachedIndexInput(FileCache fileCache, StreamReader streamReader, BlobFetchRequest request) {
+        private DelayedCreationCachedIndexInput(
+            FileCache fileCache,
+            StreamReader streamReader,
+            BlobFetchRequest request,
+            CancellableThreads cancellableThreads
+        ) {
             this.fileCache = fileCache;
             this.streamReader = streamReader;
             this.request = request;
+            this.cancellableThreads = cancellableThreads;
         }
 
         @Override
@@ -212,7 +259,7 @@ public class TransferManager {
             if (isStarted.getAndSet(true) == false) {
                 // We're the first one here, need to download the block
                 try {
-                    result.complete(createIndexInput(fileCache, streamReader, request));
+                    result.complete(createIndexInput(fileCache, streamReader, request, cancellableThreads));
                 } catch (Exception e) {
                     result.completeExceptionally(e);
                     fileCache.remove(request.getFilePath());
@@ -240,7 +287,7 @@ public class TransferManager {
                 // Create new future and set it as the result
                 CompletableFuture.supplyAsync(() -> {
                     try {
-                        return createIndexInput(fileCache, streamReader, request);
+                        return createIndexInput(fileCache, streamReader, request, cancellableThreads);
                     } catch (Exception e) {
                         fileCache.remove(request.getFilePath());
                         throw (e instanceof RuntimeException) ? (RuntimeException) e : new CompletionException(e);

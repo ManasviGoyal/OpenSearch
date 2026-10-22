@@ -12,6 +12,7 @@ import com.carrotsearch.randomizedtesting.annotations.ThreadLeakFilters;
 import org.apache.logging.log4j.Level;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.core.LogEvent;
+import org.apache.lucene.codecs.CodecUtil;
 import org.apache.lucene.store.AlreadyClosedException;
 import org.apache.lucene.store.FSDirectory;
 import org.apache.lucene.store.IOContext;
@@ -20,6 +21,7 @@ import org.apache.lucene.store.IndexOutput;
 import org.apache.lucene.store.MemorySegmentAccessInput;
 import org.apache.lucene.store.NIOFSDirectory;
 import org.apache.lucene.store.RandomAccessInput;
+import org.opensearch.common.lucene.store.ByteArrayIndexInput;
 import org.opensearch.common.lucene.store.InputStreamIndexInput;
 import org.opensearch.common.util.io.IOUtils;
 import org.opensearch.index.store.remote.file.CleanerDaemonThreadLeakFilter;
@@ -143,7 +145,7 @@ public class SwitchableIndexInputWrapperWholeFileTests extends TieredStorageBase
     private FullFileState stateFor(SwitchableIndexInput in, TransferManager tm, FSDirectory dir) {
         FullFileState state = new FullFileState(tm, dir, fileCache, FILE_NAME, in.length(), getFilePath(localDirectory, FILE_NAME));
         if (in.hasSwitchedToRemote()) {
-            state.markRemoteMode();
+            state.markRemoteMode(null);
         }
         return state;
     }
@@ -323,7 +325,7 @@ public class SwitchableIndexInputWrapperWholeFileTests extends TieredStorageBase
         );
         assertEquals(FullFileState.State.BLOCK, st.state());
 
-        st.markRemoteMode(); // what TieredDirectory.afterSyncToRemote does once switchFileToRemote has returned
+        st.markRemoteMode(null); // what TieredDirectory.afterSyncToRemote does once switchFileToRemote has returned
         IndexInput remoteClone = handle.clone();
         assertEquals("the first clone after the family is marked remote requests promotion", 1, exec.submitted.get());
         assertEquals(FullFileState.State.PROMOTING, st.state());
@@ -773,11 +775,35 @@ public class SwitchableIndexInputWrapperWholeFileTests extends TieredStorageBase
     }
 
     /**
-     * A TransferManager with its own position-aware reader, so a whole-file download returns exactly the file's length.
+     * A TransferManager serving slices of {@code content}, so a whole-file download returns exactly those bytes.
      * populateData() serves every remote read from ONE shared mock stream, which other reads of the same test consume.
      */
-    private TransferManager downloadTransferManager() {
-        return new TransferManager((name, position, length) -> new ByteArrayInputStream(new byte[(int) length]), fileCache, threadPool);
+    private TransferManager downloadTransferManager(byte[] content) {
+        return new TransferManager(
+            (name, position, length) -> new ByteArrayInputStream(content, (int) position, (int) length),
+            fileCache,
+            threadPool
+        );
+    }
+
+    /** The fixture file's length of bytes ending in a Lucene footer, as a whole-file download must to pass its checksum check. */
+    private byte[] footeredContent() throws IOException {
+        long length = remoteSegmentStoreDirectory.fileLength(FILE_NAME);
+        String temp = "footered.tmp";
+        try (IndexOutput out = localDirectory.createOutput(temp, IOContext.DEFAULT)) {
+            for (long i = 0; i < length - CodecUtil.footerLength(); i++) {
+                out.writeByte((byte) i);
+            }
+            CodecUtil.writeFooter(out);
+        }
+        byte[] content = Files.readAllBytes(getFilePath(localDirectory, temp));
+        localDirectory.deleteFile(temp);
+        return content;
+    }
+
+    /** The footer checksum of {@code content} as the remote store would record it. */
+    private static String footerChecksum(byte[] content) throws IOException {
+        return Long.toString(CodecUtil.retrieveChecksum(new ByteArrayIndexInput("content", content)));
     }
 
     // ---------------- ownership and deferred close ----------------
@@ -785,13 +811,14 @@ public class SwitchableIndexInputWrapperWholeFileTests extends TieredStorageBase
     public void testDeferredCloseKeepsMappingUntilLastHandleThenReleasesEverything() throws Exception {
         Path switchKey = getFilePathSwitchable(localDirectory, FILE_NAME);
         Path fullPath = getFilePath(localDirectory, FILE_NAME);
+        byte[] content = footeredContent();
         // The family's cache entry, as TieredDirectory.cacheFile creates it.
         CachedSwitchableIndexInput entry = new CachedSwitchableIndexInput(
             fileCache,
             FILE_NAME,
             localDirectory,
             remoteSegmentStoreDirectory,
-            downloadTransferManager(),
+            downloadTransferManager(content),
             true,
             threadPool,
             PREFETCH
@@ -799,6 +826,7 @@ public class SwitchableIndexInputWrapperWholeFileTests extends TieredStorageBase
         fileCache.put(switchKey, entry);
         fileCache.decRef(switchKey);
         FullFileState st = entry.fullFileState();
+        st.markRemoteMode(footerChecksum(content)); // the fixture metadata's checksum belongs to no real bytes
         // Real pool: the cleanup must run off the FileCache listener thread, as in production.
         WarmFullFileManager realManager = new WarmFullFileManager(
             fileCache,
@@ -848,12 +876,13 @@ public class SwitchableIndexInputWrapperWholeFileTests extends TieredStorageBase
 
     public void testFamilyClosedWithoutHandlesCleansUpOnPoolNotOnRemovingThread() throws Exception {
         Path switchKey = getFilePathSwitchable(localDirectory, FILE_NAME);
+        byte[] content = footeredContent();
         CachedSwitchableIndexInput entry = new CachedSwitchableIndexInput(
             fileCache,
             FILE_NAME,
             localDirectory,
             remoteSegmentStoreDirectory,
-            downloadTransferManager(),
+            downloadTransferManager(content),
             true,
             threadPool,
             PREFETCH
@@ -861,6 +890,7 @@ public class SwitchableIndexInputWrapperWholeFileTests extends TieredStorageBase
         fileCache.put(switchKey, entry);
         fileCache.decRef(switchKey);
         FullFileState st = entry.fullFileState();
+        st.markRemoteMode(footerChecksum(content)); // the fixture metadata's checksum belongs to no real bytes
         // Runs promote() and the download for real, but holds the cleanup to show that it is not run inline.
         List<Runnable> held = new CopyOnWriteArrayList<>();
         AtomicBoolean holdCleanup = new AtomicBoolean(false);

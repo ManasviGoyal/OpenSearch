@@ -12,6 +12,8 @@ import org.apache.logging.log4j.Logger;
 import org.apache.lucene.store.FSDirectory;
 import org.apache.lucene.store.IndexInput;
 import org.opensearch.common.annotation.ExperimentalApi;
+import org.opensearch.common.util.CancellableThreads;
+import org.opensearch.index.store.RemoteSegmentStoreDirectory;
 import org.opensearch.index.store.remote.filecache.FileCache;
 import org.opensearch.index.store.remote.utils.TransferManager;
 
@@ -69,7 +71,17 @@ public final class FullFileState {
     // a family created from remote, otherwise by TieredDirectory.afterSyncToRemote after switchToRemote has returned.
     // The trigger reads this, not an individual input's flag, so a promotion can never overlap the local-copy removal.
     private volatile boolean remoteMode;
+    // The checksum the remote store recorded for the file at upload (the Lucene footer value as a decimal string), set
+    // together with remoteMode; null when the upload metadata was not available.
+    private volatile String expectedChecksum;
     private final AtomicReference<IndexInput> localMaster = new AtomicReference<>();
+    // The handle a download of this family runs under; created by the first promotion that needs it, cancelled at
+    // closeFamily, and left as CANCELLED afterwards so a promotion racing the close starts nothing.
+    private final AtomicReference<CancellableThreads> downloadCancellation = new AtomicReference<>();
+    private static final CancellableThreads CANCELLED = new CancellableThreads();
+    static {
+        CANCELLED.cancel("family closed");
+    }
     private volatile long retryAt;
     private final AtomicInteger handleCount = new AtomicInteger(0);
 
@@ -121,14 +133,35 @@ public final class FullFileState {
      * original and every clone and the local copy has been removed; a promotion therefore never overlaps that removal.
      * An input's own switched flag flips earlier, while the switch is still in progress, so it is not used for this.
      * Remote mode is final.
+     *
+     * @param expectedChecksum the checksum the remote store holds for the file, which a local whole-file copy must
+     *                         match before it is served; null when unknown, in which case no local copy is reused
      */
-    public void markRemoteMode() {
+    public void markRemoteMode(String expectedChecksum) {
+        this.expectedChecksum = expectedChecksum;
         remoteMode = true;
     }
 
     /** @return true once the family is in remote (block) mode and may be promoted */
     public boolean isRemoteMode() {
         return remoteMode;
+    }
+
+    /** @return the remote store's checksum for the file (a decimal string), or null when it is not known */
+    public String expectedChecksum() {
+        return expectedChecksum;
+    }
+
+    /**
+     * The checksum the remote store recorded for {@code fileName} at upload.
+     *
+     * @param remoteDirectory the shard's remote segment store
+     * @param fileName        the plain file name
+     * @return the checksum as a decimal string, or null when the file has no upload metadata
+     */
+    public static String uploadedChecksum(RemoteSegmentStoreDirectory remoteDirectory, String fileName) {
+        RemoteSegmentStoreDirectory.UploadedSegmentMetadata metadata = remoteDirectory.getSegmentsUploadedToRemoteStore().get(fileName);
+        return metadata == null ? null : metadata.getChecksum();
     }
 
     /** @return the current lifecycle state */
@@ -200,6 +233,16 @@ public final class FullFileState {
     }
 
     /**
+     * The handle a download of this family runs under, created on first use. Once the family has closed this is an
+     * already cancelled handle, so a download started under it fails before its first remote read.
+     *
+     * @return the family's download cancellation handle
+     */
+    public CancellableThreads downloadCancellation() {
+        return downloadCancellation.updateAndGet(current -> current != null ? current : new CancellableThreads());
+    }
+
+    /**
      * Attaches the teardown for a FULL family. Called by the manager before it publishes FULL.
      *
      * @param cleanupExecutor          pool the unmap + decRef run on (never the FileCache listener thread)
@@ -216,12 +259,17 @@ public final class FullFileState {
      * The family-close routine. Called from {@code CachedSwitchableIndexInput.close()}, which runs
      * inside the FileCache removal listener under a segment lock, so this must not touch the FileCache inline.
      *
-     * <p>Marks the state CLOSED. If it was FULL: releases the budget now, and schedules the unmap + decRef for when the
-     * handle count reaches zero (immediately on the cleanup executor if it already is). If it was PROMOTING, the
-     * manager's completion handler sees the lost CAS and unwinds; if BLOCK, there is nothing to release.
+     * <p>Marks the state CLOSED and cancels a download in flight. If it was FULL: releases the budget now, and schedules
+     * the unmap + decRef for when the handle count reaches zero (immediately on the cleanup executor if it already is).
+     * If it was PROMOTING, the cancelled download fails and the manager's completion handler unwinds; if BLOCK, there
+     * is nothing to release.
      */
     public void closeFamily() {
         State prev = state.getAndSet(State.CLOSED);
+        CancellableThreads download = downloadCancellation.getAndSet(CANCELLED);
+        if (download != null) {
+            download.cancel("family closed"); // a download in flight fails within a part; its completion handler unwinds
+        }
         if (prev != State.FULL) {
             return;
         }

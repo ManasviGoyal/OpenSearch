@@ -78,6 +78,22 @@ public class FileCache implements RefCountedCache<Path, CachedIndexInput> {
         return theCache.capacity();
     }
 
+    /** @return the number of segments the cache is split into; each is an independent LRU with its share of the capacity */
+    public int segmentCount() {
+        return theCache.segmentCount();
+    }
+
+    /**
+     * The index of the segment that holds {@code filePath}, in {@code [0, segmentCount())}; two keys share a segment,
+     * and so compete for its capacity, exactly when they get the same index.
+     *
+     * @param filePath the cache key
+     * @return the segment index
+     */
+    public int segmentIndexFor(Path filePath) {
+        return theCache.segmentIndexFor(filePath);
+    }
+
     @Override
     public CachedIndexInput put(Path filePath, CachedIndexInput indexInput) {
         CachedIndexInput cachedIndexInput = theCache.put(filePath, indexInput);

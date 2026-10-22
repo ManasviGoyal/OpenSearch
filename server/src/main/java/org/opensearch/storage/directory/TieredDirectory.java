@@ -11,7 +11,6 @@ package org.opensearch.storage.directory;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.apache.lucene.index.IndexFileNames;
-import org.apache.lucene.store.AlreadyClosedException;
 import org.apache.lucene.store.DataAccessHint;
 import org.apache.lucene.store.Directory;
 import org.apache.lucene.store.IOContext;
@@ -35,6 +34,7 @@ import org.opensearch.storage.warmfullfile.WarmFullFileSettings;
 import org.opensearch.threadpool.ThreadPool;
 
 import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
 import java.util.Arrays;
@@ -152,16 +152,6 @@ public class TieredDirectory extends CompositeDirectory {
             return localDirectory.openInput(name, context);
         }
         Path key = getFilePathSwitchable(localDirectory, name);
-        try {
-            return openSwitchableHandle(name, context, key);
-        } catch (AlreadyClosedException e) {
-            // Two openInput calls raced to create the family: cacheFile put a new entry over the one just looked up
-            // and closed it (cacheFile closes the entry it replaces). The new entry is live; look it up once more.
-            return openSwitchableHandle(name, context, key);
-        }
-    }
-
-    private IndexInput openSwitchableHandle(String name, IOContext context, Path key) throws IOException {
         CachedIndexInput indexInput = fileCache.get(key);
         if (indexInput == null) {
             RemoteSegmentStoreDirectory.UploadedSegmentMetadata uploadedSegmentMetadata = remoteDirectory.getSegmentsUploadedToRemoteStore()
@@ -170,12 +160,10 @@ public class TieredDirectory extends CompositeDirectory {
                 throw new NoSuchFileException("File " + name + " not found in directory");
             }
             // For pre-created files already in remote, switchable entry would not be cached already locally, we need to download from
-            // remote and cache it in FileCache
-            cacheFile(name, true);
-            indexInput = fileCache.get(key);
-            // decrementing the ref here since refCount increases in cacheFile method, but since afterSyncToRemote won't be called (where we
-            // decRef) for files already in remote
-            fileCache.decRef(key);
+            // remote and cache it in FileCache. cacheFile creates the entry only if none is live, so concurrent opens of
+            // the same file share one family. The reference cacheFile leaves is released in the finally block below; for
+            // a locally written file afterSyncToRemote releases it instead.
+            indexInput = cacheFile(name, true);
         }
         try {
             SwitchableIndexInput original = (SwitchableIndexInput) indexInput.getIndexInput();
@@ -202,7 +190,7 @@ public class TieredDirectory extends CompositeDirectory {
      *
      * <p>Remote (block) mode is NOT part of this decision: the searcher opens its handles at refresh time, before the
      * segment is uploaded, and never reopens them, so a handle must be able to become promotable later. The wrapper
-     * checks the family's remote-mode flag at trigger time instead; see {@link FullFileState#markRemoteMode()}.
+     * checks the family's remote-mode flag at trigger time instead; see {@link FullFileState#markRemoteMode(String)}.
      */
     // visible for testing
     boolean isEligibleForFullFile(String name, IOContext context, SwitchableIndexInput original) {
@@ -272,7 +260,7 @@ public class TieredDirectory extends CompositeDirectory {
         withSwitchableEntry(file, (entry, input) -> {
             FullFileState fullFileState = entry.fullFileState();
             if (fullFileState != null && input.hasSwitchedToRemote()) {
-                fullFileState.markRemoteMode();
+                fullFileState.markRemoteMode(FullFileState.uploadedChecksum(remoteDirectory, file));
             }
         }, "Failed to confirm the switch to remote; the family stays on blocks");
     }
@@ -349,37 +337,36 @@ public class TieredDirectory extends CompositeDirectory {
         cacheFile(fileName, false);
     }
 
+    /**
+     * Ensures the file's switchable entry (its family) is in the FileCache, creating it only when the key has no live
+     * entry. The cache computes under the key's segment lock, so concurrent callers for the same file get one family
+     * and never replace a live one. Returns the entry with one reference taken for the caller, as a put would.
+     */
     // protected for testing
-    protected void cacheFile(String fileName, boolean cacheFromRemote) throws IOException {
+    protected CachedIndexInput cacheFile(String fileName, boolean cacheFromRemote) throws IOException {
         Path switchableFilePath = getFilePathSwitchable(localDirectory, fileName);
-        CachedIndexInput previous = fileCache.put(
-            switchableFilePath,
-            new CachedSwitchableIndexInput(
-                fileCache,
-                fileName,
-                DirectoryUtils.unwrapFSDirectory(localDirectory),
-                remoteDirectory,
-                transferManager,
-                cacheFromRemote,
-                threadPool,
-                tieredStoragePrefetchSettingsSupplier
-            )
-        );
-        // RemovalReason.REPLACED never calls the replaced entry's close(), so a put over a live entry (two
-        // openInput calls racing to create the family) would leak the old family's mapping, reference and budget. Run
-        // the family-close routine on it. This is not inside the FileCache listener, but close() defers its cache work
-        // to a pool thread regardless.
-        //
-        // A handle the racing openInput already returned from the replaced entry keeps working: its clone has its own
-        // block input and shares the TransferManager and FileCache, and its reference on the switchable key survives
-        // (put keeps the node and refcount). But its FullFileState is now CLOSED, so that handle never triggers a
-        // promotion and never receives whole-file views; only handles opened afterwards belong to the live family.
-        if (previous != null) {
-            try {
-                previous.close();
-            } catch (Exception e) {
-                logger.warn("failed to close replaced switchable entry for {}", fileName, e);
-            }
+        try {
+            return fileCache.compute(switchableFilePath, (key, existing) -> {
+                if (existing != null && existing.isClosed() == false) {
+                    return existing;
+                }
+                try {
+                    return new CachedSwitchableIndexInput(
+                        fileCache,
+                        fileName,
+                        DirectoryUtils.unwrapFSDirectory(localDirectory),
+                        remoteDirectory,
+                        transferManager,
+                        cacheFromRemote,
+                        threadPool,
+                        tieredStoragePrefetchSettingsSupplier
+                    );
+                } catch (IOException e) {
+                    throw new UncheckedIOException(e);
+                }
+            });
+        } catch (UncheckedIOException e) {
+            throw e.getCause();
         }
     }
 }

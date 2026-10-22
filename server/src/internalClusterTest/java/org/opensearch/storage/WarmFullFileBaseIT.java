@@ -46,6 +46,7 @@ import org.opensearch.test.OpenSearchIntegTestCase;
 
 import java.io.IOException;
 import java.nio.file.Files;
+import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
 import java.util.Arrays;
 import java.util.HashSet;
@@ -318,9 +319,15 @@ public abstract class WarmFullFileBaseIT extends RemoteStoreBaseIntegTestCase {
         if (localFiles(warmShard).contains(fileName) == false) {
             return false;
         }
-        long length = warmShard.directory.fileLength(fileName);
-        Path key = warmShard.directory.getFilePath(fileName);
-        if (Files.exists(key) == false || Files.size(key) != length) {
+        final long length;
+        final Path key = warmShard.directory.getFilePath(fileName);
+        try {
+            length = warmShard.directory.fileLength(fileName);
+            if (Files.exists(key) == false || Files.size(key) != length) {
+                return false;
+            }
+        } catch (NoSuchFileException e) {
+            // The whole file was deleted between the listing and this lookup (a leftover being replaced): not promoted.
             return false;
         }
         CachedIndexInput entry = warmShard.fileCache.get(key);

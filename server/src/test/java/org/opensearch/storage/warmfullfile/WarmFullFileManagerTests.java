@@ -11,11 +11,14 @@ import com.carrotsearch.randomizedtesting.annotations.ThreadLeakFilters;
 
 import org.apache.logging.log4j.Level;
 import org.apache.logging.log4j.LogManager;
+import org.apache.lucene.codecs.CodecUtil;
 import org.apache.lucene.store.FSDirectory;
 import org.apache.lucene.store.IOContext;
 import org.apache.lucene.store.IndexInput;
+import org.apache.lucene.store.IndexOutput;
 import org.apache.lucene.store.MMapDirectory;
 import org.apache.lucene.store.NIOFSDirectory;
+import org.opensearch.common.lucene.store.ByteArrayIndexInput;
 import org.opensearch.index.store.remote.file.CleanerDaemonThreadLeakFilter;
 import org.opensearch.index.store.remote.filecache.CachedFullFileIndexInput;
 import org.opensearch.index.store.remote.filecache.CachedIndexInput;
@@ -23,6 +26,7 @@ import org.opensearch.index.store.remote.filecache.FileCache;
 import org.opensearch.index.store.remote.filecache.FileCacheFactory;
 import org.opensearch.index.store.remote.utils.BlobFetchRequest;
 import org.opensearch.index.store.remote.utils.TransferManager;
+import org.opensearch.storage.warmfullfile.WarmFullFileStats.DeclineReason;
 import org.opensearch.test.MockLogAppender;
 import org.opensearch.test.OpenSearchTestCase;
 import org.opensearch.threadpool.TestThreadPool;
@@ -44,6 +48,7 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.LongSupplier;
 
 // CachedFullFileIndexInput (used by the pre-existing-entry tests) registers with a Cleaner whose daemon thread is never
@@ -90,6 +95,29 @@ public class WarmFullFileManagerTests extends OpenSearchTestCase {
                 b[i] = (byte) ((position + i) & 0xff);
             }
             return new ByteArrayInputStream(b);
+        }
+
+        int readCount() {
+            return reads.get();
+        }
+    }
+
+    /**
+     * A StreamReader that serves slices of one fixed byte array, so a download writes exactly that content (used with
+     * {@link #footeredContent(long)} to download a file that carries a valid Lucene footer). Counts reads.
+     */
+    static final class FixedContentStreamReader implements TransferManager.StreamReader {
+        private final byte[] content;
+        private final AtomicInteger reads = new AtomicInteger(0);
+
+        FixedContentStreamReader(byte[] content) {
+            this.content = content;
+        }
+
+        @Override
+        public InputStream read(String name, long position, long length) {
+            reads.incrementAndGet();
+            return new ByteArrayInputStream(content, (int) position, (int) length);
         }
 
         int readCount() {
@@ -197,7 +225,7 @@ public class WarmFullFileManagerTests extends OpenSearchTestCase {
 
     /** As {@link #newManager(FileCache, int, double)} with an injected clock, for tests that assert on retryAt. */
     private static WarmFullFileManager newManager(FileCache fileCache, LongSupplier clock, int slots, double budgetFraction) {
-        return new WarmFullFileManager(fileCache, Runnable::run, clock, slots, budgetFraction, 1, PART_SIZE);
+        return new WarmFullFileManager(fileCache, Runnable::run, clock, slots, budgetFraction, PART_SIZE);
     }
 
     private FullFileState newState(TransferManager tm, FileCache fileCache, String name, long length) {
@@ -220,6 +248,72 @@ public class WarmFullFileManagerTests extends OpenSearchTestCase {
 
     private void awaitState(FullFileState st, FullFileState.State target) throws Exception {
         assertBusy(() -> assertEquals(target, st.state()), 10, TimeUnit.SECONDS);
+    }
+
+    /**
+     * A whole file as the remote store holds it: {@code bodyLength} position-dependent bytes (as {@link #expectedBytes})
+     * followed by a valid Lucene footer, so it passes the footer and entire-file checksum checks. Built through a
+     * temporary file in {@code localDirectory} so the footer's checksum covers the exact bytes returned.
+     */
+    private byte[] footeredContent(long bodyLength) throws IOException {
+        String tempName = "_footered_" + randomAlphaOfLength(8) + ".tmp";
+        try (IndexOutput out = localDirectory.createOutput(tempName, IOContext.DEFAULT)) {
+            out.writeBytes(expectedBytes(bodyLength), (int) bodyLength);
+            CodecUtil.writeFooter(out);
+        }
+        byte[] content = Files.readAllBytes(dir.resolve(tempName));
+        localDirectory.deleteFile(tempName);
+        assertEquals(bodyLength + CodecUtil.footerLength(), content.length);
+        return content;
+    }
+
+    /** The footer checksum of {@code footered} content, in the decimal form the remote store's upload metadata uses. */
+    private static String footerChecksum(byte[] footered) throws IOException {
+        try (IndexInput in = new ByteArrayIndexInput("footered", footered)) {
+            return Long.toString(CodecUtil.retrieveChecksum(in));
+        }
+    }
+
+    /** A family in remote mode whose remote checksum is {@code checksum}, as the directory sets it after an upload. */
+    private FullFileState newStateWithChecksum(TransferManager tm, FileCache fileCache, String name, long length, String checksum) {
+        FullFileState st = newState(tm, fileCache, name, length);
+        st.markRemoteMode(checksum);
+        return st;
+    }
+
+    /** As {@link #newManager(FileCache, int, double)} with 4 slots, half the cache as budget, and the given entire-file setting. */
+    private WarmFullFileManager newManager(FileCache fileCache, boolean verifyEntireFile) {
+        return new WarmFullFileManager(
+            fileCache,
+            Runnable::run,
+            threadPool::relativeTimeInMillis,
+            4,
+            0.5,
+            PART_SIZE,
+            WarmFullFileManager.NO_OP_SCHEDULER,
+            verifyEntireFile
+        );
+    }
+
+    /** The number of parts a download of {@code length} bytes takes with {@link #PART_SIZE} parts. */
+    private static int partsFor(String name, long length) {
+        return WarmFullFileManager.buildParts(name, length, PART_SIZE).size();
+    }
+
+    /** Puts a restore placeholder for a {@code length}-byte file at {@code path} and drops the put's reference. */
+    private static FileCache.RestoredCachedIndexInput putRestoredPlaceholder(FileCache fileCache, Path path, long length) {
+        FileCache.RestoredCachedIndexInput restored = new FileCache.RestoredCachedIndexInput(length);
+        fileCache.put(path, restored);
+        fileCache.decRef(path);
+        return restored;
+    }
+
+    /** Asserts the family serves {@code content} from its own mapping and holds exactly one reference on the whole-file entry. */
+    private static void assertServedWithOneReference(FullFileState st, FileCache fileCache, Path path, byte[] content) throws IOException {
+        assertArrayEquals("served bytes", content, readAll(st.localMaster(), content.length));
+        assertNotNull(fileCache.get(path));
+        fileCache.decRef(path);
+        assertEquals("exactly the family's reference", Integer.valueOf(1), fileCache.getRef(path));
     }
 
     // ---------- buildParts (pure) ----------
@@ -299,6 +393,8 @@ public class WarmFullFileManagerTests extends OpenSearchTestCase {
     }
 
     public void testFamilyClosedDuringDownloadTakesNoReferenceAndReleasesBytes() throws Exception {
+        // The family closes mid-download and the reader is released right after: whether the cancel or the release
+        // wins, the download ends without publishing, the budget is released and no family reference is held.
         String name = "_11.faiss";
         CountDownLatch release = new CountDownLatch(1);
         FileCache fileCache = newFileCache();
@@ -316,7 +412,76 @@ public class WarmFullFileManagerTests extends OpenSearchTestCase {
         assertEquals(FullFileState.State.CLOSED, st.state());
         assertNull("nothing published", st.localMaster());
         assertFalse(st.cleanupDone());
-        assertEquals("no family reference held on the whole-file entry", Integer.valueOf(0), fileCache.getRef(dir.resolve(name)));
+        assertNull("the cancelled download's entry is gone", fileCache.getRef(dir.resolve(name)));
+        assertEquals("counted as a close, not a download failure", 1L, mgr.stats().declined().get(DeclineReason.FAMILY_CLOSED).longValue());
+    }
+
+    public void testClosingTheFamilyCancelsABlockedDownloadAndReleasesAdmission() throws Exception {
+        // The reader never returns: closing the family cancels the download anyway, and the slot, the budget, the
+        // entry and the partial file are all gone without the reader ever being released.
+        String name = "_cancel_blocked.faiss";
+        Path path = dir.resolve(name);
+        CountDownLatch release = new CountDownLatch(1);
+        PositionDependentStreamReader inner = new PositionDependentStreamReader();
+        FileCache fileCache = newFileCache();
+        TransferManager tm = new TransferManager(blockingReader(release, inner), fileCache, threadPool);
+        WarmFullFileManager mgr = newManager(fileCache, 1, 0.5);
+
+        FullFileState st = newState(tm, fileCache, name, FILE_LENGTH);
+        startPromotion(mgr, st);
+        assertEquals("the one slot is held", 1, mgr.stats().activeDownloads());
+        assertEquals(FILE_LENGTH, mgr.stats().reservedBytesPerSegment()[0]);
+
+        st.closeFamily();
+
+        assertBusy(() -> {
+            assertEquals("slot released", 0, mgr.stats().activeDownloads());
+            assertEquals("budget released", 0L, mgr.stats().reservedBytesPerSegment()[0]);
+            assertNull("no entry left", fileCache.get(path));
+            assertFalse("no partial file left", Files.exists(path));
+        }, 30, TimeUnit.SECONDS);
+        assertEquals("the reader was never released", 1L, release.getCount());
+        assertEquals(FullFileState.State.CLOSED, st.state());
+        assertNull(st.localMaster());
+        WarmFullFileStats stats = mgr.stats();
+        assertEquals(1L, stats.declined().get(DeclineReason.FAMILY_CLOSED).longValue());
+        assertEquals(0L, stats.declined().get(DeclineReason.DOWNLOAD_FAILED).longValue());
+        assertEquals(0L, stats.promoted());
+        release.countDown();
+    }
+
+    public void testFamilyClosedBetweenPartsStopsTheDownloadBeforeTheNextPart() throws Exception {
+        // The family closes after the second part was read: the loop stops before the third, so of the four parts only
+        // two were ever requested, and nothing of the download remains.
+        String name = "_cancel_between.faiss";
+        Path path = dir.resolve(name);
+        PositionDependentStreamReader inner = new PositionDependentStreamReader();
+        AtomicReference<FullFileState> family = new AtomicReference<>();
+        TransferManager.StreamReader closingOnSecondPart = (n, position, length) -> {
+            InputStream stream = inner.read(n, position, length);
+            if (inner.readCount() == 2) {
+                family.get().closeFamily();
+            }
+            return stream;
+        };
+        FileCache fileCache = newFileCache();
+        TransferManager tm = new TransferManager(closingOnSecondPart, fileCache, threadPool);
+        WarmFullFileManager mgr = newManager(fileCache, 4, 0.5);
+
+        FullFileState st = newState(tm, fileCache, name, FILE_LENGTH);
+        family.set(st);
+        startPromotion(mgr, st);
+
+        assertBusy(() -> {
+            assertEquals(0, mgr.stats().activeDownloads());
+            assertEquals(0L, mgr.stats().reservedBytesPerSegment()[0]);
+            assertNull(fileCache.get(path));
+            assertFalse(Files.exists(path));
+        }, 30, TimeUnit.SECONDS);
+        assertEquals("the third part was never requested", 2, inner.readCount());
+        assertEquals(FullFileState.State.CLOSED, st.state());
+        assertEquals(1L, mgr.stats().declined().get(DeclineReason.FAMILY_CLOSED).longValue());
+        assertEquals(0L, mgr.stats().declined().get(DeclineReason.DOWNLOAD_FAILED).longValue());
     }
 
     public void testConcurrentFamilyCloseAndPromotionDoNotDeadlock() throws Exception {
@@ -333,7 +498,6 @@ public class WarmFullFileManagerTests extends OpenSearchTestCase {
             threadPool::relativeTimeInMillis,
             families,
             0.5,
-            4,
             PART_SIZE
         );
         List<FullFileState> states = new ArrayList<>();
@@ -848,7 +1012,6 @@ public class WarmFullFileManagerTests extends OpenSearchTestCase {
             threadPool::relativeTimeInMillis,
             4,
             0.5,
-            1,
             PART_SIZE,
             (task, delay) -> {
                 scheduled.add(task);
@@ -924,7 +1087,9 @@ public class WarmFullFileManagerTests extends OpenSearchTestCase {
     }
 
     public void testRestoredPlaceholderAtKeyIsRemovedAndRedownloaded() throws Exception {
-        // A restore placeholder (no open handle, file with WRONG bytes on disk) sits at the key: removed, re-downloaded.
+        // A restore placeholder (no open handle, file with WRONG bytes on disk) sits at the key. No remote checksum is
+        // known for the family (markRemoteMode was never called), so the leftover cannot be validated and is
+        // re-downloaded: the placeholder is removed and the file rewritten from the reader.
         String name = "_restored.faiss";
         Path path = dir.resolve(name);
         PositionDependentStreamReader reader = new PositionDependentStreamReader();
@@ -990,7 +1155,8 @@ public class WarmFullFileManagerTests extends OpenSearchTestCase {
     }
 
     public void testStrayFileWithoutEntryIsDeletedAndRedownloaded() throws Exception {
-        // A file with WRONG bytes exists at the path but nothing in the cache refers to it: deleted and re-downloaded.
+        // A file with WRONG bytes exists at the path but nothing in the cache refers to it. No remote checksum is known
+        // for the family, so the leftover cannot be validated and is re-downloaded: deleted, then rewritten from the reader.
         String name = "_stray.faiss";
         Path path = dir.resolve(name);
         PositionDependentStreamReader reader = new PositionDependentStreamReader();
@@ -1013,6 +1179,203 @@ public class WarmFullFileManagerTests extends OpenSearchTestCase {
         assertNotNull(fileCache.get(path));
         fileCache.decRef(path);
         assertEquals(Integer.valueOf(1), fileCache.getRef(path));
+    }
+
+    // ---------- whole files left on disk, validated against the remote checksum ----------
+
+    public void testCompleteRestoredLeftoverIsReusedWithoutDownload() throws Exception {
+        // A restore placeholder stands for a complete whole file whose length and footer checksum match the remote
+        // store's. The file is kept and served without any remote read; the promotion is counted as reused, not started.
+        String name = "_reuse_restored.faiss";
+        Path path = dir.resolve(name);
+        byte[] content = footeredContent(FILE_LENGTH);
+        FixedContentStreamReader reader = new FixedContentStreamReader(content);
+        FileCache fileCache = newFileCache();
+        TransferManager tm = new TransferManager(reader, fileCache, threadPool);
+        WarmFullFileManager mgr = newManager(fileCache, 4, 0.5);
+
+        Files.write(path, content);
+        FileCache.RestoredCachedIndexInput restored = putRestoredPlaceholder(fileCache, path, content.length);
+
+        FullFileState st = newStateWithChecksum(tm, fileCache, name, content.length, footerChecksum(content));
+        startPromotion(mgr, st);
+        awaitState(st, FullFileState.State.FULL);
+
+        assertEquals("nothing read from the remote store", 0, reader.readCount());
+        assertServedWithOneReference(st, fileCache, path, content);
+        assertNotSame("the placeholder was replaced by a live entry", restored, fileCache.get(path));
+        fileCache.decRef(path);
+        WarmFullFileStats stats = mgr.stats();
+        assertEquals("counted as reused", 1L, stats.reused());
+        assertEquals("no download started", 0L, stats.started());
+        assertEquals("no bytes downloaded", 0L, stats.downloadedBytes());
+        assertEquals(1L, stats.promoted());
+    }
+
+    public void testCompleteStrayFileIsReusedWithoutDownload() throws Exception {
+        // A complete whole file is on disk with no cache entry at all; its length and footer checksum match the remote
+        // store's. It is kept and served without any remote read, with a fresh entry holding exactly the family's reference.
+        String name = "_reuse_stray.faiss";
+        Path path = dir.resolve(name);
+        byte[] content = footeredContent(FILE_LENGTH);
+        FixedContentStreamReader reader = new FixedContentStreamReader(content);
+        FileCache fileCache = newFileCache();
+        TransferManager tm = new TransferManager(reader, fileCache, threadPool);
+        WarmFullFileManager mgr = newManager(fileCache, 4, 0.5);
+
+        Files.write(path, content);
+        assertNull(fileCache.get(path));
+
+        FullFileState st = newStateWithChecksum(tm, fileCache, name, content.length, footerChecksum(content));
+        startPromotion(mgr, st);
+        awaitState(st, FullFileState.State.FULL);
+
+        assertEquals("nothing read from the remote store", 0, reader.readCount());
+        assertServedWithOneReference(st, fileCache, path, content);
+        WarmFullFileStats stats = mgr.stats();
+        assertEquals("counted as reused", 1L, stats.reused());
+        assertEquals("no download started", 0L, stats.started());
+        assertEquals("no bytes downloaded", 0L, stats.downloadedBytes());
+        assertEquals(1L, stats.promoted());
+    }
+
+    public void testTruncatedLeftoverIsDeletedAndRedownloaded() throws Exception {
+        // The file under a restore placeholder is shorter than the family's length (a write that did not finish): it
+        // fails the length check, the placeholder and the file are removed, and the whole file is downloaded again.
+        String name = "_truncated.faiss";
+        Path path = dir.resolve(name);
+        byte[] content = footeredContent(FILE_LENGTH);
+        FixedContentStreamReader reader = new FixedContentStreamReader(content);
+        FileCache fileCache = newFileCache();
+        TransferManager tm = new TransferManager(reader, fileCache, threadPool);
+        WarmFullFileManager mgr = newManager(fileCache, 4, 0.5);
+
+        Files.write(path, Arrays.copyOf(content, content.length - 100));
+        putRestoredPlaceholder(fileCache, path, content.length);
+
+        FullFileState st = newStateWithChecksum(tm, fileCache, name, content.length, footerChecksum(content));
+        startPromotion(mgr, st);
+        awaitState(st, FullFileState.State.FULL);
+
+        assertEquals("re-downloaded, one read per part", partsFor(name, content.length), reader.readCount());
+        assertArrayEquals("file on disk was rewritten", content, Files.readAllBytes(path));
+        assertServedWithOneReference(st, fileCache, path, content);
+        WarmFullFileStats stats = mgr.stats();
+        assertEquals("not reused", 0L, stats.reused());
+        assertEquals("one download started", 1L, stats.started());
+        assertEquals(content.length, stats.downloadedBytes());
+    }
+
+    public void testFullLengthLeftoverWithWrongFooterChecksumIsRedownloaded() throws Exception {
+        // The file under a restore placeholder has the right length but its footer carries a different CRC than the
+        // remote store's: it fails the footer check, is removed with its placeholder, and the whole file is downloaded again.
+        String name = "_wrong_footer.faiss";
+        Path path = dir.resolve(name);
+        byte[] content = footeredContent(FILE_LENGTH);
+        FixedContentStreamReader reader = new FixedContentStreamReader(content);
+        FileCache fileCache = newFileCache();
+        TransferManager tm = new TransferManager(reader, fileCache, threadPool);
+        WarmFullFileManager mgr = newManager(fileCache, 4, 0.5);
+
+        byte[] wrongFooter = content.clone();
+        for (int i = wrongFooter.length - 4; i < wrongFooter.length; i++) {
+            wrongFooter[i] ^= (byte) 0xff; // the CRC is the last four bytes of the footer
+        }
+        Files.write(path, wrongFooter);
+        putRestoredPlaceholder(fileCache, path, content.length);
+
+        FullFileState st = newStateWithChecksum(tm, fileCache, name, content.length, footerChecksum(content));
+        startPromotion(mgr, st);
+        awaitState(st, FullFileState.State.FULL);
+
+        assertEquals("re-downloaded, one read per part", partsFor(name, content.length), reader.readCount());
+        assertArrayEquals("file on disk was rewritten", content, Files.readAllBytes(path));
+        assertServedWithOneReference(st, fileCache, path, content);
+        WarmFullFileStats stats = mgr.stats();
+        assertEquals("not reused", 0L, stats.reused());
+        assertEquals("one download started", 1L, stats.started());
+        assertEquals(content.length, stats.downloadedBytes());
+    }
+
+    public void testCorruptedMiddleBytesAreRejectedOnlyWithEntireFileCheck() throws Exception {
+        // A leftover with the right length and an intact footer but one flipped byte in the middle. With the entire-file
+        // check on, the content checksum catches it and the file is re-downloaded. With the check off, only the length
+        // and the footer are compared, so the corrupted copy is accepted and served as is.
+        byte[] content = footeredContent(FILE_LENGTH);
+        byte[] corrupted = content.clone();
+        corrupted[corrupted.length / 2] ^= (byte) 0xff;
+        String checksum = footerChecksum(content);
+        assertEquals("the footer still reads the same", checksum, footerChecksum(corrupted));
+
+        String verifiedName = "_mid_verified.faiss";
+        Path verifiedPath = dir.resolve(verifiedName);
+        FixedContentStreamReader verifiedReader = new FixedContentStreamReader(content);
+        FileCache verifiedCache = newFileCache();
+        TransferManager verifiedTm = new TransferManager(verifiedReader, verifiedCache, threadPool);
+        WarmFullFileManager verifying = newManager(verifiedCache, true);
+        Files.write(verifiedPath, corrupted);
+        putRestoredPlaceholder(verifiedCache, verifiedPath, content.length);
+
+        FullFileState verified = newStateWithChecksum(verifiedTm, verifiedCache, verifiedName, content.length, checksum);
+        startPromotion(verifying, verified);
+        awaitState(verified, FullFileState.State.FULL);
+
+        assertEquals("re-downloaded, one read per part", partsFor(verifiedName, content.length), verifiedReader.readCount());
+        assertServedWithOneReference(verified, verifiedCache, verifiedPath, content);
+        assertEquals("not reused", 0L, verifying.stats().reused());
+        assertEquals(1L, verifying.stats().started());
+
+        String unverifiedName = "_mid_unverified.faiss";
+        Path unverifiedPath = dir.resolve(unverifiedName);
+        FixedContentStreamReader unverifiedReader = new FixedContentStreamReader(content);
+        FileCache unverifiedCache = newFileCache();
+        TransferManager unverifiedTm = new TransferManager(unverifiedReader, unverifiedCache, threadPool);
+        WarmFullFileManager footerOnly = newManager(unverifiedCache, false);
+        Files.write(unverifiedPath, corrupted);
+        putRestoredPlaceholder(unverifiedCache, unverifiedPath, content.length);
+
+        FullFileState unverified = newStateWithChecksum(unverifiedTm, unverifiedCache, unverifiedName, content.length, checksum);
+        startPromotion(footerOnly, unverified);
+        awaitState(unverified, FullFileState.State.FULL);
+
+        assertEquals("nothing read from the remote store", 0, unverifiedReader.readCount());
+        assertServedWithOneReference(unverified, unverifiedCache, unverifiedPath, corrupted);
+        assertEquals("the corrupted copy was reused", 1L, footerOnly.stats().reused());
+        assertEquals(0L, footerOnly.stats().started());
+    }
+
+    public void testFreshDownloadWithMismatchedChecksumEndsInBlockWithNothingLeft() throws Exception {
+        // The download completes with the right length but its footer checksum is not the remote store's: the entry and
+        // the file are dropped, the family returns to BLOCK with a retry time, the mismatch is counted, and the slot and
+        // the budget are released.
+        String name = "_bad_download.faiss";
+        Path path = dir.resolve(name);
+        byte[] content = footeredContent(FILE_LENGTH);
+        FixedContentStreamReader reader = new FixedContentStreamReader(content);
+        FileCache fileCache = newFileCache();
+        TransferManager tm = new TransferManager(reader, fileCache, threadPool);
+        AtomicLong clock = new AtomicLong(900);
+        WarmFullFileManager mgr = newManager(fileCache, clock::get, 1, 0.5);
+
+        String otherChecksum = Long.toString(Long.parseLong(footerChecksum(content)) + 1);
+        FullFileState st = newStateWithChecksum(tm, fileCache, name, content.length, otherChecksum);
+        startPromotion(mgr, st);
+
+        awaitState(st, FullFileState.State.BLOCK);
+        assertEquals(900 + WarmFullFileManager.RETRY_DELAY_MILLIS, st.retryAt());
+        assertNull("nothing published", st.localMaster());
+        assertEquals("downloaded once", partsFor(name, content.length), reader.readCount());
+        assertBusy(() -> {
+            assertNull("entry removed", fileCache.get(path));
+            assertFalse("file deleted", Files.exists(path));
+        }, 10, TimeUnit.SECONDS);
+        WarmFullFileStats stats = mgr.stats();
+        assertEquals(1L, stats.declined().get(WarmFullFileStats.DeclineReason.CHECKSUM_MISMATCH).longValue());
+        assertEquals(1L, stats.failed());
+        assertEquals(1L, stats.started());
+        assertEquals(0L, stats.promoted());
+        assertEquals("budget released", 0L, stats.reservedBytesPerSegment()[0]);
+        assertEquals("slot released", 0, stats.activeDownloads());
     }
 
     // ---------- concurrent promote() of one family ----------

@@ -57,13 +57,14 @@ public class WarmFullFilePerSegmentBudgetTests extends OpenSearchTestCase {
         // concurrencyLevel 4 -> 4 segments of 20,000 bytes; the manager budgets half of each (10,000 bytes).
         fileCache = FileCacheFactory.createConcurrentLRUFileCache(CAPACITY, SEGMENTS);
         assertEquals(CAPACITY, fileCache.capacity());
+        assertEquals(SEGMENTS, fileCache.segmentCount());
         reader = new WarmFullFileManagerTests.PositionDependentStreamReader();
         transferManager = new TransferManager(reader, fileCache, threadPool);
         clock = new AtomicLong(10_000);
-        manager = new WarmFullFileManager(fileCache, Runnable::run, clock::get, 8, 0.5, SEGMENTS, PART_SIZE);
+        manager = new WarmFullFileManager(fileCache, Runnable::run, clock::get, 8, 0.5, PART_SIZE);
         perSegmentCapacity = CAPACITY / SEGMENTS;
         cap = perSegmentCapacity / 2;
-        target = WarmFullFileManager.segmentIndexFor(dir.resolve("_t0.faiss"), SEGMENTS);
+        target = fileCache.segmentIndexFor(dir.resolve("_t0.faiss"));
     }
 
     @After
@@ -77,7 +78,7 @@ public class WarmFullFilePerSegmentBudgetTests extends OpenSearchTestCase {
         List<String> names = new ArrayList<>();
         for (int i = 0; names.size() < count; i++) {
             String name = "_t" + i + ".faiss";
-            if (WarmFullFileManager.segmentIndexFor(dir.resolve(name), SEGMENTS) == target) {
+            if (fileCache.segmentIndexFor(dir.resolve(name)) == target) {
                 names.add(name);
             }
         }
@@ -88,7 +89,7 @@ public class WarmFullFilePerSegmentBudgetTests extends OpenSearchTestCase {
     private String blockFileNameInTargetSegment() {
         for (int i = 0;; i++) {
             String name = "_b" + i + ".faiss";
-            if (WarmFullFileManager.segmentIndexFor(dir.resolve(name + "_block_0"), SEGMENTS) == target) {
+            if (fileCache.segmentIndexFor(dir.resolve(name + "_block_0")) == target) {
                 return name;
             }
         }
@@ -115,6 +116,7 @@ public class WarmFullFilePerSegmentBudgetTests extends OpenSearchTestCase {
             awaitState(st, FullFileState.State.FULL);
             full.add(st);
         }
+        assertEquals("one budget counter per cache segment", SEGMENTS, manager.stats().reservedBytesPerSegment().length);
         assertEquals(admitted * FILE_LENGTH, manager.stats().reservedBytesPerSegment()[target]);
         assertEquals("one read per part per file", admitted * (FILE_LENGTH / PART_SIZE), reader.readCount());
 
@@ -158,7 +160,7 @@ public class WarmFullFilePerSegmentBudgetTests extends OpenSearchTestCase {
         // A block of ANOTHER file whose block key hashes to the same segment: fetched normally, nothing evicted.
         String blockFile = blockFileNameInTargetSegment();
         String blockKeyName = blockFile + "_block_0";
-        assertEquals(target, WarmFullFileManager.segmentIndexFor(dir.resolve(blockKeyName), SEGMENTS));
+        assertEquals(target, fileCache.segmentIndexFor(dir.resolve(blockKeyName)));
         BlobFetchRequest blockRequest = BlobFetchRequest.builder()
             .directory(localDirectory)
             .fileName(blockKeyName)

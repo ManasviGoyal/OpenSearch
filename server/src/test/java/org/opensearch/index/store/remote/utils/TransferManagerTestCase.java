@@ -13,6 +13,7 @@ import com.carrotsearch.randomizedtesting.annotations.ThreadLeakFilters;
 import org.apache.lucene.store.IndexInput;
 import org.apache.lucene.store.MMapDirectory;
 import org.apache.lucene.store.SimpleFSLockFactory;
+import org.opensearch.common.util.CancellableThreads;
 import org.opensearch.index.store.remote.file.CleanerDaemonThreadLeakFilter;
 import org.opensearch.index.store.remote.filecache.FileCache;
 import org.opensearch.index.store.remote.filecache.FileCacheFactory;
@@ -23,11 +24,13 @@ import org.junit.After;
 import org.junit.Before;
 
 import java.io.IOException;
+import java.nio.file.Files;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
@@ -334,6 +337,36 @@ public abstract class TransferManagerTestCase extends OpenSearchTestCase {
         transferManager.fetchBlobAsync(blobFetchRequest).join();
         waitUntil(() -> fileCache.getRef(blobFetchRequest.getFilePath()) == 1, 10, TimeUnit.SECONDS);
         assertEquals(Optional.of(1), Optional.of(fileCache.getRef(blobFetchRequest.getFilePath())));
+    }
+
+    public void testCancelledAsyncDownloadLeavesNoEntryOrFile() throws Exception {
+        // A download started under a cancellation handle and then cancelled while its read blocks: the future fails
+        // with the cancellation, and the cache entry and the partial file are removed as for any failed download.
+        final CountDownLatch latch = new CountDownLatch(1);
+        mockWaitForLatchReader(latch);
+        List<BlobFetchRequest.BlobPart> blobParts = new ArrayList<>();
+        blobParts.add(new BlobFetchRequest.BlobPart("blocking-blob", 0, EIGHT_MB));
+        BlobFetchRequest request = BlobFetchRequest.builder().fileName("cancelled-file").directory(directory).blobParts(blobParts).build();
+        CancellableThreads cancellableThreads = new CancellableThreads();
+        try {
+            CompletableFuture<IndexInput> future = transferManager.fetchBlobAsync(request, cancellableThreads);
+            assertFalse(future.isDone());
+            cancellableThreads.cancel("test");
+            ExecutionException failure = expectThrows(ExecutionException.class, () -> future.get(30, TimeUnit.SECONDS));
+            Throwable cause = failure.getCause();
+            while (cause != null && cause instanceof CancellableThreads.ExecutionCancelledException == false) {
+                cause = cause.getCause();
+            }
+            assertNotNull("the future fails with the cancellation", cause);
+            assertBusy(() -> {
+                MatcherAssert.assertThat(fileCache.usage(), equalTo(0L));
+                MatcherAssert.assertThat(fileCache.activeUsage(), equalTo(0L));
+                assertNull(fileCache.get(request.getFilePath()));
+                assertFalse(Files.exists(request.getFilePath()));
+            });
+        } finally {
+            latch.countDown();
+        }
     }
 
     protected abstract void initializeTransferManager() throws IOException;

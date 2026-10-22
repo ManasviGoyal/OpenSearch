@@ -42,9 +42,11 @@ public final class WarmFullFileStats {
         DOWNLOAD_FAILED,
         /** The downloaded file does not have the expected length. */
         LENGTH_MISMATCH,
+        /** The downloaded file's checksum does not match the one the remote store holds. */
+        CHECKSUM_MISMATCH,
         /** The whole-file cache entry was evicted before the family reached FULL. */
         ENTRY_EVICTED,
-        /** The family closed while the download or the publish was in progress. */
+        /** The family closed while the download or the publish was in progress; a download in flight is cancelled. */
         FAMILY_CLOSED,
         /** An unexpected exception while starting the download or publishing the mapping. */
         ERROR
@@ -52,6 +54,7 @@ public final class WarmFullFileStats {
 
     private final long requested;
     private final long started;
+    private final long reused;
     private final long promoted;
     private final long downloadedBytes;
     private final long promotedBytes;
@@ -64,6 +67,7 @@ public final class WarmFullFileStats {
     WarmFullFileStats(
         long requested,
         long started,
+        long reused,
         long promoted,
         long downloadedBytes,
         long promotedBytes,
@@ -75,6 +79,7 @@ public final class WarmFullFileStats {
     ) {
         this.requested = requested;
         this.started = started;
+        this.reused = reused;
         this.promoted = promoted;
         this.downloadedBytes = downloadedBytes;
         this.promotedBytes = promotedBytes;
@@ -95,19 +100,24 @@ public final class WarmFullFileStats {
         return started;
     }
 
+    /** @return the number of promotions that reached FULL from a validated local copy, without downloading */
+    public long reused() {
+        return reused;
+    }
+
     /** @return the number of families that reached FULL */
     public long promoted() {
         return promoted;
     }
 
     /**
-     * @return the number of started downloads that did not reach FULL: declined after the download for not being
-     *         memory-mapped, a failed read, a wrong length, an evicted entry, a closed family, or an error
+     * @return the number of admitted promotions that did not reach FULL: declined after the download for not being
+     *         memory-mapped, a failed read, a wrong length or checksum, an evicted entry, a closed family, or an error
      */
     public long failed() {
         return count(DeclineReason.NOT_MMAP) + count(DeclineReason.DOWNLOAD_FAILED) + count(DeclineReason.LENGTH_MISMATCH) + count(
-            DeclineReason.ENTRY_EVICTED
-        ) + count(DeclineReason.FAMILY_CLOSED) + count(DeclineReason.ERROR);
+            DeclineReason.CHECKSUM_MISMATCH
+        ) + count(DeclineReason.ENTRY_EVICTED) + count(DeclineReason.FAMILY_CLOSED) + count(DeclineReason.ERROR);
     }
 
     private long count(DeclineReason reason) {
@@ -115,7 +125,7 @@ public final class WarmFullFileStats {
         return value == null ? 0L : value;
     }
 
-    /** @return the total length of every completed download, whether or not the file then reached FULL */
+    /** @return the total length of every completed download, whether or not the file then reached FULL; reused copies are not counted */
     public long downloadedBytes() {
         return downloadedBytes;
     }
@@ -174,6 +184,8 @@ public final class WarmFullFileStats {
             + requested
             + ", started="
             + started
+            + ", reused="
+            + reused
             + ", promoted="
             + promoted
             + ", failed="
