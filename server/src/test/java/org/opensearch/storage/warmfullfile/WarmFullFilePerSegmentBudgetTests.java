@@ -23,6 +23,7 @@ import org.junit.Before;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Set;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 
@@ -62,6 +63,7 @@ public class WarmFullFilePerSegmentBudgetTests extends OpenSearchTestCase {
         transferManager = new TransferManager(reader, fileCache, threadPool);
         clock = new AtomicLong(10_000);
         manager = new WarmFullFileManager(fileCache, Runnable::run, clock::get, 8, 0.5, PART_SIZE);
+        manager.onExtensionsChanged(Set.of("faiss")); // as the settings listener tells it in production
         perSegmentCapacity = CAPACITY / SEGMENTS;
         cap = perSegmentCapacity / 2;
         target = fileCache.segmentIndexFor(dir.resolve("_t0.faiss"));

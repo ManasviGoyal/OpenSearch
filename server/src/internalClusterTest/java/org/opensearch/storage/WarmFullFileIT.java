@@ -173,6 +173,34 @@ public class WarmFullFileIT extends WarmFullFileBaseIT {
         deleteIndex(INDEX_NAME);
     }
 
+    public void testCloseAndOpenPromotesAgainFromTheWholeFileLeftInTheCache() throws Exception {
+        // After a close and open on the same node the whole file is still on disk and in the cache: the next search
+        // promotes the new family from it without fetching any bytes, and returns the same results.
+        String warmNode = startCluster();
+        WarmShard warmShard = prepareEligibleIndex(INDEX_NAME, warmNode);
+        String fdt = eligibleFdt(warmShard);
+        searchUntilPromoted(INDEX_NAME, warmShard, fdt);
+        List<String> fingerprint = queryFingerprint(INDEX_NAME);
+        long downloadedBefore = warmShard.manager.stats().downloadedBytes();
+        Path wholeFilePath = warmShard.directory.getFilePath(fdt);
+
+        reopenIndex(INDEX_NAME);
+        assertTrue("the whole file survives the close", Files.exists(wholeFilePath));
+        WarmShard reopened = warmShard(INDEX_NAME, warmNode);
+        searchUntilPromoted(INDEX_NAME, reopened, fdt);
+
+        WarmFullFileStats stats = reopened.manager.stats();
+        assertEquals(2L, stats.promoted());
+        assertEquals(
+            "the second promotion is handed the finished download; the bytes are counted once more but not fetched",
+            downloadedBefore * 2,
+            stats.downloadedBytes()
+        );
+        assertEquals(fingerprint, queryFingerprint(INDEX_NAME));
+
+        deleteIndex(INDEX_NAME);
+    }
+
     public void testNoPromotionOnOpenRefreshOrForceMerge() throws Exception {
         String warmNode = startCluster();
         setFullFileExtensions(FDT_EXTENSION);

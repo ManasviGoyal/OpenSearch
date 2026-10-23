@@ -226,7 +226,13 @@ public class WarmFullFileManagerTests extends OpenSearchTestCase {
 
     /** As {@link #newManager(FileCache, int, double)} with an injected clock, for tests that assert on retryAt. */
     private static WarmFullFileManager newManager(FileCache fileCache, LongSupplier clock, int slots, double budgetFraction) {
-        return new WarmFullFileManager(fileCache, Runnable::run, clock, slots, budgetFraction, PART_SIZE);
+        return withFaissEligible(new WarmFullFileManager(fileCache, Runnable::run, clock, slots, budgetFraction, PART_SIZE));
+    }
+
+    /** Tells the manager the setting lists {@code faiss}, as the settings listener does in production. */
+    private static WarmFullFileManager withFaissEligible(WarmFullFileManager manager) {
+        manager.onExtensionsChanged(Set.of("faiss"));
+        return manager;
     }
 
     private FullFileState newState(TransferManager tm, FileCache fileCache, String name, long length) {
@@ -284,15 +290,17 @@ public class WarmFullFileManagerTests extends OpenSearchTestCase {
 
     /** As {@link #newManager(FileCache, int, double)} with 4 slots, half the cache as budget, and the given entire-file setting. */
     private WarmFullFileManager newManager(FileCache fileCache, boolean verifyEntireFile) {
-        return new WarmFullFileManager(
-            fileCache,
-            Runnable::run,
-            threadPool::relativeTimeInMillis,
-            4,
-            0.5,
-            PART_SIZE,
-            WarmFullFileManager.NO_OP_SCHEDULER,
-            verifyEntireFile
+        return withFaissEligible(
+            new WarmFullFileManager(
+                fileCache,
+                Runnable::run,
+                threadPool::relativeTimeInMillis,
+                4,
+                0.5,
+                PART_SIZE,
+                WarmFullFileManager.NO_OP_SCHEDULER,
+                verifyEntireFile
+            )
         );
     }
 
@@ -493,13 +501,8 @@ public class WarmFullFileManagerTests extends OpenSearchTestCase {
         int families = 24;
         FileCache fileCache = FileCacheFactory.createConcurrentLRUFileCache(10_000_000, 4);
         TransferManager tm = new TransferManager(new PositionDependentStreamReader(), fileCache, threadPool);
-        WarmFullFileManager mgr = new WarmFullFileManager(
-            fileCache,
-            threadPool.generic(),
-            threadPool::relativeTimeInMillis,
-            families,
-            0.5,
-            PART_SIZE
+        WarmFullFileManager mgr = withFaissEligible(
+            new WarmFullFileManager(fileCache, threadPool.generic(), threadPool::relativeTimeInMillis, families, 0.5, PART_SIZE)
         );
         List<FullFileState> states = new ArrayList<>();
         List<Path> switchKeys = new ArrayList<>();
@@ -651,7 +654,8 @@ public class WarmFullFileManagerTests extends OpenSearchTestCase {
                 assertBusy(() -> assertEquals(Long.MAX_VALUE, st.retryAt()), 10, TimeUnit.SECONDS);
                 assertEquals(FullFileState.State.BLOCK, st.state());
             }
-            appender.assertAllExpectationsMatched();
+            // The retry time is set before the line is logged, so the last WARN may land a moment after the loop.
+            assertBusy(appender::assertAllExpectationsMatched, 10, TimeUnit.SECONDS);
         }
     }
 
@@ -1007,17 +1011,11 @@ public class WarmFullFileManagerTests extends OpenSearchTestCase {
         List<Long> delays = new ArrayList<>();
         FileCache fileCache = newFileCache();
         TransferManager tm = new TransferManager(new PositionDependentStreamReader(), fileCache, threadPool);
-        WarmFullFileManager mgr = new WarmFullFileManager(
-            fileCache,
-            Runnable::run,
-            threadPool::relativeTimeInMillis,
-            4,
-            0.5,
-            PART_SIZE,
-            (task, delay) -> {
+        WarmFullFileManager mgr = withFaissEligible(
+            new WarmFullFileManager(fileCache, Runnable::run, threadPool::relativeTimeInMillis, 4, 0.5, PART_SIZE, (task, delay) -> {
                 scheduled.add(task);
                 delays.add(delay);
-            }
+            })
         );
         FullFileState st = newState(tm, fileCache, name, FILE_LENGTH);
         startPromotion(mgr, st);
@@ -1264,6 +1262,55 @@ public class WarmFullFileManagerTests extends OpenSearchTestCase {
         assertFalse(st.isMappingReleasePending());
     }
 
+    public void testExtensionRemovedDuringTheDownloadDemotesAtPublish() throws Exception {
+        // The setting drops the extension while the download is still running: the family is not FULL at that
+        // moment, so the settings change cannot demote it; the publish does, as soon as the family reaches FULL.
+        String name = "_late_demote.faiss";
+        Path path = dir.resolve(name);
+        byte[] content = footeredContent(FILE_LENGTH);
+        CountDownLatch release = new CountDownLatch(1);
+        FileCache fileCache = newFileCache();
+        TransferManager tm = new TransferManager(blockingReader(release, new FixedContentStreamReader(content)), fileCache, threadPool);
+        WarmFullFileManager mgr = newManager(fileCache, 4, 0.5);
+        mgr.onExtensionsChanged(Set.of("faiss"));
+        FullFileState st = newStateWithChecksum(tm, fileCache, name, content.length, footerChecksum(content));
+        startPromotion(mgr, st); // the reader blocks on the latch
+
+        mgr.onExtensionsChanged(Set.of());
+        assertEquals("still downloading", FullFileState.State.PROMOTING, st.state());
+        release.countDown();
+
+        assertBusy(() -> {
+            assertEquals(FullFileState.State.BLOCK, st.state());
+            assertTrue(st.cleanupDone());
+            assertNull(fileCache.get(path));
+            assertEquals(0L, mgr.stats().reservedBytesPerSegment()[0]);
+        }, 30, TimeUnit.SECONDS);
+        assertEquals(1L, mgr.stats().promoted());
+        assertEquals(1L, mgr.stats().demoted());
+    }
+
+    public void testSettingsChangeThatKeepsTheExtensionDuringTheDownloadLeavesTheFamilyFull() throws Exception {
+        // The setting changes while the download runs but still lists the family's extension: the publish finds the
+        // family eligible and it stays FULL.
+        String name = "_kept.faiss";
+        byte[] content = footeredContent(FILE_LENGTH);
+        CountDownLatch release = new CountDownLatch(1);
+        FileCache fileCache = newFileCache();
+        TransferManager tm = new TransferManager(blockingReader(release, new FixedContentStreamReader(content)), fileCache, threadPool);
+        WarmFullFileManager mgr = newManager(fileCache, 4, 0.5);
+        FullFileState st = newStateWithChecksum(tm, fileCache, name, content.length, footerChecksum(content));
+        startPromotion(mgr, st);
+
+        mgr.onExtensionsChanged(Set.of("faiss", "veq"));
+        release.countDown();
+
+        awaitState(st, FullFileState.State.FULL);
+        assertNotNull(st.localMaster());
+        assertEquals(0L, mgr.stats().demoted());
+        assertEquals(content.length, mgr.stats().reservedBytesPerSegment()[0]);
+    }
+
     public void testOnlyFamiliesOfRemovedExtensionsAreDemoted() throws Exception {
         // Two FULL families of different extensions; the setting keeps one: only the other is demoted.
         byte[] content = footeredContent(FILE_LENGTH);
@@ -1340,6 +1387,41 @@ public class WarmFullFileManagerTests extends OpenSearchTestCase {
         assertEquals("no download started", 0L, stats.started());
         assertEquals("no bytes downloaded", 0L, stats.downloadedBytes());
         assertEquals(1L, stats.promoted());
+    }
+
+    public void testCompletedEntryOfAnEarlierFamilyIsJoinedAfterItsClose() throws Exception {
+        // The family of a promoted file closes (the index is closed) and its whole-file entry stays in the cache,
+        // open and unreferenced. A new family for the same file (the index reopened) is handed that entry's finished
+        // download by the fetch: no remote read, FULL, exactly one reference; counted as a download, not a reuse.
+        String name = "_reopen.faiss";
+        Path path = dir.resolve(name);
+        byte[] content = footeredContent(FILE_LENGTH);
+        FixedContentStreamReader reader = new FixedContentStreamReader(content);
+        FileCache fileCache = newFileCache();
+        TransferManager tm = new TransferManager(reader, fileCache, threadPool);
+        WarmFullFileManager mgr = newManager(fileCache, 4, 0.5);
+        FullFileState first = promoteToFull(mgr, fileCache, name, content, tm);
+        int parts = partsFor(name, content.length);
+        assertEquals(parts, reader.readCount());
+
+        first.closeFamily();
+        assertBusy(() -> assertTrue(first.cleanupDone()), 30, TimeUnit.SECONDS);
+        assertNotNull("the whole-file entry outlives the family", fileCache.get(path));
+        fileCache.decRef(path);
+        assertEquals("unreferenced after the close", Integer.valueOf(0), fileCache.getRef(path));
+        assertEquals(0L, mgr.stats().reservedBytesPerSegment()[0]);
+
+        FullFileState second = newStateWithChecksum(tm, fileCache, name, content.length, footerChecksum(content));
+        startPromotion(mgr, second);
+        awaitState(second, FullFileState.State.FULL);
+
+        assertEquals("no remote read for the joined entry", parts, reader.readCount());
+        assertServedWithOneReference(second, fileCache, path, content);
+        WarmFullFileStats stats = mgr.stats();
+        assertEquals("joining a complete download is not a local-copy reuse", 0L, stats.reused());
+        assertEquals(2L, stats.started());
+        assertEquals(2L, stats.promoted());
+        assertEquals(content.length, stats.reservedBytesPerSegment()[0]);
     }
 
     public void testTruncatedLeftoverIsDeletedAndRedownloaded() throws Exception {

@@ -431,6 +431,9 @@ public class WarmFullFileManager {
                     segment
                 );
             }
+            // The setting may have dropped the extension while the download ran; such a family was not FULL when
+            // the change was applied, so it is demoted here instead.
+            demoteIfNoLongerEligible(st);
         } catch (Exception e) {
             if (refTaken) {
                 fileCache.decRef(path); // do not leak the family reference taken above
@@ -614,21 +617,24 @@ public class WarmFullFileManager {
     public void onExtensionsChanged(Set<String> extensions) {
         eligibleExtensions = extensions;
         for (FullFileState st : fullFamilies) {
-            String extension = WarmFullFileSettings.extensionOf(st.fileName());
-            if (extension != null && extensions.contains(extension)) {
-                continue;
-            }
-            if (st.demote()) {
-                fullFamilies.remove(st);
-                demoted.incrementAndGet();
-                logger.info(
-                    "demoted [{}] back to blocks: extension [{}] is no longer configured; its mapping is released once its {} handle(s) close",
-                    st.fullFilePath(),
-                    extension,
-                    st.handleCount()
-                );
-            }
+            demoteIfNoLongerEligible(st);
         }
+    }
+
+    /** Demotes a FULL family whose extension the setting no longer lists; a no-op for any other family. */
+    private void demoteIfNoLongerEligible(FullFileState st) {
+        String extension = WarmFullFileSettings.extensionOf(st.fileName());
+        if (isExtensionEligible(extension) || st.demote() == false) {
+            return;
+        }
+        fullFamilies.remove(st);
+        demoted.incrementAndGet();
+        logger.info(
+            "demoted [{}] back to blocks: extension [{}] is no longer configured; its mapping is released once its {} handle(s) close",
+            st.fullFilePath(),
+            extension,
+            st.handleCount()
+        );
     }
 
     /**
@@ -718,7 +724,9 @@ public class WarmFullFileManager {
     /**
      * True for live cache entries that are never reused or served from, and so are removed before re-downloading: a
      * completed whole-file entry or a switchable family entry. A restore placeholder is handled separately (its file
-     * may be reused), and fetchBlobAsync's own in-flight placeholder (a private type) is joined, not removed.
+     * may be reused), and fetchBlobAsync's own placeholder (a private type), in flight or complete, is joined, not
+     * removed: a complete one hands back its finished download, which is how a family created by an index reopen gets
+     * the whole file its predecessor left in the cache without a second download.
      */
     private static boolean isKnownNonReusableEntry(CachedIndexInput entry) {
         return entry instanceof CachedFullFileIndexInput || entry instanceof CachedSwitchableIndexInput;
