@@ -237,6 +237,84 @@ public class FullFileStateTests extends OpenSearchTestCase {
         }
     }
 
+    public void testDemoteNeverShowsBlockWithoutAPendingRelease() throws Exception {
+        // The trigger reads the state and then isMappingReleasePending. Whenever it observes BLOCK on a family that
+        // still holds its mapping it must also observe the pending release, or it would map the file a second time.
+        for (int i = 0; i < 20_000; i++) {
+            Fixture f = new Fixture();
+            f.goFull();
+            f.st.incHandles();
+            CyclicBarrier barrier = new CyclicBarrier(2);
+            boolean[] exposed = new boolean[1];
+            Thread demoter = new Thread(() -> {
+                await(barrier);
+                f.st.demote();
+            });
+            Thread trigger = new Thread(() -> {
+                await(barrier);
+                while (f.st.state() == FullFileState.State.FULL) {
+                    Thread.onSpinWait();
+                }
+                exposed[0] = f.st.isMappingReleasePending() == false;
+            });
+            demoter.start();
+            trigger.start();
+            demoter.join();
+            trigger.join();
+            assertFalse("iteration " + i + ": BLOCK was visible before the pending release", exposed[0]);
+        }
+    }
+
+    public void testDemoteOfANonFullFamilyLeavesTheReleaseFlagAlone() {
+        Fixture f = new Fixture();
+        assertFalse(f.st.demote());
+        assertFalse("a family that never held a mapping owes no release", f.st.isMappingReleasePending());
+        f.goFull();
+        f.st.incHandles();
+        assertTrue(f.st.demote());
+        assertFalse("already demoted", f.st.demote());
+        assertTrue("the first demotion's release is still owed", f.st.isMappingReleasePending());
+    }
+
+    public void testConcurrentRestoreAndCloseNeverLoseTheMappingRelease() throws Exception {
+        // A demoted family (handle open, mapping held) is restored by a settings change while the family closes on the
+        // FileCache listener thread. Whatever the order, once the handle closes exactly one cleanup must be scheduled:
+        // the mapping and the family's cache reference have to be released.
+        int lost = 0;
+        int restoredThenClosed = 0;
+        final int iterations = 20_000;
+        for (int i = 0; i < iterations; i++) {
+            Fixture f = new Fixture();
+            f.goFull();
+            f.st.incHandles();
+            assertTrue(f.st.demote());
+            CyclicBarrier barrier = new CyclicBarrier(2);
+            boolean[] restored = new boolean[1];
+            Thread restorer = new Thread(() -> {
+                await(barrier);
+                restored[0] = f.st.restore();
+            });
+            Thread closer = new Thread(() -> {
+                await(barrier);
+                f.st.closeFamily();
+            });
+            restorer.start();
+            closer.start();
+            restorer.join();
+            closer.join();
+            assertEquals(FullFileState.State.CLOSED, f.st.state());
+            f.st.decHandles();
+            if (restored[0]) {
+                restoredThenClosed++;
+            }
+            if (f.executor.tasks.size() != 1) {
+                lost++;
+            }
+        }
+        logger.info("restore won {} of {} races; cleanup lost {} times", restoredThenClosed, iterations, lost);
+        assertEquals("iterations whose mapping release was never scheduled", 0, lost);
+    }
+
     private static void await(CyclicBarrier barrier) {
         try {
             barrier.await();

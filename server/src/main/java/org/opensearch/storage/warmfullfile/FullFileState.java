@@ -92,6 +92,9 @@ public final class FullFileState {
     // Set when the family left FULL (closed or demoted) with a mapping still published: the deferred unmap and decRef
     // are owed exactly in that case.
     private volatile boolean mappingReleaseOwed;
+    // Orders the transitions out of FULL (close, demote), restore and the scheduling of the release against each
+    // other; never held across cache calls.
+    private final Object releaseLock = new Object();
     private final AtomicBoolean budgetReleased = new AtomicBoolean(false);
     private final AtomicBoolean cleanupScheduled = new AtomicBoolean(false);
     private volatile boolean cleanupDone;
@@ -268,7 +271,15 @@ public final class FullFileState {
      * is nothing to release.
      */
     public void closeFamily() {
-        State prev = state.getAndSet(State.CLOSED);
+        State prev;
+        synchronized (releaseLock) {
+            // Held with restore(): a restore that has just put the family back to FULL must not clear the release this
+            // close owes, or the mapping and the cache reference would never be given back.
+            prev = state.getAndSet(State.CLOSED);
+            if (prev == State.FULL) {
+                mappingReleaseOwed = true;
+            }
+        }
         CancellableThreads download = downloadCancellation.getAndSet(CANCELLED);
         if (download != null) {
             download.cancel("family closed"); // a download in flight fails within a part; its completion handler unwinds
@@ -277,7 +288,6 @@ public final class FullFileState {
             return;
         }
         releaseBudgetOnce();
-        mappingReleaseOwed = true;
         if (handleCount.get() > 0) {
             Runnable report = onClosedWithLiveHandles;
             if (report != null) {
@@ -296,17 +306,44 @@ public final class FullFileState {
      * @return true if the family was FULL and is now BLOCK; false if it was in any other state
      */
     public boolean demote() {
-        if (state.compareAndSet(State.FULL, State.BLOCK) == false) {
-            return false;
+        synchronized (releaseLock) {
+            // The release is owed before BLOCK becomes visible: a trigger that sees BLOCK must also see the pending
+            // release, or it would start a promotion that maps the file a second time and then finds this mapping.
+            boolean owedBefore = mappingReleaseOwed;
+            mappingReleaseOwed = true;
+            if (state.compareAndSet(State.FULL, State.BLOCK) == false) {
+                mappingReleaseOwed = owedBefore;
+                return false;
+            }
+            maybeScheduleCleanup();
+            return true;
         }
-        mappingReleaseOwed = true;
-        maybeScheduleCleanup();
-        return true;
+    }
+
+    /**
+     * Takes a demoted family back to FULL while it still holds its mapping: the extension is in the setting again
+     * and nothing has been released, so views are served from the existing mapping from the next clone on, with no
+     * download and no second mapping. Refused once the deferred release has been scheduled, or if the family is not
+     * a demoted one; such a family is promoted again the ordinary way after its release.
+     *
+     * @return true if the family is FULL again
+     */
+    public boolean restore() {
+        synchronized (releaseLock) {
+            if (mappingReleaseOwed == false || cleanupScheduled.get() || localMaster.get() == null) {
+                return false;
+            }
+            if (state.compareAndSet(State.BLOCK, State.FULL) == false) {
+                return false;
+            }
+            mappingReleaseOwed = false;
+            return true;
+        }
     }
 
     /**
      * @return true while a demoted family still holds its previous mapping, i.e. between {@link #demote()} and the
-     *         deferred release; a promotion in that window would map the file a second time
+     *         deferred release or a {@link #restore()}; a promotion in that window would map the file a second time
      */
     public boolean isMappingReleasePending() {
         return mappingReleaseOwed && cleanupDone == false && state.get() != State.CLOSED;
@@ -325,18 +362,22 @@ public final class FullFileState {
      * runs second sees both conditions true.
      */
     private void maybeScheduleCleanup() {
-        if (mappingReleaseOwed == false || handleCount.get() != 0) {
-            return;
-        }
-        Executor executor = cleanupExecutor;
-        if (executor == null || cleanupScheduled.compareAndSet(false, true) == false) {
-            return;
-        }
-        try {
-            executor.execute(this::runCleanup);
-        } catch (RuntimeException e) {
-            // Only expected on node shutdown. Never run inline: this may be the FileCache listener thread.
-            logger.warn("could not schedule whole-file cleanup for {}; mapping kept until shutdown", fullFilePath, e);
+        // Held with closeFamily(), demote() and restore(): a restore must not slip in between this check and the
+        // scheduling, or the release would run under a family that is FULL again.
+        synchronized (releaseLock) {
+            if (mappingReleaseOwed == false || handleCount.get() != 0) {
+                return;
+            }
+            Executor executor = cleanupExecutor;
+            if (executor == null || cleanupScheduled.compareAndSet(false, true) == false) {
+                return;
+            }
+            try {
+                executor.execute(this::runCleanup);
+            } catch (RuntimeException e) {
+                // Only expected on node shutdown. Never run inline: this may be the FileCache listener thread.
+                logger.warn("could not schedule whole-file cleanup for {}; mapping kept until shutdown", fullFilePath, e);
+            }
         }
     }
 

@@ -1311,6 +1311,77 @@ public class WarmFullFileManagerTests extends OpenSearchTestCase {
         assertEquals(content.length, mgr.stats().reservedBytesPerSegment()[0]);
     }
 
+    public void testReAddingTheExtensionRestoresADemotedFamilyWhileItsHandleIsOpen() throws Exception {
+        // The reader's handle never closes, so the demoted family still holds its mapping, file and budget. Listing
+        // the extension again takes it straight back to FULL: no download, no second mapping, nothing released; and
+        // the later handle close releases nothing either, since the family is FULL again.
+        String name = "_restore.faiss";
+        Path path = dir.resolve(name);
+        byte[] content = footeredContent(FILE_LENGTH);
+        FixedContentStreamReader reader = new FixedContentStreamReader(content);
+        FileCache fileCache = newFileCache();
+        TransferManager tm = new TransferManager(reader, fileCache, threadPool);
+        WarmFullFileManager mgr = newManager(fileCache, 4, 0.5);
+        FullFileState st = promoteToFull(mgr, fileCache, name, content, tm);
+        int parts = partsFor(name, content.length);
+        IndexInput master = st.localMaster();
+        st.incHandles();
+
+        mgr.onExtensionsChanged(Set.of());
+        assertEquals(FullFileState.State.BLOCK, st.state());
+        assertTrue(st.isMappingReleasePending());
+
+        mgr.onExtensionsChanged(Set.of("faiss"));
+
+        assertEquals("FULL again", FullFileState.State.FULL, st.state());
+        assertFalse("nothing left to release", st.isMappingReleasePending());
+        assertSame("the same mapping is served", master, st.localMaster());
+        assertEquals("no remote read", parts, reader.readCount());
+        assertEquals(1L, mgr.stats().demoted());
+        assertEquals(1L, mgr.stats().restored());
+        assertEquals("one promotion in total", 1L, mgr.stats().promoted());
+        assertEquals(content.length, mgr.stats().reservedBytesPerSegment()[0]);
+        assertServedWithOneReference(st, fileCache, path, content);
+
+        st.decHandles();
+        assertFalse("the handle close releases nothing from a restored family", st.cleanupDone());
+        assertSame(master, st.localMaster());
+
+        // A second demotion, now with no handle open, releases everything as usual.
+        mgr.onExtensionsChanged(Set.of());
+        assertBusy(() -> {
+            assertTrue(st.cleanupDone());
+            assertNull(st.localMaster());
+            assertNull(fileCache.get(path));
+            assertEquals(0L, mgr.stats().reservedBytesPerSegment()[0]);
+        }, 30, TimeUnit.SECONDS);
+        assertEquals(2L, mgr.stats().demoted());
+    }
+
+    public void testReAddingTheExtensionAfterTheReleaseIsNotARestore() throws Exception {
+        // The demoted family's release already ran (no handle was open), so there is nothing to restore: listing the
+        // extension again does nothing by itself, and the next promotion downloads the file again.
+        String name = "_restore_late.faiss";
+        byte[] content = footeredContent(FILE_LENGTH);
+        FixedContentStreamReader reader = new FixedContentStreamReader(content);
+        FileCache fileCache = newFileCache();
+        TransferManager tm = new TransferManager(reader, fileCache, threadPool);
+        WarmFullFileManager mgr = newManager(fileCache, 4, 0.5);
+        FullFileState st = promoteToFull(mgr, fileCache, name, content, tm);
+        int parts = partsFor(name, content.length);
+
+        mgr.onExtensionsChanged(Set.of());
+        assertBusy(() -> assertTrue(st.cleanupDone()), 30, TimeUnit.SECONDS);
+        mgr.onExtensionsChanged(Set.of("faiss"));
+
+        assertEquals(FullFileState.State.BLOCK, st.state());
+        assertEquals(0L, mgr.stats().restored());
+        assertFalse(st.isMappingReleasePending());
+        startPromotion(mgr, st);
+        awaitState(st, FullFileState.State.FULL);
+        assertEquals("downloaded again", 2 * parts, reader.readCount());
+    }
+
     public void testOnlyFamiliesOfRemovedExtensionsAreDemoted() throws Exception {
         // Two FULL families of different extensions; the setting keeps one: only the other is demoted.
         byte[] content = footeredContent(FILE_LENGTH);

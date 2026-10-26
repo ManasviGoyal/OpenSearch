@@ -57,6 +57,7 @@ public final class WarmFullFileStats {
     private final long reused;
     private final long promoted;
     private final long demoted;
+    private final long restored;
     private final long downloadedBytes;
     private final long promotedBytes;
     private final long downloadMillis;
@@ -71,6 +72,7 @@ public final class WarmFullFileStats {
         long reused,
         long promoted,
         long demoted,
+        long restored,
         long downloadedBytes,
         long promotedBytes,
         long downloadMillis,
@@ -84,6 +86,7 @@ public final class WarmFullFileStats {
         this.reused = reused;
         this.promoted = promoted;
         this.demoted = demoted;
+        this.restored = restored;
         this.downloadedBytes = downloadedBytes;
         this.promotedBytes = promotedBytes;
         this.downloadMillis = downloadMillis;
@@ -116,6 +119,11 @@ public final class WarmFullFileStats {
     /** @return the number of FULL families taken back to blocks because their extension was removed from the setting */
     public long demoted() {
         return demoted;
+    }
+
+    /** @return the number of demoted families taken back to FULL, from the mapping they still held, because their extension returned */
+    public long restored() {
+        return restored;
     }
 
     /**
@@ -198,6 +206,8 @@ public final class WarmFullFileStats {
             + promoted
             + ", demoted="
             + demoted
+            + ", restored="
+            + restored
             + ", failed="
             + failed()
             + ", downloadedBytes="

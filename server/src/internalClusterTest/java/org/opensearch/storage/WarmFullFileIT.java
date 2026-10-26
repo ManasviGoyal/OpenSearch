@@ -390,6 +390,18 @@ public class WarmFullFileIT extends WarmFullFileBaseIT {
         assertEquals(FullFileState.State.BLOCK, stateOf(first, firstFdt));
         assertEquals(1L, first.manager.stats().demoted());
         assertEquals(firstFingerprint, queryFingerprint(INDEX_NAME));
+
+        // Listing the extension again while the reader is still open restores the family from the mapping it kept:
+        // FULL at once, no download, same results. Then clear it once more before the reopen below.
+        long startedBefore = first.manager.stats().started();
+        setFullFileExtensions(FDT_EXTENSION);
+        assertBusy(() -> assertEquals(FullFileState.State.FULL, stateOf(first, firstFdt)), WAIT_TIMEOUT.seconds(), TimeUnit.SECONDS);
+        assertEquals(1L, first.manager.stats().restored());
+        assertEquals("no download for the restore", startedBefore, first.manager.stats().started());
+        assertEquals(firstFingerprint, queryFingerprint(INDEX_NAME));
+        clearFullFileExtensions();
+        assertBusy(() -> assertEquals(FullFileState.State.BLOCK, stateOf(first, firstFdt)), WAIT_TIMEOUT.seconds(), TimeUnit.SECONDS);
+        assertEquals(2L, first.manager.stats().demoted());
         reopenIndex(INDEX_NAME);
         WarmShard reopened = warmShard(INDEX_NAME, warmNode);
         assertBusy(() -> {

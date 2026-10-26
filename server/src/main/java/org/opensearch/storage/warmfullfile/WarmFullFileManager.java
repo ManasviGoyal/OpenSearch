@@ -103,9 +103,12 @@ public class WarmFullFileManager {
     private final AtomicLong started = new AtomicLong();
     private final AtomicLong reused = new AtomicLong();
     private final AtomicLong demoted = new AtomicLong();
+    private final AtomicLong restored = new AtomicLong();
     private final AtomicLong downloadedBytes = new AtomicLong();
     // The families currently FULL on this node, so a settings change can find the ones to demote.
     private final Set<FullFileState> fullFamilies = ConcurrentHashMap.newKeySet();
+    // Demoted families still holding their mapping, so a settings change can restore the ones whose extension returns.
+    private final Set<FullFileState> demotedFamilies = ConcurrentHashMap.newKeySet();
     // The extensions the setting currently allows; the trigger re-checks this so a change applies to open handles too.
     private volatile Set<String> eligibleExtensions = Set.of();
     private final AtomicLong promoted = new AtomicLong();
@@ -391,6 +394,7 @@ public class WarmFullFileManager {
             st.attachCleanup(executor, () -> {
                 releaseSegmentBytes(segment, length);
                 fullFamilies.remove(st);
+                demotedFamilies.remove(st);
             }, () -> scheduleStuckHandleWarning(st));
             if (st.compareAndSetLocalMaster(null, master) == false) {
                 // Another completion handler for this family already installed its mapping (two promote() calls joined
@@ -401,9 +405,13 @@ public class WarmFullFileManager {
                 logger.debug("whole-file mapping for {} was already published by another completion", path);
                 return;
             }
+            // Registered before the CAS: a close right after the CAS runs the budget release, which must find the
+            // family in the registry to take it out again.
+            fullFamilies.add(st);
             if (st.casState(FullFileState.State.PROMOTING, FullFileState.State.FULL) == false) {
                 // The family closed during the publish (closeFamily saw PROMOTING, so it owes no cleanup). Unwind this
                 // handler's own mapping only; never touch a mapping installed by another handler.
+                fullFamilies.remove(st);
                 closeQuietly(master);
                 st.compareAndSetLocalMaster(master, null);
                 fileCache.decRef(path);
@@ -411,7 +419,6 @@ public class WarmFullFileManager {
                 decline(st, DeclineReason.FAMILY_CLOSED, "family closed during publish");
                 return;
             }
-            fullFamilies.add(st);
             slots.release();
             final long elapsedMillis = clock.getAsLong() - startedAt;
             promoted.incrementAndGet();
@@ -617,7 +624,19 @@ public class WarmFullFileManager {
     public void onExtensionsChanged(Set<String> extensions) {
         eligibleExtensions = extensions;
         for (FullFileState st : fullFamilies) {
+            if (st.state() == FullFileState.State.CLOSED) {
+                // Closed just as it was registered or restored; its budget release ran before the registration.
+                fullFamilies.remove(st);
+                continue;
+            }
             demoteIfNoLongerEligible(st);
+        }
+        for (FullFileState st : demotedFamilies) {
+            if (st.state() == FullFileState.State.CLOSED) {
+                demotedFamilies.remove(st);
+                continue;
+            }
+            restoreIfEligibleAgain(st);
         }
     }
 
@@ -628,12 +647,33 @@ public class WarmFullFileManager {
             return;
         }
         fullFamilies.remove(st);
+        demotedFamilies.add(st);
         demoted.incrementAndGet();
         logger.info(
             "demoted [{}] back to blocks: extension [{}] is no longer configured; its mapping is released once its {} handle(s) close",
             st.fullFilePath(),
             extension,
             st.handleCount()
+        );
+    }
+
+    /**
+     * Takes a demoted family back to FULL when its extension is listed again and its mapping is still held, so the
+     * setting is a live switch in both directions: nothing is downloaded or mapped a second time. A family whose
+     * release has already run is promoted again the ordinary way by its next trigger.
+     */
+    private void restoreIfEligibleAgain(FullFileState st) {
+        String extension = WarmFullFileSettings.extensionOf(st.fileName());
+        if (isExtensionEligible(extension) == false || st.restore() == false) {
+            return;
+        }
+        demotedFamilies.remove(st);
+        fullFamilies.add(st);
+        restored.incrementAndGet();
+        logger.info(
+            "restored [{}] to its whole file: extension [{}] is configured again and the mapping was still held",
+            st.fullFilePath(),
+            extension
         );
     }
 
@@ -665,6 +705,7 @@ public class WarmFullFileManager {
             reused.get(),
             promoted.get(),
             demoted.get(),
+            restored.get(),
             downloadedBytes.get(),
             promotedBytes.get(),
             downloadMillis.get(),

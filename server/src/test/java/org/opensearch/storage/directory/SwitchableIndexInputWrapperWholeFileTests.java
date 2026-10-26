@@ -916,6 +916,67 @@ public class SwitchableIndexInputWrapperWholeFileTests extends TieredStorageBase
         assertBusy(() -> assertTrue(st.cleanupDone()), 30, TimeUnit.SECONDS);
     }
 
+    public void testReEnablingWhileTheHandleIsOpenServesViewsAgainWithoutADownload() throws Exception {
+        // The setting drops the extension and lists it again while the reader's handle stays open throughout: the
+        // family is demoted, then restored from the mapping it still holds, and the next clone is a view again with
+        // no download and no new promotion request.
+        Path switchKey = getFilePathSwitchable(localDirectory, FILE_NAME);
+        byte[] content = footeredContent();
+        CachedSwitchableIndexInput entry = new CachedSwitchableIndexInput(
+            fileCache,
+            FILE_NAME,
+            localDirectory,
+            remoteSegmentStoreDirectory,
+            downloadTransferManager(content),
+            true,
+            threadPool,
+            PREFETCH
+        );
+        fileCache.put(switchKey, entry);
+        fileCache.decRef(switchKey);
+        FullFileState st = entry.fullFileState();
+        st.markRemoteMode(footerChecksum(content));
+        WarmFullFileManager realManager = new WarmFullFileManager(
+            fileCache,
+            threadPool.executor(ThreadPool.Names.REMOTE_RECOVERY),
+            threadPool::relativeTimeInMillis,
+            1,
+            (task, delayMillis) -> {}
+        );
+        realManager.onExtensionsChanged(Set.of(WarmFullFileSettings.extensionOf(FILE_NAME)));
+        SwitchableIndexInputWrapper handle = new SwitchableIndexInputWrapper(
+            "h",
+            (SwitchableIndexInput) entry.getIndexInput().clone(),
+            st,
+            true,
+            realManager
+        );
+        handle.clone(); // trigger
+        assertBusy(() -> assertEquals(FullFileState.State.FULL, st.state()), 30, TimeUnit.SECONDS);
+        IndexInput master = st.localMaster();
+        long requestedBefore = realManager.stats().requested();
+
+        realManager.onExtensionsChanged(Set.of());
+        IndexInput block = handle.clone();
+        assertTrue("blocks while demoted", block instanceof SwitchableIndexInputWrapper);
+
+        realManager.onExtensionsChanged(Set.of(WarmFullFileSettings.extensionOf(FILE_NAME)));
+
+        assertEquals(FullFileState.State.FULL, st.state());
+        assertSame("the held mapping is served again", master, st.localMaster());
+        IndexInput view = handle.clone();
+        assertTrue("views again after the restore", view instanceof MemorySegmentAccessInput);
+        assertEquals(0, view.readByte());
+        assertEquals("no promotion was requested", requestedBefore, realManager.stats().requested());
+        assertEquals(1L, realManager.stats().promoted());
+        assertEquals(1L, realManager.stats().restored());
+        assertEquals(content.length, realManager.stats().reservedBytes());
+
+        IOUtils.close(view, block, handle);
+        fileCache.remove(switchKey);
+        assertBusy(() -> assertTrue(st.cleanupDone()), 30, TimeUnit.SECONDS);
+    }
+
     public void testDeferredCloseKeepsMappingUntilLastHandleThenReleasesEverything() throws Exception {
         Path switchKey = getFilePathSwitchable(localDirectory, FILE_NAME);
         Path fullPath = getFilePath(localDirectory, FILE_NAME);
