@@ -337,6 +337,7 @@ public class WarmFullFileManager {
     ) {
         final Path path = st.fullFilePath();
         boolean refTaken = false;
+        boolean published = false;
         try {
             if (throwable != null) {
                 if (isCancellation(throwable)) {
@@ -419,6 +420,9 @@ public class WarmFullFileManager {
                 decline(st, DeclineReason.FAMILY_CLOSED, "family closed during publish");
                 return;
             }
+            // From here the family owns the reference and the budget, and the slot is given back below: nothing after
+            // this point may unwind admission.
+            published = true;
             slots.release();
             final long elapsedMillis = clock.getAsLong() - startedAt;
             promoted.incrementAndGet();
@@ -442,6 +446,11 @@ public class WarmFullFileManager {
             // the change was applied, so it is demoted here instead.
             demoteIfNoLongerEligible(st);
         } catch (Exception e) {
+            if (published) {
+                // The family is FULL and serving; its reference, budget and slot are already settled.
+                logger.warn("whole-file bookkeeping after publishing [{}] failed", path, e);
+                return;
+            }
             if (refTaken) {
                 fileCache.decRef(path); // do not leak the family reference taken above
             }

@@ -46,7 +46,7 @@ public class WarmFullFileSettingsTests extends OpenSearchTestCase {
 
     public void testGraphAndCodeFilesByDefault() {
         WarmFullFileSettings settings = new WarmFullFileSettings(clusterService.getClusterSettings());
-        assertEquals("on by default for the k-NN graph and code files", Set.of("faiss", "veq"), settings.getExtensions());
+        assertEquals("on by default for the k-NN graph and code files", Set.of("faiss", "faissc", "veq"), settings.getExtensions());
         assertTrue(settings.isExtensionEligible("faiss"));
         assertTrue(settings.isExtensionEligible("veq"));
         assertFalse("rescoring vectors stay on blocks", settings.isExtensionEligible("vec"));
@@ -61,12 +61,14 @@ public class WarmFullFileSettingsTests extends OpenSearchTestCase {
 
     public void testDynamicUpdateApplies() {
         WarmFullFileSettings settings = new WarmFullFileSettings(clusterService.getClusterSettings());
-        assertEquals(Set.of("faiss", "veq"), settings.getExtensions());
+        assertEquals(Set.of("faiss", "faissc", "veq"), settings.getExtensions());
 
-        Settings updated = Settings.builder().putList(WarmFullFileSettings.EXTENSIONS.getKey(), List.of("faiss", "veq", "vec")).build();
+        Settings updated = Settings.builder()
+            .putList(WarmFullFileSettings.EXTENSIONS.getKey(), List.of("faiss", "faissc", "veq", "vec"))
+            .build();
         clusterService.getClusterSettings().applySettings(updated);
 
-        assertEquals(Set.of("faiss", "veq", "vec"), settings.getExtensions());
+        assertEquals(Set.of("faiss", "faissc", "veq", "vec"), settings.getExtensions());
         assertTrue(settings.isExtensionEligible("faiss"));
         assertTrue(settings.isExtensionEligible("veq"));
         assertTrue(settings.isExtensionEligible("vec"));
@@ -76,14 +78,14 @@ public class WarmFullFileSettingsTests extends OpenSearchTestCase {
         WarmFullFileSettings settings = new WarmFullFileSettings(clusterService.getClusterSettings());
         List<Set<String>> seen = new ArrayList<>();
         settings.addListener(seen::add);
-        assertEquals("called once on registration with the current set", List.of(Set.of("faiss", "veq")), seen);
+        assertEquals("called once on registration with the current set", List.of(Set.of("faiss", "faissc", "veq")), seen);
 
         clusterService.getClusterSettings()
             .applySettings(Settings.builder().putList(WarmFullFileSettings.EXTENSIONS.getKey(), List.of("faiss", ".VEQ", "vec")).build());
-        assertEquals(List.of(Set.of("faiss", "veq"), Set.of("faiss", "veq", "vec")), seen);
+        assertEquals(List.of(Set.of("faiss", "faissc", "veq"), Set.of("faiss", "veq", "vec")), seen);
 
         clusterService.getClusterSettings().applySettings(Settings.builder().putNull(WarmFullFileSettings.EXTENSIONS.getKey()).build());
-        assertEquals("clearing the setting reverts to the default set", Set.of("faiss", "veq"), seen.get(seen.size() - 1));
+        assertEquals("clearing the setting reverts to the default set", Set.of("faiss", "faissc", "veq"), seen.get(seen.size() - 1));
     }
 
     public void testExtensionsAreNormalized() {

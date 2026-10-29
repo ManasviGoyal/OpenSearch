@@ -36,12 +36,12 @@ public class WarmFullFileSettings {
     /**
      * Node-level, dynamic setting listing the file extensions eligible for whole-file promotion.
      * Values are the extension only, without a leading dot (for example {@code faiss}, {@code veq}).
-     * Defaults to the k-NN graph and code files. Setting an empty list disables the feature; removing the setting
+     * Defaults to the k-NN graph files, standalone and compound-segment ({@code faissc}), and the code files. Setting an empty list disables the feature; removing the setting
      * restores the default.
      */
     public static final Setting<List<String>> EXTENSIONS = Setting.listSetting(
         "tiering.service.full_file.extensions",
-        List.of("faiss", "veq"),
+        List.of("faiss", "faissc", "veq"),
         Function.identity(),
         Setting.Property.Dynamic,
         Setting.Property.NodeScope

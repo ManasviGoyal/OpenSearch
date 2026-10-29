@@ -39,10 +39,12 @@ import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
 import java.util.Arrays;
 import java.util.Collection;
+import java.util.Optional;
 import java.util.function.Supplier;
 import java.util.stream.Stream;
 
 import static org.opensearch.index.store.remote.utils.FileTypeUtils.BLOCK_FILE_IDENTIFIER;
+import static org.opensearch.storage.prefetch.TieredStoragePrefetchSettings.CFS_FILE_SUFFIX;
 import static org.opensearch.storage.utils.DirectoryUtils.getFilePathSwitchable;
 import static org.apache.lucene.index.IndexFileNames.SEGMENTS;
 
@@ -202,17 +204,19 @@ public class TieredDirectory extends CompositeDirectory {
         }
         // A rejection is worth a line only for an extension the setting lists, when debugging a node that never
         // promotes. This runs once per openInput, never on a read.
-        WarmFullFileSettings settings = warmFullFileSettingsSupplier == null ? null : warmFullFileSettingsSupplier.get();
-        if (settings != null && settings.isExtensionEligible(WarmFullFileSettings.extensionOf(name))) {
-            logger.debug("whole-file promotion: [{}] opened with {} is not eligible: {}", name, context, rejection);
-        }
+        Optional.ofNullable(warmFullFileSettingsSupplier)
+            .map(Supplier::get)
+            .filter(settings -> settings.isExtensionEligible(WarmFullFileSettings.extensionOf(name)))
+            .ifPresent(settings -> logger.debug("whole-file promotion: [{}] opened with {} is not eligible: {}", name, context, rejection));
         return false;
     }
 
     /** The rule that rejects a file at open, or null when its handles may trigger a promotion. */
     private static String ineligibleReason(String name, IOContext context, SwitchableIndexInput original) {
         // Not an ordinary Lucene special file.
-        if (FileTypeUtils.isSegmentsFile(name) || FileTypeUtils.isLockFile(name) || name.endsWith(".cfs")) {
+        if (FileTypeUtils.isSegmentsFile(name)
+            || FileTypeUtils.isLockFile(name)
+            || IndexFileNames.matchesExtension(name, CFS_FILE_SUFFIX)) {
             return "segments, lock or compound file";
         }
         if (original.length() <= ONE_BLOCK_BYTES) { // original input: offset 0, length == whole file length
@@ -335,29 +339,27 @@ public class TieredDirectory extends CompositeDirectory {
     }
 
     /**
-     * Ensures the file's switchable entry (its family) is in the FileCache, creating it only when the key has no live
-     * entry. The cache computes under the key's segment lock, so concurrent callers for the same file get one family
-     * and never replace a live one. Returns the entry with one reference taken for the caller, as a put would.
+     * Caches the file's switchable entry (its family) and returns it with one reference taken for the caller. A locally
+     * written file is put as is: nothing opens it before its output closes, and its entry opens the local file and
+     * calls into the FileCache, which must not happen under a segment lock. A remote-only file is created under the
+     * key's segment lock, only when no live entry exists, so concurrent opens share one family; that entry does no IO
+     * and makes no cache call while it is built.
      */
     // protected for testing
     protected CachedIndexInput cacheFile(String fileName, boolean cacheFromRemote) throws IOException {
         Path switchableFilePath = getFilePathSwitchable(localDirectory, fileName);
+        if (cacheFromRemote == false) {
+            CachedSwitchableIndexInput entry = newSwitchableEntry(fileName, false);
+            fileCache.put(switchableFilePath, entry);
+            return entry;
+        }
         try {
             return fileCache.compute(switchableFilePath, (key, existing) -> {
                 if (existing != null && existing.isClosed() == false) {
                     return existing;
                 }
                 try {
-                    return new CachedSwitchableIndexInput(
-                        fileCache,
-                        fileName,
-                        DirectoryUtils.unwrapFSDirectory(localDirectory),
-                        remoteDirectory,
-                        transferManager,
-                        cacheFromRemote,
-                        threadPool,
-                        tieredStoragePrefetchSettingsSupplier
-                    );
+                    return newSwitchableEntry(fileName, true);
                 } catch (IOException e) {
                     throw new UncheckedIOException(e);
                 }
@@ -365,5 +367,18 @@ public class TieredDirectory extends CompositeDirectory {
         } catch (UncheckedIOException e) {
             throw e.getCause();
         }
+    }
+
+    private CachedSwitchableIndexInput newSwitchableEntry(String fileName, boolean cacheFromRemote) throws IOException {
+        return new CachedSwitchableIndexInput(
+            fileCache,
+            fileName,
+            DirectoryUtils.unwrapFSDirectory(localDirectory),
+            remoteDirectory,
+            transferManager,
+            cacheFromRemote,
+            threadPool,
+            tieredStoragePrefetchSettingsSupplier
+        );
     }
 }

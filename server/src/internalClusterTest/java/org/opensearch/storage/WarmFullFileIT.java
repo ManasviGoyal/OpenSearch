@@ -17,6 +17,8 @@ import org.opensearch.action.search.SearchPhaseExecutionException;
 import org.opensearch.action.search.SearchResponse;
 import org.opensearch.action.search.ShardSearchFailure;
 import org.opensearch.cluster.node.DiscoveryNode;
+import org.opensearch.cluster.routing.allocation.command.MoveAllocationCommand;
+import org.opensearch.common.Priority;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.common.unit.TimeValue;
 import org.opensearch.index.IndexNotFoundException;
@@ -414,6 +416,61 @@ public class WarmFullFileIT extends WarmFullFileBaseIT {
         deleteIndex(SECOND_INDEX_NAME);
     }
 
+    public void testWritesAndMergeAfterPromotionCloseTheOldFamilyAndPromoteTheMergedSegment() throws Exception {
+        String warmNode = startCluster();
+        WarmShard warmShard = prepareEligibleIndex(INDEX_NAME, warmNode);
+        String promotedFdt = eligibleFdt(warmShard);
+        searchUntilPromoted(INDEX_NAME, warmShard, promotedFdt);
+        FullFileState promotedFamily = requireFamilyState(warmShard, promotedFdt);
+        Path promotedWholeFile = warmShard.directory.getFilePath(promotedFdt);
+        long promotedBefore = warmShard.manager.stats().promoted();
+        assertThat(warmShard.manager.stats().reservedBytes(), greaterThan(0L));
+
+        // Writes and a flush while the segment is served whole: a second segment appears and the promoted one keeps serving.
+        indexDocs(INDEX_NAME, NUM_DOCS, 2 * NUM_DOCS);
+        flushAndRefresh(INDEX_NAME);
+        assertHitCount(client().prepareSearch(INDEX_NAME).setQuery(QueryBuilders.matchAllQuery()).setSize(0).get(), 2 * NUM_DOCS);
+        assertEquals(FullFileState.State.FULL, promotedFamily.state());
+        assertThat(fdts(warmShard.shard).size(), greaterThan(1));
+
+        // A force merge removes the promoted segment. Its family closes and gives the budget back at once; the mapping,
+        // the cache reference and the whole file go once the old reader's handles close.
+        flushAndRefresh(INDEX_NAME);
+        assertNoFailures(client().admin().indices().prepareForceMerge(INDEX_NAME).setMaxNumSegments(1).get());
+        flushAndRefresh(INDEX_NAME);
+        List<String> mergedFdts = fdts(warmShard.shard);
+        assertEquals("expected one segment after the merge: " + mergedFdts, 1, mergedFdts.size());
+        String mergedFdt = mergedFdts.get(0);
+        assertNotEquals(promotedFdt, mergedFdt);
+        assertBusy(() -> {
+            FullFileState mergedFamily = familyState(warmShard, mergedFdt);
+            assertNotNull("no family for the merged segment yet", mergedFamily);
+            assertTrue("merged segment not uploaded yet", mergedFamily.isRemoteMode());
+        }, BLOCK_MODE_TIMEOUT.seconds(), TimeUnit.SECONDS);
+        assertBusy(() -> {
+            assertEquals(FullFileState.State.CLOSED, promotedFamily.state());
+            assertTrue("mapping of the merged-away segment not released", promotedFamily.cleanupDone());
+            assertEquals("budget of the merged-away segment not released", 0L, warmShard.manager.stats().reservedBytes());
+            assertFalse("whole file of the merged-away segment still local", localFiles(warmShard).contains(promotedFdt));
+            assertFalse(
+                "whole-file cache entry of the merged-away segment left behind",
+                hasWholeFileCacheEntry(warmShard.fileCache, promotedWholeFile)
+            );
+        }, DOWNLOAD_TIMEOUT.seconds(), TimeUnit.SECONDS);
+
+        // The merged segment is on blocks and promotes on the next searches, with every document.
+        assertAdmissibleLength(mergedFdt, warmShard.directory.fileLength(mergedFdt), perSegmentBudget(warmShard));
+        assertFalse(isPromoted(warmShard, mergedFdt));
+        assertBusy(() -> {
+            assertHitCount(client().prepareSearch(INDEX_NAME).setQuery(QueryBuilders.matchAllQuery()).setSize(10).get(), 2 * NUM_DOCS);
+            assertTrue("merged segment not promoted yet, family state " + stateOf(warmShard, mergedFdt), isPromoted(warmShard, mergedFdt));
+        }, DOWNLOAD_TIMEOUT.seconds(), TimeUnit.SECONDS);
+        assertEquals(promotedBefore + 1, warmShard.manager.stats().promoted());
+        assertEquals(FullFileState.State.FULL, stateOf(warmShard, mergedFdt));
+
+        deleteIndex(INDEX_NAME);
+    }
+
     public void testDeleteIndexWhileDownloadHeld() throws Exception {
         String warmNode = startCluster();
         WarmShard warmShard = prepareEligibleIndex(INDEX_NAME, warmNode);
@@ -553,6 +610,129 @@ public class WarmFullFileIT extends WarmFullFileBaseIT {
                 .get()
         );
         deleteIndex(SECOND_INDEX_NAME);
+        deleteIndex(INDEX_NAME);
+    }
+
+    public void testRestartReusesTheWholeFileLeftOnDiskWithoutADownload() throws Exception {
+        String warmNode = startCluster();
+        WarmShard warmShard = prepareEligibleIndex(INDEX_NAME, warmNode);
+        String fdt = eligibleFdt(warmShard);
+        searchUntilPromoted(INDEX_NAME, warmShard, fdt);
+        List<String> beforeRestart = queryFingerprint(INDEX_NAME);
+        Path wholeFilePath = warmShard.directory.getFilePath(fdt);
+        long wholeFileLength = Files.size(wholeFilePath);
+
+        // Close the index so its last commit is synced to the remote store, restart the node and open the index again.
+        // The whole file stays in the shard directory across the restart, untouched.
+        assertShardsAcknowledged(client().admin().indices().prepareClose(INDEX_NAME).get());
+        AtomicBoolean leftoverIntact = new AtomicBoolean(false);
+        internalCluster().restartNode(warmNode, new InternalTestCluster.RestartCallback() {
+            @Override
+            public Settings onNodeStopped(String nodeName) throws Exception {
+                leftoverIntact.set(Files.exists(wholeFilePath) && Files.size(wholeFilePath) == wholeFileLength);
+                return super.onNodeStopped(nodeName);
+            }
+        });
+        assertTrue("the whole file should have survived the shutdown intact", leftoverIntact.get());
+        assertShardsAcknowledged(client().admin().indices().prepareOpen(INDEX_NAME).get());
+        ensureGreen(ENSURE_GREEN_TIMEOUT, INDEX_NAME);
+
+        // The restarted node has a fresh manager: the first searches promote by validating and reusing the leftover.
+        WarmShard restarted = warmShard(INDEX_NAME, warmNode);
+        searchUntilPromoted(INDEX_NAME, restarted, fdt);
+        WarmFullFileStats stats = restarted.manager.stats();
+        assertEquals("the leftover was not reused: " + stats, 1L, stats.reused());
+        assertEquals("the leftover was downloaded again: " + stats, 0L, stats.downloadedBytes());
+        assertEquals(FullFileState.State.FULL, stateOf(restarted, fdt));
+        assertEquals(beforeRestart, queryFingerprint(INDEX_NAME));
+
+        deleteIndex(INDEX_NAME);
+    }
+
+    public void testRelocationUnderSearchLoadClosesTheSourceFamilyAndPromotesOnTheTarget() throws Exception {
+        String sourceNode = startCluster();
+        WarmShard source = prepareEligibleIndex(INDEX_NAME, sourceNode);
+        String fdt = eligibleFdt(source);
+        searchUntilPromoted(INDEX_NAME, source, fdt);
+        List<String> beforeMove = queryFingerprint(INDEX_NAME);
+        FullFileState sourceFamily = requireFamilyState(source, fdt);
+        String targetNode = internalCluster().startDataAndWarmNodes(1).get(0);
+
+        // Searches keep running while the shard moves. A search may see a shard-unavailable failure while the copy it
+        // was routed to hands over; anything else is a real failure.
+        int threadCount = 4;
+        AtomicBoolean stop = new AtomicBoolean(false);
+        AtomicInteger completedSearches = new AtomicInteger();
+        ConcurrentLinkedQueue<Throwable> unexpected = new ConcurrentLinkedQueue<>();
+        List<Thread> searchers = new ArrayList<>();
+        for (int t = 0; t < threadCount; t++) {
+            Thread thread = new Thread(() -> {
+                while (stop.get() == false) {
+                    try {
+                        client().prepareSearch(INDEX_NAME).setQuery(QueryBuilders.matchAllQuery()).setSize(20).get();
+                        completedSearches.incrementAndGet();
+                    } catch (Exception e) {
+                        if (isIndexGoneException(e) == false) {
+                            logger.info("unexpected search failure while the shard was relocating", e);
+                            unexpected.add(new AssertionError(describeFailure(e), e));
+                            return;
+                        }
+                    }
+                }
+            }, "warm-full-file-relocation-searcher-" + t);
+            searchers.add(thread);
+            thread.start();
+        }
+        try {
+            assertBusy(
+                () -> assertThat(completedSearches.get(), greaterThanOrEqualTo(threadCount * 3)),
+                WAIT_TIMEOUT.seconds(),
+                TimeUnit.SECONDS
+            );
+            assertAcked(
+                client().admin().cluster().prepareReroute().add(new MoveAllocationCommand(INDEX_NAME, 0, sourceNode, targetNode)).get()
+            );
+            ClusterHealthResponse health = client().admin()
+                .cluster()
+                .prepareHealth(INDEX_NAME)
+                .setWaitForEvents(Priority.LANGUID)
+                .setWaitForNoRelocatingShards(true)
+                .setWaitForGreenStatus()
+                .setTimeout(ENSURE_GREEN_TIMEOUT)
+                .get();
+            assertFalse("relocation did not finish", health.isTimedOut());
+            int searchesAfterMove = completedSearches.get();
+            assertBusy(
+                () -> assertThat(completedSearches.get(), greaterThanOrEqualTo(searchesAfterMove + threadCount)),
+                WAIT_TIMEOUT.seconds(),
+                TimeUnit.SECONDS
+            );
+        } finally {
+            stop.set(true);
+            for (Thread thread : searchers) {
+                thread.join(WAIT_TIMEOUT.millis());
+                assertFalse("search thread did not finish: " + thread.getName(), thread.isAlive());
+            }
+        }
+        assertTrue("unexpected exceptions during the relocation: " + unexpected, unexpected.isEmpty());
+        assertTrue("source node left the cluster", isNodeInCluster(sourceNode));
+        assertTrue("target node left the cluster", isNodeInCluster(targetNode));
+
+        // The source shard closed under the running searches: its family is closed, the budget is back and the mapping
+        // is released once the last handle closed. Removing the shard's files from the source is IndicesStore's job.
+        assertBusy(() -> {
+            assertEquals(FullFileState.State.CLOSED, sourceFamily.state());
+            assertTrue("source mapping not released", sourceFamily.cleanupDone());
+            assertEquals("source budget not released", 0L, source.manager.stats().reservedBytes());
+        }, DOWNLOAD_TIMEOUT.seconds(), TimeUnit.SECONDS);
+
+        // The target promotes on its own, within its own budget, with the same results.
+        WarmShard target = warmShard(INDEX_NAME, targetNode);
+        searchUntilPromoted(INDEX_NAME, target, fdt);
+        assertEquals(FullFileState.State.FULL, stateOf(target, fdt));
+        assertThat(target.manager.stats().promoted(), greaterThanOrEqualTo(1L));
+        assertEquals(beforeMove, queryFingerprint(INDEX_NAME));
+
         deleteIndex(INDEX_NAME);
     }
 
