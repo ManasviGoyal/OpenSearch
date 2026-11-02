@@ -10,8 +10,6 @@ package org.opensearch.storage.directory;
 
 import com.carrotsearch.randomizedtesting.annotations.ThreadLeakFilters;
 
-import org.apache.logging.log4j.Level;
-import org.apache.logging.log4j.LogManager;
 import org.apache.lucene.store.DataAccessHint;
 import org.apache.lucene.store.Directory;
 import org.apache.lucene.store.FSDirectory;
@@ -24,20 +22,21 @@ import org.apache.lucene.store.MergeInfo;
 import org.apache.lucene.store.ReadOnceHint;
 import org.opensearch.common.settings.ClusterSettings;
 import org.opensearch.common.settings.Settings;
+import org.opensearch.common.util.io.IOUtils;
 import org.opensearch.index.store.remote.file.CleanerDaemonThreadLeakFilter;
 import org.opensearch.index.store.remote.filecache.CachedIndexInput;
 import org.opensearch.index.store.remote.filecache.FileCache;
 import org.opensearch.index.store.remote.filecache.FileCacheFactory;
 import org.opensearch.index.store.remote.utils.FileTypeUtils;
 import org.opensearch.plugins.IndexStorePlugin;
+import org.opensearch.storage.indexinput.CachedSwitchableIndexInput;
+import org.opensearch.storage.indexinput.PromotableCachedSwitchableIndexInput;
 import org.opensearch.storage.indexinput.SwitchableIndexInput;
 import org.opensearch.storage.indexinput.SwitchableIndexInputWrapper;
 import org.opensearch.storage.prefetch.TieredStoragePrefetchSettings;
 import org.opensearch.storage.warmfullfile.FullFileState;
 import org.opensearch.storage.warmfullfile.WarmFullFileManager;
 import org.opensearch.storage.warmfullfile.WarmFullFileSettings;
-import org.opensearch.test.MockLogAppender;
-import org.opensearch.test.junit.annotations.TestLogging;
 import org.junit.Before;
 
 import java.io.IOException;
@@ -93,14 +92,17 @@ public class TieredDirectoryTests extends TieredStorageBaseTestCase {
         removeExtraFSFiles();
         int concurrencyLevel = randomIntBetween(1, 2);
         fileCache = FileCacheFactory.createConcurrentLRUFileCache(FILE_CACHE_CAPACITY, concurrencyLevel);
+        // The fixture files' extensions are listed, so their entries carry a family; the files fit in one block, so no
+        // handle is eligible and nothing promotes.
+        WarmFullFileManager manager = recordingManager(new RecordingExecutor());
+        manager.onExtensionsChanged(Set.of("cfe", "si"));
         tieredDirectory = new TieredDirectory(
             localDirectory,
             remoteSegmentStoreDirectory,
             fileCache,
             threadPool,
             getMockPrefetchSettingsSupplier(),
-            getMockWarmFullFileSettingsSupplier(),
-            null // manager not needed: feature off (empty extensions), nothing promotes
+            manager
         );
         addFilesToDirectory(LOCAL_FILES);
     }
@@ -115,15 +117,7 @@ public class TieredDirectoryTests extends TieredStorageBaseTestCase {
         };
     }
 
-    // Feature off (empty extensions): no file is eligible, so the fixture directory never promotes anything.
-    private Supplier<WarmFullFileSettings> getMockWarmFullFileSettingsSupplier() {
-        return () -> {
-            WarmFullFileSettings settings = mock(WarmFullFileSettings.class);
-            when(settings.getExtensions()).thenReturn(Set.of());
-            return settings;
-        };
-    }
-
+    // The fixture files fit in one block, so no handle is eligible and the fixture directory never promotes anything.
     public void testSecondCacheFileForLiveFamilyReturnsItUnchanged() throws Exception {
         // cacheFile creates a family only when the key has no live entry: a second call for the same file returns the
         // first family, closes nothing, and takes one more reference on it, as a put would have.
@@ -136,7 +130,7 @@ public class TieredDirectoryTests extends TieredStorageBaseTestCase {
         CachedIndexInput second = tieredDirectory.cacheFile(FILE_PRESENT_IN_REMOTE_ONLY, true);
         assertSame("the live family is kept", first, second);
         assertFalse("nothing was closed", first.isClosed());
-        assertEquals(FullFileState.State.BLOCK, first.fullFileState().state());
+        assertEquals(FullFileState.State.BLOCK, familyOf(first).state());
         assertEquals("each call leaves one reference for its caller", Integer.valueOf(2), fileCache.getRef(key));
         fileCache.decRef(key);
         fileCache.decRef(key);
@@ -153,7 +147,7 @@ public class TieredDirectoryTests extends TieredStorageBaseTestCase {
         CachedIndexInput live = tieredDirectory.cacheFile(FILE_PRESENT_IN_REMOTE_ONLY, true);
         assertNotSame(stale, live);
         assertFalse(live.isClosed());
-        assertEquals(FullFileState.State.BLOCK, live.fullFileState().state());
+        assertEquals(FullFileState.State.BLOCK, familyOf(live).state());
         fileCache.decRef(key);
     }
 
@@ -188,7 +182,7 @@ public class TieredDirectoryTests extends TieredStorageBaseTestCase {
         CachedIndexInput family = fileCache.get(key);
         assertNotNull("one family was created", family);
         assertFalse(family.isClosed());
-        assertEquals(FullFileState.State.BLOCK, family.fullFileState().state());
+        assertEquals(FullFileState.State.BLOCK, familyOf(family).state());
         fileCache.decRef(key);
         assertEquals("one reference per open handle, none left by openInput itself", Integer.valueOf(threads), fileCache.getRef(key));
 
@@ -308,7 +302,7 @@ public class TieredDirectoryTests extends TieredStorageBaseTestCase {
         Path localKey = getFilePathSwitchable(localDirectory, localFile);
         CachedIndexInput entry = fileCache.get(localKey);
         try {
-            assertFalse("local-mode family not yet promotable", entry.fullFileState().isRemoteMode());
+            assertFalse("local-mode family not yet promotable", familyOf(entry).isRemoteMode());
         } finally {
             fileCache.decRef(localKey);
         }
@@ -317,7 +311,7 @@ public class TieredDirectoryTests extends TieredStorageBaseTestCase {
 
         entry = fileCache.get(localKey);
         try {
-            assertTrue("marked remote once the switch completed", entry.fullFileState().isRemoteMode());
+            assertTrue("marked remote once the switch completed", familyOf(entry).isRemoteMode());
         } finally {
             fileCache.decRef(localKey);
         }
@@ -326,7 +320,7 @@ public class TieredDirectoryTests extends TieredStorageBaseTestCase {
         Path remoteKey = getFilePathSwitchable(localDirectory, FILE_PRESENT_IN_REMOTE_ONLY);
         entry = fileCache.get(remoteKey);
         try {
-            assertTrue("family created from remote is promotable at once", entry.fullFileState().isRemoteMode());
+            assertTrue("family created from remote is promotable at once", familyOf(entry).isRemoteMode());
         } finally {
             fileCache.decRef(remoteKey);
         }
@@ -348,19 +342,10 @@ public class TieredDirectoryTests extends TieredStorageBaseTestCase {
         try {
             SwitchableIndexInput original = (SwitchableIndexInput) entry.getIndexInput();
             assertFalse("switch did not happen", original.hasSwitchedToRemote());
-            assertFalse("family stays non-promotable while serving the local copy", entry.fullFileState().isRemoteMode());
+            assertFalse("family stays non-promotable while serving the local copy", familyOf(entry).isRemoteMode());
         } finally {
             fileCache.decRef(localKey);
         }
-    }
-
-    public void testSwitchFileToRemoteWithoutCacheEntryDoesNotThrow() {
-        Path key = getFilePathSwitchable(localDirectory, NON_EXISTENT_FILE);
-        assertNull(fileCache.getRef(key));
-
-        tieredDirectory.switchFileToRemote(NON_EXISTENT_FILE);
-
-        assertNull(fileCache.getRef(key));
     }
 
     public void testAfterSyncToRemote() throws IOException {
@@ -422,31 +407,20 @@ public class TieredDirectoryTests extends TieredStorageBaseTestCase {
         clusterSettings.applySettings(Settings.builder().putList(WarmFullFileSettings.EXTENSIONS.getKey(), List.of(extensions)).build());
     }
 
-    /** A real WarmFullFileSettings over its own ClusterSettings, already configured with the given extensions. */
-    private static WarmFullFileSettings realSettings(String... extensions) {
-        ClusterSettings clusterSettings = newClusterSettings();
-        WarmFullFileSettings settings = new WarmFullFileSettings(clusterSettings);
-        if (extensions.length > 0) {
-            setExtensions(clusterSettings, extensions);
-        }
-        return settings;
-    }
-
     /** A second TieredDirectory over the same local directory, remote directory and file cache as the fixture's. */
-    private TieredDirectory directoryWith(Supplier<WarmFullFileSettings> settingsSupplier, WarmFullFileManager manager) {
+    private TieredDirectory directoryWith(WarmFullFileManager manager) {
         return new TieredDirectory(
             localDirectory,
             remoteSegmentStoreDirectory,
             fileCache,
             threadPool,
             getMockPrefetchSettingsSupplier(),
-            settingsSupplier,
             manager
         );
     }
 
     private WarmFullFileManager recordingManager(RecordingExecutor executor) {
-        return new WarmFullFileManager(fileCache, executor, () -> 0L, 8, (task, delayMillis) -> {});
+        return new WarmFullFileManager(fileCache, executor, () -> 0L, 8);
     }
 
     /** An original input in remote (block) mode whose whole-file length is {@code length}, as openInput passes it. */
@@ -457,36 +431,45 @@ public class TieredDirectoryTests extends TieredStorageBaseTestCase {
         return original;
     }
 
+    /** The family of a switchable entry, or null for the existing entry, which carries none. */
+    private static FullFileState familyOf(CachedIndexInput entry) {
+        return entry instanceof PromotableCachedSwitchableIndexInput promotable ? promotable.fullFileState() : null;
+    }
+
     private FullFileState familyStateOf(String name) {
         Path key = getFilePathSwitchable(localDirectory, name);
         CachedIndexInput entry = fileCache.get(key);
         assertNotNull("switchable entry for " + name, entry);
         fileCache.decRef(key);
-        return entry.fullFileState();
+        return familyOf(entry);
+    }
+
+    private Class<?> entryClassOf(String name) {
+        Path key = getFilePathSwitchable(localDirectory, name);
+        CachedIndexInput entry = fileCache.get(key);
+        assertNotNull("switchable entry for " + name, entry);
+        fileCache.decRef(key);
+        return entry.getClass();
     }
 
     public void testEligibilityIgnoresTheExtensionAtOpen() {
-        // The setting is read at trigger time, not at open, so a handle opened before an extension is configured can
-        // promote later and one opened while it was configured stops when it is removed. Open-time eligibility is the
-        // same with the setting empty, with the file's extension listed, and with another extension listed.
+        // The extension is not an open-time rule: it selects the entry type when the family is created, and the trigger
+        // checks it against the manager so a handle opened while it was listed stops when it is removed. Any extension,
+        // or none, passes the open-time rules.
+        TieredDirectory dir = directoryWith(null);
         SwitchableIndexInput original = remoteOriginal(ONE_BLOCK_BYTES + 1);
-        for (TieredDirectory dir : List.of(
-            directoryWith(() -> realSettings(), null),
-            directoryWith(() -> realSettings(".FAISS", "veq"), null),
-            directoryWith(() -> realSettings("vec"), null)
-        )) {
-            assertTrue(dir.isEligibleForFullFile(FAISS_FILE, IOContext.DEFAULT, original));
-            assertTrue(dir.isEligibleForFullFile("_0_Lucene99_0.veq", IOContext.DEFAULT, original));
-            assertTrue(dir.isEligibleForFullFile("_0_Lucene99_0.vec", IOContext.DEFAULT, original));
-            assertTrue(
-                "a file without an extension passes the open-time rules",
-                dir.isEligibleForFullFile("faiss", IOContext.DEFAULT, original)
-            );
-        }
+
+        assertTrue(dir.isEligibleForFullFile(FAISS_FILE, IOContext.DEFAULT, original));
+        assertTrue(dir.isEligibleForFullFile("_0_Lucene99_0.veq", IOContext.DEFAULT, original));
+        assertTrue(dir.isEligibleForFullFile("_0_Lucene99_0.vec", IOContext.DEFAULT, original));
+        assertTrue(
+            "a file without an extension passes the open-time rules",
+            dir.isEligibleForFullFile("faiss", IOContext.DEFAULT, original)
+        );
     }
 
     public void testEligibilityExcludesLuceneSpecialFiles() {
-        TieredDirectory dir = directoryWith(() -> realSettings("cfs", "lock", "si", "faiss"), null);
+        TieredDirectory dir = directoryWith(null);
         SwitchableIndexInput original = remoteOriginal(ONE_BLOCK_BYTES + 1);
 
         assertTrue("control: a plain file of a configured extension", dir.isEligibleForFullFile("_0.si", IOContext.DEFAULT, original));
@@ -499,47 +482,8 @@ public class TieredDirectoryTests extends TieredStorageBaseTestCase {
         assertFalse("write.lock", dir.isEligibleForFullFile("write.lock", IOContext.DEFAULT, original));
     }
 
-    @TestLogging(value = "org.opensearch.storage.directory.TieredDirectory:DEBUG", reason = "the rejection line is logged at DEBUG")
-    public void testEligibilityRejectionOfConfiguredExtensionIsLoggedAtDebug() throws Exception {
-        TieredDirectory dir = directoryWith(() -> realSettings("faiss", "cfs"), null);
-        SwitchableIndexInput original = remoteOriginal(ONE_BLOCK_BYTES + 1);
-        String loggerName = TieredDirectory.class.getName();
-        try (MockLogAppender appender = MockLogAppender.createForLoggers(LogManager.getLogger(TieredDirectory.class))) {
-            appender.addExpectation(
-                new MockLogAppender.SeenEventExpectation(
-                    "compound file rejection names the rule",
-                    loggerName,
-                    Level.DEBUG,
-                    "*[_0.cfs]*not eligible: segments, lock or compound file*"
-                )
-            );
-            appender.addExpectation(
-                new MockLogAppender.SeenEventExpectation(
-                    "read-once rejection names the rule",
-                    loggerName,
-                    Level.DEBUG,
-                    "*[_0.faiss]*not eligible: read-once or sequential hint*"
-                )
-            );
-            appender.addExpectation(
-                new MockLogAppender.UnseenEventExpectation("an unconfigured extension is not logged", loggerName, Level.DEBUG, "*[_0.vec]*")
-            );
-            appender.addExpectation(
-                new MockLogAppender.UnseenEventExpectation("an eligible file is not logged", loggerName, Level.DEBUG, "*[_1.faiss]*")
-            );
-            assertFalse(dir.isEligibleForFullFile("_0.cfs", IOContext.DEFAULT, original));
-            assertFalse(dir.isEligibleForFullFile("_0.faiss", IOContext.READONCE, original));
-            assertFalse(
-                "rejected, but its extension is not configured, so not logged",
-                dir.isEligibleForFullFile("_0.vec", IOContext.READONCE, original)
-            );
-            assertTrue(dir.isEligibleForFullFile("_1.faiss", IOContext.DEFAULT, original));
-            appender.assertAllExpectationsMatched();
-        }
-    }
-
     public void testEligibilityRequiresPlainDefaultReadContext() {
-        TieredDirectory dir = directoryWith(() -> realSettings("faiss"), null);
+        TieredDirectory dir = directoryWith(null);
         SwitchableIndexInput original = remoteOriginal(ONE_BLOCK_BYTES + 1);
 
         assertTrue(dir.isEligibleForFullFile(FAISS_FILE, IOContext.DEFAULT, original));
@@ -567,7 +511,7 @@ public class TieredDirectoryTests extends TieredStorageBaseTestCase {
     }
 
     public void testEligibilitySizeBounds() {
-        TieredDirectory dir = directoryWith(() -> realSettings("faiss"), null);
+        TieredDirectory dir = directoryWith(null);
 
         assertFalse("exactly one block", dir.isEligibleForFullFile(FAISS_FILE, IOContext.DEFAULT, remoteOriginal(ONE_BLOCK_BYTES)));
         assertTrue("one byte over a block", dir.isEligibleForFullFile(FAISS_FILE, IOContext.DEFAULT, remoteOriginal(ONE_BLOCK_BYTES + 1)));
@@ -589,7 +533,7 @@ public class TieredDirectoryTests extends TieredStorageBaseTestCase {
         // A handle opened while the file is still local (e.g. by the searcher at refresh time, before the upload) is
         // eligible; whether the file has switched to remote mode is checked by the wrapper when a clone or slice is
         // taken, so the handle becomes promotable after the upload without being reopened.
-        TieredDirectory dir = directoryWith(() -> realSettings("faiss"), null);
+        TieredDirectory dir = directoryWith(null);
         SwitchableIndexInput local = mock(SwitchableIndexInput.class);
         when(local.length()).thenReturn(ONE_BLOCK_BYTES + 1);
         when(local.hasSwitchedToRemote()).thenReturn(false);
@@ -601,96 +545,58 @@ public class TieredDirectoryTests extends TieredStorageBaseTestCase {
         );
     }
 
-    public void testOpenTimeEligibilityDoesNotNeedTheSetting() {
-        // The open-time rules are structural; whether the feature is on for a file is the trigger's check against the
-        // manager's current extensions (a null manager means the feature is off and nothing ever triggers).
-        SwitchableIndexInput original = remoteOriginal(ONE_BLOCK_BYTES + 1);
-
-        assertTrue(
-            "real settings, default (empty)",
-            directoryWith(() -> realSettings(), null).isEligibleForFullFile(FAISS_FILE, IOContext.DEFAULT, original)
-        );
-        assertTrue(
-            "mock settings, empty",
-            directoryWith(getMockWarmFullFileSettingsSupplier(), null).isEligibleForFullFile(FAISS_FILE, IOContext.DEFAULT, original)
-        );
-        assertTrue("supplier returns null", directoryWith(() -> null, null).isEligibleForFullFile(FAISS_FILE, IOContext.DEFAULT, original));
-        assertTrue("no supplier", directoryWith(null, null).isEligibleForFullFile(FAISS_FILE, IOContext.DEFAULT, original));
-    }
-
-    public void testDynamicExtensionUpdateLeavesOpenTimeEligibilityUnchanged() {
-        // Adding or removing the extension changes what the trigger does with a handle, never the open-time decision.
-        ClusterSettings clusterSettings = newClusterSettings();
-        WarmFullFileSettings settings = new WarmFullFileSettings(clusterSettings);
-        TieredDirectory dir = directoryWith(() -> settings, null);
-        SwitchableIndexInput original = remoteOriginal(9L * 1024 * 1024);
-
-        assertTrue("before the update", dir.isEligibleForFullFile(FAISS_FILE, IOContext.DEFAULT, original));
-        setExtensions(clusterSettings, "faiss");
-        assertTrue("after the update", dir.isEligibleForFullFile(FAISS_FILE, IOContext.DEFAULT, original));
-        clusterSettings.applySettings(Settings.EMPTY);
-        assertTrue("after the extension is removed again", dir.isEligibleForFullFile(FAISS_FILE, IOContext.DEFAULT, original));
-    }
-
-    public void testDynamicExtensionUpdateNeverPromotesFileOfOneBlockOrLess() throws Exception {
-        // The fixture file is well under one block, so even once its extension is configured no handle may promote:
-        // a handle opened before the update and one opened after it both stay on blocks and submit nothing.
+    public void testExtensionUpdateAppliesToFamiliesCreatedAfterwards() throws Exception {
+        // The entry type is chosen when the family is created: a file whose extension is not listed gets the existing
+        // entry, and listing the extension later leaves a live entry as it is. A family created after the update is
+        // promotable, but the fixture file fits in one block, so its handles still stay on blocks and submit nothing.
         populateData();
         ClusterSettings clusterSettings = newClusterSettings();
         WarmFullFileSettings settings = new WarmFullFileSettings(clusterSettings);
         RecordingExecutor executor = new RecordingExecutor();
-        TieredDirectory dir = directoryWith(() -> settings, recordingManager(executor));
+        WarmFullFileManager manager = recordingManager(executor);
+        settings.addListener(manager::onExtensionsChanged);
+        TieredDirectory dir = directoryWith(manager);
         long length = remoteSegmentStoreDirectory.fileLength(FILE_PRESENT_IN_REMOTE_ONLY);
         assertTrue("fixture file must fit in one block", length > 0 && length <= ONE_BLOCK_BYTES);
 
         IndexInput before = dir.openInput(FILE_PRESENT_IN_REMOTE_ONLY, IOContext.DEFAULT);
+        assertEquals(CachedSwitchableIndexInput.class, entryClassOf(FILE_PRESENT_IN_REMOTE_ONLY));
         setExtensions(clusterSettings, "si");
-        assertTrue(settings.isExtensionEligible("si"));
+        assertTrue(manager.isExtensionEligible("si"));
         IndexInput after = dir.openInput(FILE_PRESENT_IN_REMOTE_ONLY, IOContext.DEFAULT);
-        assertTrue(getSwitchableIndexInputFromWrapper(after).hasSwitchedToRemote());
+        assertEquals("the live entry is kept", CachedSwitchableIndexInput.class, entryClassOf(FILE_PRESENT_IN_REMOTE_ONLY));
+        assertNull("the existing entry carries no family", familyStateOf(FILE_PRESENT_IN_REMOTE_ONLY));
+        assertEquals(SwitchableIndexInputWrapper.class, before.getClass());
+        assertEquals(SwitchableIndexInputWrapper.class, after.getClass());
+        IOUtils.close(before, after);
 
-        IndexInput beforeClone = before.clone();
-        IndexInput afterClone = after.clone();
-        IndexInput beforeSlice = before.slice("s", 0, Math.min(16, length));
-        IndexInput afterSlice = after.slice("s", 0, Math.min(16, length));
-        assertEquals("no promotion submitted by either handle", 0, executor.submitted.get());
-        assertTrue(beforeClone instanceof SwitchableIndexInputWrapper);
-        assertTrue(afterClone instanceof SwitchableIndexInputWrapper);
-        assertTrue(beforeSlice instanceof SwitchableIndexInputWrapper);
-        assertTrue(afterSlice instanceof SwitchableIndexInputWrapper);
+        // Dropping the entry, as a shard close does, and opening again creates a promotable family.
+        fileCache.remove(getFilePathSwitchable(localDirectory, FILE_PRESENT_IN_REMOTE_ONLY));
+        IndexInput recreated = dir.openInput(FILE_PRESENT_IN_REMOTE_ONLY, IOContext.DEFAULT);
+        assertEquals(PromotableCachedSwitchableIndexInput.class, entryClassOf(FILE_PRESENT_IN_REMOTE_ONLY));
+        assertTrue(getSwitchableIndexInputFromWrapper(recreated).hasSwitchedToRemote());
         assertEquals(FullFileState.State.BLOCK, familyStateOf(FILE_PRESENT_IN_REMOTE_ONLY).state());
-
-        beforeClone.close();
-        afterClone.close();
-        beforeSlice.close();
-        afterSlice.close();
-        before.close();
-        after.close();
+        assertEquals("one block or less: the existing wrapper", SwitchableIndexInputWrapper.class, recreated.getClass());
+        IndexInput clone = recreated.clone();
+        IndexInput slice = recreated.slice("s", 0, Math.min(16, length));
+        assertEquals(SwitchableIndexInputWrapper.class, clone.getClass());
+        assertEquals(SwitchableIndexInputWrapper.class, slice.getClass());
+        assertEquals("no promotion submitted by any handle", 0, executor.submitted.get());
+        assertEquals(FullFileState.State.BLOCK, familyStateOf(FILE_PRESENT_IN_REMOTE_ONLY).state());
+        IOUtils.close(slice, clone, recreated);
     }
 
     public void testFeatureOffNeverPromotesEvenWithManager() throws Exception {
-        // Empty extension list with a live manager: opening, reading, cloning and slicing the fixture files must submit
-        // no promotion, and every family stays BLOCK.
+        // A live manager with no listed extensions: every file this directory creates gets the existing entry, which
+        // carries no family, and the existing wrapper, whose clones and slices are existing wrappers too; nothing is
+        // submitted.
         populateData();
         RecordingExecutor executor = new RecordingExecutor();
-        TieredDirectory dir = directoryWith(getMockWarmFullFileSettingsSupplier(), recordingManager(executor));
+        TieredDirectory dir = directoryWith(recordingManager(executor));
+        String localFile = "_3.cfe";
+        dir.createOutput(localFile, IOContext.DEFAULT).close(); // written through this directory, not the fixture's
 
-        for (String name : new String[] { FILE_PRESENT_LOCALLY, FILE_PRESENT_IN_REMOTE_ONLY }) {
-            IndexInput handle = dir.openInput(name, IOContext.DEFAULT);
-            assertTrue(handle instanceof SwitchableIndexInputWrapper);
-            IndexInput clone = handle.clone();
-            assertTrue("block clone for " + name, clone instanceof SwitchableIndexInputWrapper);
-            long length = handle.length();
-            if (length > 0) {
-                IndexInput slice = handle.slice("s", 0, Math.min(16, length));
-                assertTrue("block slice for " + name, slice instanceof SwitchableIndexInputWrapper);
-                assertEquals(clone.readByte(), slice.readByte());
-                slice.close();
-            }
-            clone.close();
-            handle.close();
-            assertEquals("family stays BLOCK for " + name, FullFileState.State.BLOCK, familyStateOf(name).state());
-        }
+        assertExistingEntriesAndHandles(dir, localFile, FILE_PRESENT_IN_REMOTE_ONLY);
         assertEquals("no promotion submitted", 0, executor.submitted.get());
     }
 
@@ -728,12 +634,72 @@ public class TieredDirectoryTests extends TieredStorageBaseTestCase {
         });
     }
 
-    public void testTieredDirectoryFactory() throws IOException {
-        TieredDirectoryFactory factory = new TieredDirectoryFactory(
-            getMockPrefetchSettingsSupplier(),
-            getMockWarmFullFileSettingsSupplier(),
-            null // manager not needed: feature off
+    public void testIneligibleHandleIsAPlainSwitchableWrapper() throws Exception {
+        // An ineligible open (merge or flush context, read-once hint, a file of one block or less) gets the plain
+        // wrapper, whose clones and slices are plain too; nothing is requested. The eligibility rules themselves are
+        // covered by the tests above; this one checks the routing.
+        populateData();
+        RecordingExecutor executor = new RecordingExecutor();
+        WarmFullFileManager manager = recordingManager(executor);
+        manager.onExtensionsChanged(Set.of("si"));
+        TieredDirectory dir = directoryWith(manager);
+        assertFalse(
+            "fixture file fits in one block, so even a DEFAULT open is ineligible",
+            dir.isEligibleForFullFile(FILE_PRESENT_IN_REMOTE_ONLY, IOContext.DEFAULT, remoteOriginal(ONE_BLOCK_BYTES))
         );
+
+        for (IOContext context : List.of(
+            IOContext.DEFAULT,
+            IOContext.READONCE,
+            IOContext.merge(new MergeInfo(1, ONE_BLOCK_BYTES + 1, false, 1)),
+            IOContext.flush(new FlushInfo(1, ONE_BLOCK_BYTES + 1))
+        )) {
+            IndexInput handle = dir.openInput(FILE_PRESENT_IN_REMOTE_ONLY, context);
+            assertEquals(context.toString(), SwitchableIndexInputWrapper.class, handle.getClass());
+            IndexInput clone = handle.clone();
+            assertEquals(SwitchableIndexInputWrapper.class, clone.getClass());
+            IndexInput slice = handle.slice("s", 0, Math.min(16, handle.length()));
+            assertEquals(SwitchableIndexInputWrapper.class, slice.getClass());
+            IOUtils.close(slice, clone, handle);
+        }
+        assertEquals("no promotion requested", 0, executor.submitted.get());
+        assertNotNull("the entry still carries its family", familyStateOf(FILE_PRESENT_IN_REMOTE_ONLY));
+    }
+
+    public void testWithoutManagerOpensPlainSwitchableInputs() throws Exception {
+        // No manager means nothing can promote: the directory creates the existing entry, which carries no family, and
+        // hands out the existing wrapper, whose clones and slices are existing wrappers too.
+        populateData();
+        TieredDirectory dir = directoryWith(null);
+        String localFile = "_3.cfe";
+        dir.createOutput(localFile, IOContext.DEFAULT).close(); // written through this directory, not the fixture's
+
+        assertExistingEntriesAndHandles(dir, localFile, FILE_PRESENT_IN_REMOTE_ONLY);
+    }
+
+    /** Opens each file through {@code dir} and checks that its entry, handle, clone and slice are the existing classes. */
+    private void assertExistingEntriesAndHandles(TieredDirectory dir, String... names) throws IOException {
+        for (String name : names) {
+            IndexInput handle = dir.openInput(name, IOContext.DEFAULT);
+            assertEquals(name, SwitchableIndexInputWrapper.class, handle.getClass());
+            IndexInput clone = handle.clone();
+            assertEquals(SwitchableIndexInputWrapper.class, clone.getClass());
+            long length = handle.length();
+            if (length > 0) {
+                IndexInput slice = handle.slice("s", 0, Math.min(16, length));
+                assertEquals(SwitchableIndexInputWrapper.class, slice.getClass());
+                assertEquals(clone.readByte(), slice.readByte());
+                slice.close();
+            }
+            clone.close();
+            handle.close();
+            assertEquals(CachedSwitchableIndexInput.class, entryClassOf(name));
+            assertNull("the existing entry carries no family", familyStateOf(name));
+        }
+    }
+
+    public void testTieredDirectoryFactory() throws IOException {
+        TieredDirectoryFactory factory = new TieredDirectoryFactory(getMockPrefetchSettingsSupplier(), null /* feature off */);
         FSDirectory factoryLocalDir = FSDirectory.open(createTempDir());
         IndexStorePlugin.DirectoryFactory localDirFactory = mock(IndexStorePlugin.DirectoryFactory.class);
         when(localDirFactory.newDirectory(any(), any())).thenReturn(factoryLocalDir);

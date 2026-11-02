@@ -39,20 +39,29 @@ public class FullFileStateTests extends OpenSearchTestCase {
         assertEquals(0L, st.retryAt());
     }
 
-    public void testCompareAndSetLocalMasterInstallsOnceAndClearsOnlyTheInstalledMapping() throws Exception {
+    public void testCompletePromotionPublishesOnceAndOnlyFromPromoting() throws Exception {
         FullFileState st = newState();
         try (
             IndexInput first = new ByteArrayIndexInput("first", new byte[4]);
             IndexInput second = new ByteArrayIndexInput("second", new byte[4])
         ) {
-            assertTrue("first publish installs", st.compareAndSetLocalMaster(null, first));
-            assertFalse("second publish is rejected while one is installed", st.compareAndSetLocalMaster(null, second));
-            assertSame(first, st.localMaster());
-            assertFalse("a handler cannot clear a mapping it did not install", st.compareAndSetLocalMaster(second, null));
-            assertSame(first, st.localMaster());
-            assertTrue("the installer can clear its own mapping", st.compareAndSetLocalMaster(first, null));
+            assertEquals("not promoting", FullFileState.Completion.NOT_PROMOTING, complete(st, first));
             assertNull(st.localMaster());
+            assertEquals(FullFileState.State.BLOCK, st.state());
+
+            assertTrue(st.onAccess(0));
+            assertEquals(FullFileState.Completion.FULL, complete(st, first));
+            assertSame(first, st.localMaster());
+            assertEquals(FullFileState.State.FULL, st.state());
+
+            assertEquals("a second completion for the same download", FullFileState.Completion.PUBLISHED_BY_OTHER, complete(st, second));
+            assertSame("the first mapping stays published", first, st.localMaster());
+            assertEquals(FullFileState.State.FULL, st.state());
         }
+    }
+
+    private static FullFileState.Completion complete(FullFileState st, IndexInput mapping) {
+        return st.completePromotion(mapping, null, () -> {}, () -> {}, () -> {});
     }
 
     public void testRemoteModeIsOffUntilMarkedAndThenFinal() {
@@ -67,15 +76,38 @@ public class FullFileStateTests extends OpenSearchTestCase {
         assertEquals("remote mode is independent of the promotion state", FullFileState.State.BLOCK, st.state());
     }
 
-    public void testCasTransitions() {
+    public void testOnAccessStartsAPromotionOnceAndAbandonPromotionEndsIt() {
         FullFileState st = newState();
-        assertTrue(st.casState(FullFileState.State.BLOCK, FullFileState.State.PROMOTING));
+        assertTrue(st.onAccess(0));
         assertEquals(FullFileState.State.PROMOTING, st.state());
-        // a CAS from the wrong expected value must fail and not change the state
-        assertFalse(st.casState(FullFileState.State.BLOCK, FullFileState.State.FULL));
+        assertFalse("already promoting", st.onAccess(0));
         assertEquals(FullFileState.State.PROMOTING, st.state());
-        assertTrue(st.casState(FullFileState.State.PROMOTING, FullFileState.State.FULL));
-        assertEquals(FullFileState.State.FULL, st.state());
+
+        assertTrue(st.abandonPromotion(12_345L));
+        assertEquals(FullFileState.State.BLOCK, st.state());
+        assertEquals(12_345L, st.retryAt());
+        assertFalse("not promoting any more", st.abandonPromotion(99L));
+        assertEquals("the retry time is set regardless", 99L, st.retryAt());
+
+        assertFalse("before the retry time", st.onAccess(98L));
+        assertEquals(FullFileState.State.BLOCK, st.state());
+        assertTrue("at the retry time", st.onAccess(99L));
+        assertEquals(FullFileState.State.PROMOTING, st.state());
+    }
+
+    public void testOnAccessWaitsForAPendingRelease() throws Exception {
+        // A demoted family still holding its mapping must not be promoted again, or the file would be mapped twice.
+        Fixture f = new Fixture();
+        f.goFull();
+        f.st.incHandles();
+        assertTrue(f.st.demote());
+        assertFalse("release pending", f.st.onAccess(Long.MAX_VALUE));
+        assertEquals(FullFileState.State.BLOCK, f.st.state());
+
+        f.st.decHandles();
+        f.runCleanupOnce();
+        assertTrue("release done", f.st.onAccess(Long.MAX_VALUE));
+        assertEquals(FullFileState.State.PROMOTING, f.st.state());
     }
 
     public void testHandleCount() {
@@ -85,12 +117,6 @@ public class FullFileStateTests extends OpenSearchTestCase {
         assertEquals(1, st.decHandles());
         assertEquals(0, st.decHandles());
         assertEquals(0, st.handleCount());
-    }
-
-    public void testRetryAt() {
-        FullFileState st = newState();
-        st.setRetryAt(12345L);
-        assertEquals(12345L, st.retryAt());
     }
 
     public void testFileLengthAccessor() {
@@ -123,6 +149,7 @@ public class FullFileStateTests extends OpenSearchTestCase {
         final RecordingExecutor executor = new RecordingExecutor();
         final AtomicInteger budgetReleases = new AtomicInteger();
         final AtomicInteger stuckReports = new AtomicInteger();
+        final AtomicInteger cleanupsDone = new AtomicInteger();
         final FullFileState st;
 
         Fixture() {
@@ -132,21 +159,46 @@ public class FullFileStateTests extends OpenSearchTestCase {
         }
 
         void goFull() {
-            st.attachCleanup(executor, budgetReleases::incrementAndGet, stuckReports::incrementAndGet);
-            assertTrue(st.compareAndSetLocalMaster(null, master));
-            assertTrue(st.casState(FullFileState.State.BLOCK, FullFileState.State.PROMOTING));
-            assertTrue(st.casState(FullFileState.State.PROMOTING, FullFileState.State.FULL));
+            assertTrue(st.onAccess(0));
+            assertEquals(FullFileState.Completion.FULL, complete(master));
+        }
+
+        FullFileState.Completion complete(IndexInput mapping) {
+            return st.completePromotion(
+                mapping,
+                executor,
+                budgetReleases::incrementAndGet,
+                stuckReports::incrementAndGet,
+                cleanupsDone::incrementAndGet
+            );
+        }
+
+        /** Runs the one cleanup task scheduled since the last call, as the pool would. */
+        void runCleanupOnce() {
+            assertEquals("exactly one cleanup scheduled", 1, executor.tasks.size());
+            executor.tasks.remove(0).run();
+        }
+
+        /** Promotes the released family again, as the manager does: a new entry, a new teardown and a new mapping. */
+        IndexInput startSecondPeriod() {
+            fileCache.put(path, new FileCache.RestoredCachedIndexInput(10));
+            IndexInput second = mock(IndexInput.class);
+            assertTrue(st.onAccess(Long.MAX_VALUE));
+            assertEquals(FullFileState.Completion.FULL, complete(second));
+            assertFalse("a new period owes nothing yet", st.cleanupDone());
+            assertFalse(st.isMappingReleasePending());
+            return second;
         }
     }
 
-    public void testCloseWhileFullWithNoHandlesReleasesBudgetAndDefersCleanupOffThread() throws Exception {
+    public void testCloseWhileFullWithNoHandlesDefersCleanupOffThread() throws Exception {
         Fixture f = new Fixture();
         f.goFull();
 
         f.st.closeFamily();
 
         assertEquals(FullFileState.State.CLOSED, f.st.state());
-        assertEquals("budget released at close", 1, f.budgetReleases.get());
+        assertEquals("budget held until the cleanup runs", 0, f.budgetReleases.get());
         assertEquals("cleanup scheduled once", 1, f.executor.tasks.size());
         // Not run inline: the caller may be the FileCache removal listener holding a segment lock.
         verify(f.master, never()).close();
@@ -156,7 +208,9 @@ public class FullFileStateTests extends OpenSearchTestCase {
         f.executor.runAll();
         verify(f.master).close();
         assertEquals("family reference released", Integer.valueOf(0), f.fileCache.getRef(f.path));
+        assertEquals("budget released with the reference", 1, f.budgetReleases.get());
         assertTrue(f.st.cleanupDone());
+        assertEquals("cleanup-done hook ran once", 1, f.cleanupsDone.get());
         assertNull(f.st.localMaster());
         assertEquals("no stuck-handle report without handles", 0, f.stuckReports.get());
     }
@@ -168,8 +222,9 @@ public class FullFileStateTests extends OpenSearchTestCase {
         f.st.incHandles();
 
         f.st.closeFamily();
-        assertEquals(1, f.budgetReleases.get());
+        assertEquals("budget held while handles are open", 0, f.budgetReleases.get());
         assertEquals("reported: closed with live handles", 1, f.stuckReports.get());
+        assertEquals("cleanup-done hook not yet run", 0, f.cleanupsDone.get());
         assertTrue("no cleanup while handles are open", f.executor.tasks.isEmpty());
 
         f.st.decHandles();
@@ -180,6 +235,7 @@ public class FullFileStateTests extends OpenSearchTestCase {
         f.executor.runAll();
         verify(f.master).close();
         assertEquals(Integer.valueOf(0), f.fileCache.getRef(f.path));
+        assertEquals("budget released with the reference", 1, f.budgetReleases.get());
     }
 
     public void testCloseWhileBlockOrPromotingOwesNoCleanup() throws Exception {
@@ -190,15 +246,14 @@ public class FullFileStateTests extends OpenSearchTestCase {
         assertEquals(0, blocked.budgetReleases.get());
         assertTrue(blocked.executor.tasks.isEmpty());
 
-        // PROMOTING with the teardown already attached (closed between attach and the CAS to FULL): the manager's
-        // completion handler sees the lost CAS and unwinds; closeFamily must not ALSO clean up (double close/decRef).
+        // PROMOTING, closed before the completion handler publishes: the publish is refused and installs nothing, so
+        // the handler unwinds its own mapping; closeFamily must not ALSO clean up (double close/decRef).
         Fixture promoting = new Fixture();
-        promoting.st.attachCleanup(promoting.executor, promoting.budgetReleases::incrementAndGet, () -> {});
-        assertTrue(promoting.st.compareAndSetLocalMaster(null, promoting.master));
-        assertTrue(promoting.st.casState(FullFileState.State.BLOCK, FullFileState.State.PROMOTING));
+        assertTrue(promoting.st.onAccess(0));
         promoting.st.incHandles();
         promoting.st.closeFamily();
-        assertFalse("CAS to FULL must now fail", promoting.st.casState(FullFileState.State.PROMOTING, FullFileState.State.FULL));
+        assertEquals("publish refused after the close", FullFileState.Completion.NOT_PROMOTING, promoting.complete(promoting.master));
+        assertNull(promoting.st.localMaster());
         promoting.st.decHandles();
         assertEquals(0, promoting.budgetReleases.get());
         assertTrue(promoting.executor.tasks.isEmpty());
@@ -210,8 +265,9 @@ public class FullFileStateTests extends OpenSearchTestCase {
         f.goFull();
         f.st.closeFamily();
         f.st.closeFamily();
-        assertEquals(1, f.budgetReleases.get());
         assertEquals(1, f.executor.tasks.size());
+        f.executor.runAll();
+        assertEquals(1, f.budgetReleases.get());
     }
 
     public void testConcurrentCloseAndLastHandleCloseCleansUpExactlyOnce() throws Exception {
@@ -233,6 +289,7 @@ public class FullFileStateTests extends OpenSearchTestCase {
             closer.join();
             lastHandle.join();
             assertEquals("iteration " + i + ": cleanup scheduled exactly once", 1, f.executor.tasks.size());
+            f.executor.runAll();
             assertEquals("iteration " + i + ": budget released exactly once", 1, f.budgetReleases.get());
         }
     }
@@ -274,6 +331,64 @@ public class FullFileStateTests extends OpenSearchTestCase {
         assertTrue(f.st.demote());
         assertFalse("already demoted", f.st.demote());
         assertTrue("the first demotion's release is still owed", f.st.isMappingReleasePending());
+    }
+
+    public void testASecondFullPeriodAfterADemotionIsReleasedByItsDemote() throws Exception {
+        // Demote, release, promote, demote: the second demotion owes a release of its own, and the one-shot flags of the
+        // first period must not swallow it.
+        Fixture f = new Fixture();
+        f.goFull();
+        assertTrue(f.st.demote());
+        f.runCleanupOnce();
+        assertFirstPeriodReleased(f);
+
+        IndexInput second = f.startSecondPeriod();
+
+        assertTrue(f.st.demote());
+        f.runCleanupOnce();
+        assertSecondPeriodReleased(f, second);
+        assertNull("a demoted family drops its whole file from the cache", f.fileCache.get(f.path));
+    }
+
+    public void testASecondFullPeriodAfterADemotionIsReleasedByItsClose() throws Exception {
+        // Demote, release, promote, close: the close releases the second period's budget and mapping.
+        Fixture f = new Fixture();
+        f.goFull();
+        assertTrue(f.st.demote());
+        f.runCleanupOnce();
+        assertFirstPeriodReleased(f);
+
+        IndexInput second = f.startSecondPeriod();
+
+        f.st.closeFamily();
+        assertEquals("budget held until the cleanup", 1, f.budgetReleases.get());
+        f.runCleanupOnce();
+        assertSecondPeriodReleased(f, second);
+        assertEquals(FullFileState.State.CLOSED, f.st.state());
+        assertEquals(
+            "a closed family leaves the entry, unreferenced, to the directory's close",
+            Integer.valueOf(0),
+            f.fileCache.getRef(f.path)
+        );
+    }
+
+    private static void assertFirstPeriodReleased(Fixture f) throws Exception {
+        assertTrue(f.st.cleanupDone());
+        assertEquals(1, f.budgetReleases.get());
+        assertEquals(1, f.cleanupsDone.get());
+        verify(f.master).close();
+        assertNull(f.st.localMaster());
+        assertFalse(f.st.isMappingReleasePending());
+        assertEquals(FullFileState.State.BLOCK, f.st.state());
+    }
+
+    private static void assertSecondPeriodReleased(Fixture f, IndexInput second) throws Exception {
+        assertTrue("the second release ran", f.st.cleanupDone());
+        assertEquals("the second period's budget was released", 2, f.budgetReleases.get());
+        assertEquals(2, f.cleanupsDone.get());
+        verify(second).close();
+        assertNull(f.st.localMaster());
+        assertFalse(f.st.isMappingReleasePending());
     }
 
     public void testConcurrentRestoreAndCloseNeverLoseTheMappingRelease() throws Exception {

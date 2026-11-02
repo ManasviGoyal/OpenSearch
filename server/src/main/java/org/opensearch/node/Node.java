@@ -980,14 +980,11 @@ public class Node implements Closeable {
             // Initialize tiered storage prefetch settings
             final TieredStoragePrefetchSettings tieredStoragePrefetchSettings;
             final Supplier<TieredStoragePrefetchSettings> tieredStoragePrefetchSettingsSupplier;
-            final WarmFullFileSettings warmFullFileSettings;
-            final Supplier<WarmFullFileSettings> warmFullFileSettingsSupplier;
             final WarmFullFileManager warmFullFileManager;
             if (FeatureFlags.isEnabled(FeatureFlags.WRITABLE_WARM_INDEX_EXPERIMENTAL_FLAG)) {
                 tieredStoragePrefetchSettings = new TieredStoragePrefetchSettings(clusterService.getClusterSettings());
                 tieredStoragePrefetchSettingsSupplier = () -> tieredStoragePrefetchSettings;
-                warmFullFileSettings = new WarmFullFileSettings(clusterService.getClusterSettings());
-                warmFullFileSettingsSupplier = () -> warmFullFileSettings;
+                final WarmFullFileSettings warmFullFileSettings = new WarmFullFileSettings(clusterService.getClusterSettings());
                 // Only warm nodes have a FileCache (fileCache() is null otherwise, e.g. cluster-manager-only or data-only
                 // nodes). Without one there is nothing to promote into; TieredDirectory and the wrapper treat a null
                 // manager as "feature off".
@@ -998,8 +995,7 @@ public class Node implements Closeable {
                         nodeFileCache,
                         threadPool.executor(ThreadPool.Names.GENERIC),
                         threadPool::relativeTimeInMillis,
-                        OpenSearchExecutors.allocatedProcessors(settings),
-                        (task, delayMillis) -> threadPool.schedule(task, TimeValue.timeValueMillis(delayMillis), ThreadPool.Names.GENERIC)
+                        OpenSearchExecutors.allocatedProcessors(settings)
                     );
                 if (warmFullFileManager != null) {
                     warmFullFileSettings.addListener(warmFullFileManager::onExtensionsChanged);
@@ -1007,8 +1003,6 @@ public class Node implements Closeable {
             } else {
                 tieredStoragePrefetchSettings = null;
                 tieredStoragePrefetchSettingsSupplier = () -> null;
-                warmFullFileSettings = null;
-                warmFullFileSettingsSupplier = () -> null;
                 warmFullFileManager = null;
             }
 
@@ -1053,7 +1047,7 @@ public class Node implements Closeable {
             if (FeatureFlags.isEnabled(FeatureFlags.WRITABLE_WARM_INDEX_EXPERIMENTAL_FLAG)) {
                 compositeDirectoryFactories.put(
                     TieringUtils.TIERED_COMPOSITE_INDEX_TYPE,
-                    new TieredDirectoryFactory(tieredStoragePrefetchSettingsSupplier, warmFullFileSettingsSupplier, warmFullFileManager)
+                    new TieredDirectoryFactory(tieredStoragePrefetchSettingsSupplier, warmFullFileManager)
                 );
             }
             final Map<String, org.opensearch.index.store.DataFormatAwareStoreDirectoryFactory> dataFormatAwareStoreDirectoryFactories =

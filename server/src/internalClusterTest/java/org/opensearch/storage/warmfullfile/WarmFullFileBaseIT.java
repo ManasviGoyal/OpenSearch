@@ -6,7 +6,7 @@
  * compatible open source license.
  */
 
-package org.opensearch.storage;
+package org.opensearch.storage.warmfullfile;
 
 import com.carrotsearch.randomizedtesting.annotations.ThreadLeakFilters;
 
@@ -37,10 +37,8 @@ import org.opensearch.indices.IndicesService;
 import org.opensearch.node.Node;
 import org.opensearch.remotestore.RemoteStoreBaseIntegTestCase;
 import org.opensearch.storage.directory.TieredDirectory;
+import org.opensearch.storage.indexinput.PromotableCachedSwitchableIndexInput;
 import org.opensearch.storage.utils.DirectoryUtils;
-import org.opensearch.storage.warmfullfile.FullFileState;
-import org.opensearch.storage.warmfullfile.WarmFullFileManager;
-import org.opensearch.storage.warmfullfile.WarmFullFileSettings;
 import org.opensearch.test.InternalTestCluster;
 import org.opensearch.test.OpenSearchIntegTestCase;
 
@@ -302,7 +300,7 @@ public abstract class WarmFullFileBaseIT extends RemoteStoreBaseIntegTestCase {
 
     /** The whole-file budget of one cache segment on the warm node: half of the cache capacity per segment. */
     protected static long perSegmentBudget(WarmShard warmShard) {
-        return warmShard.manager.stats().perSegmentBudgetBytes();
+        return warmShard.manager.perSegmentBudgetBytes();
     }
 
     /** Asserts a file of the given length exceeds one block and fits the per-segment whole-file budget. */
@@ -362,7 +360,7 @@ public abstract class WarmFullFileBaseIT extends RemoteStoreBaseIntegTestCase {
             return null;
         }
         try {
-            return entry.fullFileState();
+            return entry instanceof PromotableCachedSwitchableIndexInput promotable ? promotable.fullFileState() : null;
         } finally {
             warmShard.fileCache.decRef(key);
         }

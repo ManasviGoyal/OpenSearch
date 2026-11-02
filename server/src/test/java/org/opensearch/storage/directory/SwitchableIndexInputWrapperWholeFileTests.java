@@ -28,7 +28,8 @@ import org.opensearch.index.store.remote.file.CleanerDaemonThreadLeakFilter;
 import org.opensearch.index.store.remote.filecache.FileCache;
 import org.opensearch.index.store.remote.filecache.FileCacheFactory;
 import org.opensearch.index.store.remote.utils.TransferManager;
-import org.opensearch.storage.indexinput.CachedSwitchableIndexInput;
+import org.opensearch.storage.indexinput.PromotableCachedSwitchableIndexInput;
+import org.opensearch.storage.indexinput.PromotableSwitchableIndexInputWrapper;
 import org.opensearch.storage.indexinput.SwitchableIndexInput;
 import org.opensearch.storage.indexinput.SwitchableIndexInputWrapper;
 import org.opensearch.storage.prefetch.TieredStoragePrefetchSettings;
@@ -154,7 +155,7 @@ public class SwitchableIndexInputWrapperWholeFileTests extends TieredStorageBase
 
     /** A manager whose setting lists the fixture file's extension, so eligible handles trigger. */
     private WarmFullFileManager manager(Executor executor, AtomicLong clock) {
-        WarmFullFileManager manager = new WarmFullFileManager(fileCache, executor, clock::get, 8, (task, delayMillis) -> {});
+        WarmFullFileManager manager = new WarmFullFileManager(fileCache, executor, clock::get, 8);
         manager.onExtensionsChanged(Set.of(WarmFullFileSettings.extensionOf(FILE_NAME)));
         return manager;
     }
@@ -175,9 +176,8 @@ public class SwitchableIndexInputWrapperWholeFileTests extends TieredStorageBase
     }
 
     private void makeFull(FullFileState st, IndexInput master) {
-        assertTrue(st.compareAndSetLocalMaster(null, master));
-        assertTrue(st.casState(FullFileState.State.BLOCK, FullFileState.State.PROMOTING));
-        assertTrue(st.casState(FullFileState.State.PROMOTING, FullFileState.State.FULL));
+        assertTrue(st.onAccess(0));
+        assertEquals(FullFileState.Completion.FULL, st.completePromotion(master, null, () -> {}, () -> {}, () -> {}));
     }
 
     // ---------------- Trigger ----------------
@@ -186,7 +186,7 @@ public class SwitchableIndexInputWrapperWholeFileTests extends TieredStorageBase
         SwitchableIndexInput in = remoteModeInput();
         FullFileState st = stateFor(in);
         RecordingExecutor exec = new RecordingExecutor();
-        SwitchableIndexInputWrapper handle = new SwitchableIndexInputWrapper("h", in, st, true, manager(exec, new AtomicLong()));
+        SwitchableIndexInputWrapper handle = new PromotableSwitchableIndexInputWrapper("h", in, st, manager(exec, new AtomicLong()));
 
         IndexInput c1 = handle.clone();
         assertEquals(FullFileState.State.PROMOTING, st.state());
@@ -202,7 +202,7 @@ public class SwitchableIndexInputWrapperWholeFileTests extends TieredStorageBase
         SwitchableIndexInput in = remoteModeInput();
         FullFileState st = stateFor(in);
         RecordingExecutor exec = new RecordingExecutor();
-        SwitchableIndexInputWrapper handle = new SwitchableIndexInputWrapper("h", in, st, true, manager(exec, new AtomicLong()));
+        SwitchableIndexInputWrapper handle = new PromotableSwitchableIndexInputWrapper("h", in, st, manager(exec, new AtomicLong()));
 
         IndexInput s = handle.slice("s", 0, Math.min(16, in.length()));
         assertEquals(1, exec.submitted.get());
@@ -214,7 +214,7 @@ public class SwitchableIndexInputWrapperWholeFileTests extends TieredStorageBase
         SwitchableIndexInput in = remoteModeInput();
         FullFileState st = stateFor(in);
         RecordingExecutor exec = new RecordingExecutor();
-        SwitchableIndexInputWrapper handle = new SwitchableIndexInputWrapper("h", in, st, true, manager(exec, new AtomicLong()));
+        SwitchableIndexInputWrapper handle = new PromotableSwitchableIndexInputWrapper("h", in, st, manager(exec, new AtomicLong()));
 
         int threads = 8;
         CountDownLatch start = new CountDownLatch(1);
@@ -254,7 +254,7 @@ public class SwitchableIndexInputWrapperWholeFileTests extends TieredStorageBase
             FullFileState st = stateFor(in, countingTm, nio);
             AtomicLong clock = new AtomicLong(0);
             WarmFullFileManager mgr = manager(Runnable::run, clock);
-            SwitchableIndexInputWrapper handle = new SwitchableIndexInputWrapper("h", in, st, true, mgr);
+            SwitchableIndexInputWrapper handle = new PromotableSwitchableIndexInputWrapper("h", in, st, mgr);
 
             IndexInput first = handle.clone(); // triggers the one and only attempt
             assertBusy(() -> assertEquals(Long.MAX_VALUE, st.retryAt()), 30, TimeUnit.SECONDS);
@@ -276,7 +276,7 @@ public class SwitchableIndexInputWrapperWholeFileTests extends TieredStorageBase
         // Non-warm nodes have no FileCache, so Node builds no manager. An eligible handle must still work on blocks.
         SwitchableIndexInput in = remoteModeInput();
         FullFileState st = stateFor(in);
-        SwitchableIndexInputWrapper handle = new SwitchableIndexInputWrapper("h", in, st, true, null);
+        SwitchableIndexInputWrapper handle = new PromotableSwitchableIndexInputWrapper("h", in, st, null);
 
         IndexInput c = handle.clone();
         IndexInput s = handle.slice("s", 0, Math.min(16, in.length()));
@@ -294,7 +294,7 @@ public class SwitchableIndexInputWrapperWholeFileTests extends TieredStorageBase
         SwitchableIndexInput in = remoteModeInput();
         FullFileState st = stateFor(in);
         RecordingExecutor exec = new RecordingExecutor();
-        SwitchableIndexInputWrapper handle = new SwitchableIndexInputWrapper("h", in, st, true, manager(exec, new AtomicLong()));
+        SwitchableIndexInputWrapper handle = new PromotableSwitchableIndexInputWrapper("h", in, st, manager(exec, new AtomicLong()));
         st.closeFamily();
 
         IndexInput c = handle.clone();
@@ -313,7 +313,7 @@ public class SwitchableIndexInputWrapperWholeFileTests extends TieredStorageBase
         SwitchableIndexInput in = newInput(false, transferManager); // local mode: the file has not been uploaded yet
         FullFileState st = stateFor(in);
         RecordingExecutor exec = new RecordingExecutor();
-        SwitchableIndexInputWrapper handle = new SwitchableIndexInputWrapper("h", in, st, true, manager(exec, new AtomicLong()));
+        SwitchableIndexInputWrapper handle = new PromotableSwitchableIndexInputWrapper("h", in, st, manager(exec, new AtomicLong()));
 
         IndexInput localClone = handle.clone();
         IndexInput localSlice = handle.slice("s", 0, Math.min(16, in.length()));
@@ -337,17 +337,19 @@ public class SwitchableIndexInputWrapperWholeFileTests extends TieredStorageBase
         IOUtils.close(localClone, localSlice, switchedClone, remoteClone, handle);
     }
 
-    @TestLogging(value = "org.opensearch.storage.indexinput.SwitchableIndexInputWrapper:DEBUG", reason = "request line is DEBUG")
+    @TestLogging(value = "org.opensearch.storage.indexinput.PromotableSwitchableIndexInputWrapper:DEBUG", reason = "request line is DEBUG")
     public void testTriggerLogsOneRequestWithTheThreadName() throws Exception {
         syncLocalAndRemoteForFile(localDirectory, FILE_NAME);
         SwitchableIndexInput in = newInput(true, transferManager);
         FullFileState st = stateFor(in);
         RecordingExecutor exec = new RecordingExecutor();
-        SwitchableIndexInputWrapper handle = new SwitchableIndexInputWrapper("h", in, st, true, manager(exec, new AtomicLong()));
-        String loggerName = SwitchableIndexInputWrapper.class.getName();
+        SwitchableIndexInputWrapper handle = new PromotableSwitchableIndexInputWrapper("h", in, st, manager(exec, new AtomicLong()));
+        String loggerName = PromotableSwitchableIndexInputWrapper.class.getName();
         String expected = "whole-file promotion requested for h on thread [" + Thread.currentThread().getName() + "]";
         AtomicInteger seen = new AtomicInteger();
-        try (MockLogAppender appender = MockLogAppender.createForLoggers(LogManager.getLogger(SwitchableIndexInputWrapper.class))) {
+        try (
+            MockLogAppender appender = MockLogAppender.createForLoggers(LogManager.getLogger(PromotableSwitchableIndexInputWrapper.class))
+        ) {
             appender.addExpectation(new MockLogAppender.LoggingExpectation() {
                 @Override
                 public void match(LogEvent event) {
@@ -378,7 +380,7 @@ public class SwitchableIndexInputWrapperWholeFileTests extends TieredStorageBase
         SwitchableIndexInput in = newInput(true, transferManager);
         FullFileState st = stateFor(in);
         RecordingExecutor exec = new RecordingExecutor();
-        SwitchableIndexInputWrapper handle = new SwitchableIndexInputWrapper("h", in, st, true, manager(exec, new AtomicLong()));
+        SwitchableIndexInputWrapper handle = new PromotableSwitchableIndexInputWrapper("h", in, st, manager(exec, new AtomicLong()));
 
         // The same clone and slice calls a merge makes, on a thread named the way OpenSearch names merge threads.
         Queue<IndexInput> mergeInputs = new ConcurrentLinkedQueue<>();
@@ -399,26 +401,14 @@ public class SwitchableIndexInputWrapperWholeFileTests extends TieredStorageBase
         IOUtils.close(searchClone, handle);
     }
 
-    public void testIneligibleHandleNeverRequests() throws IOException {
-        SwitchableIndexInput in = remoteModeInput();
-        FullFileState st = stateFor(in);
-        RecordingExecutor exec = new RecordingExecutor();
-        SwitchableIndexInputWrapper handle = new SwitchableIndexInputWrapper("h", in, st, false, manager(exec, new AtomicLong()));
-
-        IndexInput c = handle.clone();
-        IndexInput s = handle.slice("s", 0, Math.min(16, in.length()));
-        assertEquals(0, exec.submitted.get());
-        assertEquals(FullFileState.State.BLOCK, st.state());
-        IOUtils.close(c, s, handle);
-    }
-
     public void testNoRequestBeforeRetryAt() throws IOException {
         SwitchableIndexInput in = remoteModeInput();
         FullFileState st = stateFor(in);
         AtomicLong clock = new AtomicLong(1_000);
-        st.setRetryAt(5_000);
+        assertTrue(st.onAccess(0));
+        assertTrue(st.abandonPromotion(5_000));
         RecordingExecutor exec = new RecordingExecutor();
-        SwitchableIndexInputWrapper handle = new SwitchableIndexInputWrapper("h", in, st, true, manager(exec, clock));
+        SwitchableIndexInputWrapper handle = new PromotableSwitchableIndexInputWrapper("h", in, st, manager(exec, clock));
 
         IndexInput early = handle.clone();
         assertEquals("before retryAt", 0, exec.submitted.get());
@@ -432,7 +422,7 @@ public class SwitchableIndexInputWrapperWholeFileTests extends TieredStorageBase
         SwitchableIndexInput in = remoteModeInput();
         FullFileState st = stateFor(in);
         RecordingExecutor exec = new RecordingExecutor();
-        SwitchableIndexInputWrapper handle = new SwitchableIndexInputWrapper("h", in, st, true, manager(exec, new AtomicLong()));
+        SwitchableIndexInputWrapper handle = new PromotableSwitchableIndexInputWrapper("h", in, st, manager(exec, new AtomicLong()));
         IndexInput master = openMaster(in.length());
         makeFull(st, master);
 
@@ -446,7 +436,7 @@ public class SwitchableIndexInputWrapperWholeFileTests extends TieredStorageBase
         SwitchableIndexInput in = remoteModeInput();
         FullFileState st = stateFor(in);
         Executor rejecting = command -> { throw new RejectedExecutionException("full"); };
-        SwitchableIndexInputWrapper handle = new SwitchableIndexInputWrapper("h", in, st, true, manager(rejecting, new AtomicLong()));
+        SwitchableIndexInputWrapper handle = new PromotableSwitchableIndexInputWrapper("h", in, st, manager(rejecting, new AtomicLong()));
 
         IndexInput c = handle.clone();
         assertEquals(FullFileState.State.BLOCK, st.state());
@@ -461,11 +451,10 @@ public class SwitchableIndexInputWrapperWholeFileTests extends TieredStorageBase
         long len = in.length();
         assumeTrue("need a few bytes to test", len >= 8);
         FullFileState st = stateFor(in);
-        SwitchableIndexInputWrapper handle = new SwitchableIndexInputWrapper(
+        SwitchableIndexInputWrapper handle = new PromotableSwitchableIndexInputWrapper(
             "h",
             in,
             st,
-            true,
             manager(new RecordingExecutor(), new AtomicLong())
         );
         IndexInput master = openMaster(len);
@@ -493,11 +482,10 @@ public class SwitchableIndexInputWrapperWholeFileTests extends TieredStorageBase
         long len = in.length();
         assumeTrue("need room for nested slices", len >= 16);
         FullFileState st = stateFor(in);
-        SwitchableIndexInputWrapper handle = new SwitchableIndexInputWrapper(
+        SwitchableIndexInputWrapper handle = new PromotableSwitchableIndexInputWrapper(
             "h",
             in,
             st,
-            true,
             manager(new RecordingExecutor(), new AtomicLong())
         );
         IndexInput master = openMaster(len);
@@ -527,13 +515,8 @@ public class SwitchableIndexInputWrapperWholeFileTests extends TieredStorageBase
         SwitchableIndexInput in = remoteModeInput();
         long len = in.length();
         FullFileState st = stateFor(in);
-        SwitchableIndexInputWrapper handle = new SwitchableIndexInputWrapper(
-            "h",
-            in,
-            st,
-            false,
-            manager(new RecordingExecutor(), new AtomicLong())
-        );
+        // No manager: the clone below must not trigger, so the test can move the state to FULL by hand.
+        SwitchableIndexInputWrapper handle = new PromotableSwitchableIndexInputWrapper("h", in, st, null);
 
         IndexInput before = handle.clone();
         IndexInput master = openMaster(len);
@@ -586,11 +569,10 @@ public class SwitchableIndexInputWrapperWholeFileTests extends TieredStorageBase
         long len = in.length();
         assumeTrue("fixture must hold the typed header", len >= 128);
         FullFileState st = stateFor(in);
-        SwitchableIndexInputWrapper handle = new SwitchableIndexInputWrapper(
+        SwitchableIndexInputWrapper handle = new PromotableSwitchableIndexInputWrapper(
             "h",
             in,
             st,
-            true,
             manager(new RecordingExecutor(), new AtomicLong())
         );
         long[] p = writeTypedMaster("typed.bin", len);
@@ -642,11 +624,10 @@ public class SwitchableIndexInputWrapperWholeFileTests extends TieredStorageBase
         long len = in.length();
         assumeTrue("need a few bytes", len >= 64);
         FullFileState st = stateFor(in);
-        SwitchableIndexInputWrapper handle = new SwitchableIndexInputWrapper(
+        SwitchableIndexInputWrapper handle = new PromotableSwitchableIndexInputWrapper(
             "h",
             in,
             st,
-            true,
             manager(new RecordingExecutor(), new AtomicLong())
         );
         // FSDirectory.open on a 64-bit JVM is an MMapDirectory, so the master is a real mmap input.
@@ -694,11 +675,10 @@ public class SwitchableIndexInputWrapperWholeFileTests extends TieredStorageBase
         long len = in.length();
         assumeTrue("need room for a sub-window", len >= 64);
         FullFileState st = stateFor(in);
-        SwitchableIndexInputWrapper handle = new SwitchableIndexInputWrapper(
+        SwitchableIndexInputWrapper handle = new PromotableSwitchableIndexInputWrapper(
             "h",
             in,
             st,
-            true,
             manager(new RecordingExecutor(), new AtomicLong())
         );
         IndexInput master = openMaster(len);
@@ -720,8 +700,8 @@ public class SwitchableIndexInputWrapperWholeFileTests extends TieredStorageBase
         long len = in.length();
         assumeTrue("need room for a sub-window", len >= 64);
         FullFileState st = stateFor(in);
-        WarmFullFileManager mgr = manager(new RecordingExecutor(), new AtomicLong());
-        SwitchableIndexInputWrapper handle = new SwitchableIndexInputWrapper("h", in, st, false, mgr);
+        // No manager: the slice below must not trigger, so the test can move the state to FULL by hand.
+        SwitchableIndexInputWrapper handle = new PromotableSwitchableIndexInputWrapper("h", in, st, null);
 
         // Take a block slice BEFORE FULL (a wrapper over a 16-byte sub-window), then go FULL.
         IndexInput window = handle.slice("w", 8, 16);
@@ -746,15 +726,9 @@ public class SwitchableIndexInputWrapperWholeFileTests extends TieredStorageBase
         FullFileState st = stateFor(in);
         // Production constructor with 1 processor: 1 segment (budget = half the cache) and 1 slot. promote() runs inline
         // on the calling thread; the download itself runs on the REMOTE_RECOVERY pool inside fetchBlobAsync.
-        WarmFullFileManager realManager = new WarmFullFileManager(
-            fileCache,
-            Runnable::run,
-            threadPool::relativeTimeInMillis,
-            1,
-            (task, delayMillis) -> {}
-        );
+        WarmFullFileManager realManager = new WarmFullFileManager(fileCache, Runnable::run, threadPool::relativeTimeInMillis, 1);
         realManager.onExtensionsChanged(Set.of(WarmFullFileSettings.extensionOf(FILE_NAME)));
-        SwitchableIndexInputWrapper handle = new SwitchableIndexInputWrapper("h", in, st, true, realManager);
+        SwitchableIndexInputWrapper handle = new PromotableSwitchableIndexInputWrapper("h", in, st, realManager);
 
         // First clone: still blocks, and it starts the real promotion.
         IndexInput first = handle.clone();
@@ -821,7 +795,7 @@ public class SwitchableIndexInputWrapperWholeFileTests extends TieredStorageBase
         FullFileState st = stateFor(in);
         RecordingExecutor exec = new RecordingExecutor();
         WarmFullFileManager manager = manager(exec, new AtomicLong());
-        SwitchableIndexInputWrapper handle = new SwitchableIndexInputWrapper("h", in, st, true, manager);
+        SwitchableIndexInputWrapper handle = new PromotableSwitchableIndexInputWrapper("h", in, st, manager);
 
         manager.onExtensionsChanged(Set.of());
         IndexInput off = handle.clone();
@@ -842,7 +816,7 @@ public class SwitchableIndexInputWrapperWholeFileTests extends TieredStorageBase
         Path switchKey = getFilePathSwitchable(localDirectory, FILE_NAME);
         Path fullPath = getFilePath(localDirectory, FILE_NAME);
         byte[] content = footeredContent();
-        CachedSwitchableIndexInput entry = new CachedSwitchableIndexInput(
+        PromotableCachedSwitchableIndexInput entry = new PromotableCachedSwitchableIndexInput(
             fileCache,
             FILE_NAME,
             localDirectory,
@@ -860,34 +834,36 @@ public class SwitchableIndexInputWrapperWholeFileTests extends TieredStorageBase
             fileCache,
             threadPool.executor(ThreadPool.Names.REMOTE_RECOVERY),
             threadPool::relativeTimeInMillis,
-            1,
-            (task, delayMillis) -> {}
+            1
         );
         realManager.onExtensionsChanged(Set.of(WarmFullFileSettings.extensionOf(FILE_NAME)));
-        SwitchableIndexInputWrapper handle = new SwitchableIndexInputWrapper(
+        SwitchableIndexInputWrapper handle = new PromotableSwitchableIndexInputWrapper(
             "h",
             (SwitchableIndexInput) entry.getIndexInput().clone(),
             st,
-            true,
             realManager
         );
         handle.clone(); // trigger
         assertBusy(() -> assertEquals(FullFileState.State.FULL, st.state()), 30, TimeUnit.SECONDS);
         IndexInput view = handle.clone();
         assertTrue(view instanceof MemorySegmentAccessInput);
-        long requestedBefore = realManager.stats().requested();
+        long requestedBefore = realManager.counters().get("requested").longValue();
 
         realManager.onExtensionsChanged(Set.of());
 
         assertEquals(FullFileState.State.BLOCK, st.state());
-        assertEquals(1L, realManager.stats().demoted());
+        assertEquals(1L, realManager.counters().get("demoted").longValue());
         assertTrue("release waits for the open handle", st.isMappingReleasePending());
         IndexInput block = handle.clone();
         assertTrue("new clones read blocks", block instanceof SwitchableIndexInputWrapper);
-        assertEquals("no promotion requested while the old mapping is held", requestedBefore, realManager.stats().requested());
+        assertEquals(
+            "no promotion requested while the old mapping is held",
+            requestedBefore,
+            realManager.counters().get("requested").longValue()
+        );
         assertEquals("the open view keeps reading", 0, view.readByte());
         assertEquals("the family still holds its reference", Integer.valueOf(1), fileCache.getRef(fullPath));
-        assertEquals(content.length, realManager.stats().reservedBytes());
+        assertEquals(content.length, realManager.counters().get("reservedBytes").longValue());
 
         block.close();
         handle.close();
@@ -895,20 +871,19 @@ public class SwitchableIndexInputWrapperWholeFileTests extends TieredStorageBase
         assertNull("mapping released", st.localMaster());
         assertNull("whole file dropped from the cache", fileCache.getRef(fullPath));
         assertFalse(Files.exists(fullPath));
-        assertEquals("budget released", 0L, realManager.stats().reservedBytes());
+        assertEquals("budget released", 0L, realManager.counters().get("reservedBytes").longValue());
         assertFalse(st.isMappingReleasePending());
 
         realManager.onExtensionsChanged(Set.of(WarmFullFileSettings.extensionOf(FILE_NAME)));
-        SwitchableIndexInputWrapper again = new SwitchableIndexInputWrapper(
+        SwitchableIndexInputWrapper again = new PromotableSwitchableIndexInputWrapper(
             "h2",
             (SwitchableIndexInput) entry.getIndexInput().clone(),
             st,
-            true,
             realManager
         );
         again.clone(); // trigger
         assertBusy(() -> assertEquals(FullFileState.State.FULL, st.state()), 30, TimeUnit.SECONDS);
-        assertEquals(2L, realManager.stats().promoted());
+        assertEquals(2L, realManager.counters().get("promoted").longValue());
         IndexInput viewAgain = again.clone();
         assertTrue(viewAgain instanceof MemorySegmentAccessInput);
         IOUtils.close(viewAgain, again);
@@ -922,7 +897,7 @@ public class SwitchableIndexInputWrapperWholeFileTests extends TieredStorageBase
         // no download and no new promotion request.
         Path switchKey = getFilePathSwitchable(localDirectory, FILE_NAME);
         byte[] content = footeredContent();
-        CachedSwitchableIndexInput entry = new CachedSwitchableIndexInput(
+        PromotableCachedSwitchableIndexInput entry = new PromotableCachedSwitchableIndexInput(
             fileCache,
             FILE_NAME,
             localDirectory,
@@ -940,21 +915,19 @@ public class SwitchableIndexInputWrapperWholeFileTests extends TieredStorageBase
             fileCache,
             threadPool.executor(ThreadPool.Names.REMOTE_RECOVERY),
             threadPool::relativeTimeInMillis,
-            1,
-            (task, delayMillis) -> {}
+            1
         );
         realManager.onExtensionsChanged(Set.of(WarmFullFileSettings.extensionOf(FILE_NAME)));
-        SwitchableIndexInputWrapper handle = new SwitchableIndexInputWrapper(
+        SwitchableIndexInputWrapper handle = new PromotableSwitchableIndexInputWrapper(
             "h",
             (SwitchableIndexInput) entry.getIndexInput().clone(),
             st,
-            true,
             realManager
         );
         handle.clone(); // trigger
         assertBusy(() -> assertEquals(FullFileState.State.FULL, st.state()), 30, TimeUnit.SECONDS);
         IndexInput master = st.localMaster();
-        long requestedBefore = realManager.stats().requested();
+        long requestedBefore = realManager.counters().get("requested").longValue();
 
         realManager.onExtensionsChanged(Set.of());
         IndexInput block = handle.clone();
@@ -967,10 +940,10 @@ public class SwitchableIndexInputWrapperWholeFileTests extends TieredStorageBase
         IndexInput view = handle.clone();
         assertTrue("views again after the restore", view instanceof MemorySegmentAccessInput);
         assertEquals(0, view.readByte());
-        assertEquals("no promotion was requested", requestedBefore, realManager.stats().requested());
-        assertEquals(1L, realManager.stats().promoted());
-        assertEquals(1L, realManager.stats().restored());
-        assertEquals(content.length, realManager.stats().reservedBytes());
+        assertEquals("no promotion was requested", requestedBefore, realManager.counters().get("requested").longValue());
+        assertEquals(1L, realManager.counters().get("promoted").longValue());
+        assertEquals(1L, realManager.counters().get("restored").longValue());
+        assertEquals(content.length, realManager.counters().get("reservedBytes").longValue());
 
         IOUtils.close(view, block, handle);
         fileCache.remove(switchKey);
@@ -982,7 +955,7 @@ public class SwitchableIndexInputWrapperWholeFileTests extends TieredStorageBase
         Path fullPath = getFilePath(localDirectory, FILE_NAME);
         byte[] content = footeredContent();
         // The family's cache entry, as TieredDirectory.cacheFile creates it.
-        CachedSwitchableIndexInput entry = new CachedSwitchableIndexInput(
+        PromotableCachedSwitchableIndexInput entry = new PromotableCachedSwitchableIndexInput(
             fileCache,
             FILE_NAME,
             localDirectory,
@@ -1001,15 +974,13 @@ public class SwitchableIndexInputWrapperWholeFileTests extends TieredStorageBase
             fileCache,
             threadPool.executor(ThreadPool.Names.REMOTE_RECOVERY),
             threadPool::relativeTimeInMillis,
-            1,
-            (task, delayMillis) -> {}
+            1
         );
         realManager.onExtensionsChanged(Set.of(WarmFullFileSettings.extensionOf(FILE_NAME)));
-        SwitchableIndexInputWrapper handle = new SwitchableIndexInputWrapper(
+        SwitchableIndexInputWrapper handle = new PromotableSwitchableIndexInputWrapper(
             "h",
             (SwitchableIndexInput) entry.getIndexInput().clone(),
             st,
-            true,
             realManager
         );
 
@@ -1047,7 +1018,7 @@ public class SwitchableIndexInputWrapperWholeFileTests extends TieredStorageBase
     public void testFamilyClosedWithoutHandlesCleansUpOnPoolNotOnRemovingThread() throws Exception {
         Path switchKey = getFilePathSwitchable(localDirectory, FILE_NAME);
         byte[] content = footeredContent();
-        CachedSwitchableIndexInput entry = new CachedSwitchableIndexInput(
+        PromotableCachedSwitchableIndexInput entry = new PromotableCachedSwitchableIndexInput(
             fileCache,
             FILE_NAME,
             localDirectory,
@@ -1071,19 +1042,12 @@ public class SwitchableIndexInputWrapperWholeFileTests extends TieredStorageBase
                 threadPool.executor(ThreadPool.Names.REMOTE_RECOVERY).execute(command);
             }
         };
-        WarmFullFileManager realManager = new WarmFullFileManager(
-            fileCache,
-            exec,
-            threadPool::relativeTimeInMillis,
-            1,
-            (task, delayMillis) -> {}
-        );
+        WarmFullFileManager realManager = new WarmFullFileManager(fileCache, exec, threadPool::relativeTimeInMillis, 1);
         realManager.onExtensionsChanged(Set.of(WarmFullFileSettings.extensionOf(FILE_NAME)));
-        SwitchableIndexInputWrapper handle = new SwitchableIndexInputWrapper(
+        SwitchableIndexInputWrapper handle = new PromotableSwitchableIndexInputWrapper(
             "h",
             (SwitchableIndexInput) entry.getIndexInput().clone(),
             st,
-            true,
             realManager
         );
         handle.clone();
@@ -1137,7 +1101,12 @@ public class SwitchableIndexInputWrapperWholeFileTests extends TieredStorageBase
         FullFileState st = stateFor(in, positionAware, localDirectory);
         ExecutorService promoter = Executors.newSingleThreadExecutor(r -> new Thread(r, promotionThread));
         try {
-            SwitchableIndexInputWrapper handle = new SwitchableIndexInputWrapper("h", in, st, true, manager(promoter, new AtomicLong()));
+            SwitchableIndexInputWrapper handle = new PromotableSwitchableIndexInputWrapper(
+                "h",
+                in,
+                st,
+                manager(promoter, new AtomicLong())
+            );
 
             final int threads = 8;
             AtomicBoolean stop = new AtomicBoolean(false);
@@ -1259,11 +1228,10 @@ public class SwitchableIndexInputWrapperWholeFileTests extends TieredStorageBase
     public void testOpenedHandleHoldsOneCountReleasedOnceOnClose() throws IOException {
         SwitchableIndexInput in = remoteModeInput();
         FullFileState st = stateFor(in);
-        SwitchableIndexInputWrapper handle = new SwitchableIndexInputWrapper(
+        SwitchableIndexInputWrapper handle = new PromotableSwitchableIndexInputWrapper(
             "h",
             in,
             st,
-            true,
             manager(new RecordingExecutor(), new AtomicLong())
         );
         assertEquals(1, st.handleCount());

@@ -6,7 +6,7 @@
  * compatible open source license.
  */
 
-package org.opensearch.storage;
+package org.opensearch.storage.warmfullfile;
 
 import org.apache.lucene.store.AlreadyClosedException;
 import org.opensearch.action.NoShardAvailableActionException;
@@ -32,8 +32,6 @@ import org.opensearch.indices.ShardLimitValidator;
 import org.opensearch.search.SearchContextMissingException;
 import org.opensearch.search.SearchHit;
 import org.opensearch.search.sort.SortOrder;
-import org.opensearch.storage.warmfullfile.FullFileState;
-import org.opensearch.storage.warmfullfile.WarmFullFileStats;
 import org.opensearch.test.InternalTestCluster;
 
 import java.nio.file.Files;
@@ -41,6 +39,7 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.CountDownLatch;
@@ -153,9 +152,10 @@ public class WarmFullFileIT extends WarmFullFileBaseIT {
         };
     }
 
-    public void testEnablingExtensionsAfterOpenPromotesWithoutReopen() throws Exception {
-        // The reader's handles are opened while the setting is empty. Adding the extension afterwards is enough: the
-        // next search promotes, with no index close/open.
+    public void testEnablingExtensionsAfterOpenAppliesOnReopen() throws Exception {
+        // The reader's handles are opened while the setting is empty, so their files have the existing entries, which
+        // cannot promote. Listing the extension afterwards applies to families created from then on: a reopen drops the
+        // entries, and the next search promotes.
         String warmNode = startCluster();
         createWarmIndex(INDEX_NAME);
         populateAndMergeToBlocks(INDEX_NAME, warmShard(INDEX_NAME, warmNode));
@@ -163,12 +163,16 @@ public class WarmFullFileIT extends WarmFullFileBaseIT {
         WarmShard warmShard = warmShard(INDEX_NAME, warmNode);
         waitForBlockMode(warmShard);
         String fdt = eligibleFdt(warmShard);
+        setFullFileExtensions(FDT_EXTENSION);
         for (int i = 0; i < 5; i++) {
             searchWithSource(INDEX_NAME);
-            assertEquals("nothing promotes while the setting is empty", FullFileState.State.BLOCK, stateOf(warmShard, fdt));
+            assertNull("the entry created while the setting was empty carries no family", stateOf(warmShard, fdt));
+            assertFalse(isPromoted(warmShard, fdt));
         }
 
-        setFullFileExtensions(FDT_EXTENSION);
+        reopenIndex(INDEX_NAME);
+        warmShard = warmShard(INDEX_NAME, warmNode);
+        waitForBlockMode(warmShard);
         searchUntilPromoted(INDEX_NAME, warmShard, fdt);
         assertEquals(FullFileState.State.FULL, stateOf(warmShard, fdt));
 
@@ -183,7 +187,7 @@ public class WarmFullFileIT extends WarmFullFileBaseIT {
         String fdt = eligibleFdt(warmShard);
         searchUntilPromoted(INDEX_NAME, warmShard, fdt);
         List<String> fingerprint = queryFingerprint(INDEX_NAME);
-        long downloadedBefore = warmShard.manager.stats().downloadedBytes();
+        long downloadedBefore = warmShard.manager.counters().get("downloadedBytes").longValue();
         Path wholeFilePath = warmShard.directory.getFilePath(fdt);
 
         reopenIndex(INDEX_NAME);
@@ -191,12 +195,12 @@ public class WarmFullFileIT extends WarmFullFileBaseIT {
         WarmShard reopened = warmShard(INDEX_NAME, warmNode);
         searchUntilPromoted(INDEX_NAME, reopened, fdt);
 
-        WarmFullFileStats stats = reopened.manager.stats();
-        assertEquals(2L, stats.promoted());
+        Map<String, Long> stats = reopened.manager.counters();
+        assertEquals(2L, stats.get("promoted").longValue());
         assertEquals(
             "the second promotion is handed the finished download; the bytes are counted once more but not fetched",
             downloadedBefore * 2,
-            stats.downloadedBytes()
+            stats.get("downloadedBytes").longValue()
         );
         assertEquals(fingerprint, queryFingerprint(INDEX_NAME));
 
@@ -260,7 +264,7 @@ public class WarmFullFileIT extends WarmFullFileBaseIT {
         for (String fdt : sourceFdts) {
             assertEquals(FullFileState.State.BLOCK, stateOf(warmShard, fdt));
         }
-        WarmFullFileStats before = warmShard.manager.stats();
+        Map<String, Long> before = warmShard.manager.counters();
 
         assertNoFailures(client().admin().indices().prepareForceMerge(INDEX_NAME).setMaxNumSegments(1).get());
         flushAndRefresh(INDEX_NAME);
@@ -270,10 +274,10 @@ public class WarmFullFileIT extends WarmFullFileBaseIT {
         waitForBlockMode(warmShard);
 
         // The merge read both source segments through the open reader but asked for no promotion.
-        WarmFullFileStats after = warmShard.manager.stats();
-        assertEquals("the merge requested a promotion: " + after, before.requested(), after.requested());
-        assertEquals(before.started(), after.started());
-        assertEquals(before.promoted(), after.promoted());
+        Map<String, Long> after = warmShard.manager.counters();
+        assertEquals("the merge requested a promotion: " + after, before.get("requested").longValue(), after.get("requested").longValue());
+        assertEquals(before.get("started").longValue(), after.get("started").longValue());
+        assertEquals(before.get("promoted").longValue(), after.get("promoted").longValue());
         for (String fdt : sourceFdts) {
             assertFalse(
                 fdt + " has a whole-file cache entry",
@@ -287,7 +291,7 @@ public class WarmFullFileIT extends WarmFullFileBaseIT {
 
         // A search promotes the merged file, so the index was eligible all along.
         searchUntilPromoted(INDEX_NAME, warmShard, mergedFdt);
-        assertThat(warmShard.manager.stats().promoted(), greaterThan(before.promoted()));
+        assertThat(warmShard.manager.counters().get("promoted").longValue(), greaterThan(before.get("promoted").longValue()));
 
         deleteIndex(INDEX_NAME);
     }
@@ -383,32 +387,32 @@ public class WarmFullFileIT extends WarmFullFileBaseIT {
         for (int i = 0; i < 20; i++) {
             searchWithSource(SECOND_INDEX_NAME);
             assertFalse("second index promoted with the feature off", isPromoted(second, secondFdt));
-            assertEquals(FullFileState.State.BLOCK, stateOf(second, secondFdt));
+            assertNull("created with the feature off, so its entry carries no family", stateOf(second, secondFdt));
         }
         assertTrue(wholeSegmentFiles(localFiles(second)).isEmpty());
 
         // The already promoted family was demoted by the settings change: it serves blocks again with the same
         // results, and its mapping, whole file and budget are released once the reader's handles close (on reopen).
         assertEquals(FullFileState.State.BLOCK, stateOf(first, firstFdt));
-        assertEquals(1L, first.manager.stats().demoted());
+        assertEquals(1L, first.manager.counters().get("demoted").longValue());
         assertEquals(firstFingerprint, queryFingerprint(INDEX_NAME));
 
         // Listing the extension again while the reader is still open restores the family from the mapping it kept:
         // FULL at once, no download, same results. Then clear it once more before the reopen below.
-        long startedBefore = first.manager.stats().started();
+        long startedBefore = first.manager.counters().get("started").longValue();
         setFullFileExtensions(FDT_EXTENSION);
         assertBusy(() -> assertEquals(FullFileState.State.FULL, stateOf(first, firstFdt)), WAIT_TIMEOUT.seconds(), TimeUnit.SECONDS);
-        assertEquals(1L, first.manager.stats().restored());
-        assertEquals("no download for the restore", startedBefore, first.manager.stats().started());
+        assertEquals(1L, first.manager.counters().get("restored").longValue());
+        assertEquals("no download for the restore", startedBefore, first.manager.counters().get("started").longValue());
         assertEquals(firstFingerprint, queryFingerprint(INDEX_NAME));
         clearFullFileExtensions();
         assertBusy(() -> assertEquals(FullFileState.State.BLOCK, stateOf(first, firstFdt)), WAIT_TIMEOUT.seconds(), TimeUnit.SECONDS);
-        assertEquals(2L, first.manager.stats().demoted());
+        assertEquals(2L, first.manager.counters().get("demoted").longValue());
         reopenIndex(INDEX_NAME);
         WarmShard reopened = warmShard(INDEX_NAME, warmNode);
         assertBusy(() -> {
             assertTrue("whole file released after the reopen: " + localFiles(reopened), wholeSegmentFiles(localFiles(reopened)).isEmpty());
-            assertEquals("budget released", 0L, reopened.manager.stats().reservedBytes());
+            assertEquals("budget released", 0L, reopened.manager.counters().get("reservedBytes").longValue());
         }, DOWNLOAD_TIMEOUT.seconds(), TimeUnit.SECONDS);
         assertEquals(firstFingerprint, queryFingerprint(INDEX_NAME));
 
@@ -423,8 +427,8 @@ public class WarmFullFileIT extends WarmFullFileBaseIT {
         searchUntilPromoted(INDEX_NAME, warmShard, promotedFdt);
         FullFileState promotedFamily = requireFamilyState(warmShard, promotedFdt);
         Path promotedWholeFile = warmShard.directory.getFilePath(promotedFdt);
-        long promotedBefore = warmShard.manager.stats().promoted();
-        assertThat(warmShard.manager.stats().reservedBytes(), greaterThan(0L));
+        long promotedBefore = warmShard.manager.counters().get("promoted").longValue();
+        assertThat(warmShard.manager.counters().get("reservedBytes").longValue(), greaterThan(0L));
 
         // Writes and a flush while the segment is served whole: a second segment appears and the promoted one keeps serving.
         indexDocs(INDEX_NAME, NUM_DOCS, 2 * NUM_DOCS);
@@ -450,7 +454,11 @@ public class WarmFullFileIT extends WarmFullFileBaseIT {
         assertBusy(() -> {
             assertEquals(FullFileState.State.CLOSED, promotedFamily.state());
             assertTrue("mapping of the merged-away segment not released", promotedFamily.cleanupDone());
-            assertEquals("budget of the merged-away segment not released", 0L, warmShard.manager.stats().reservedBytes());
+            assertEquals(
+                "budget of the merged-away segment not released",
+                0L,
+                warmShard.manager.counters().get("reservedBytes").longValue()
+            );
             assertFalse("whole file of the merged-away segment still local", localFiles(warmShard).contains(promotedFdt));
             assertFalse(
                 "whole-file cache entry of the merged-away segment left behind",
@@ -465,10 +473,87 @@ public class WarmFullFileIT extends WarmFullFileBaseIT {
             assertHitCount(client().prepareSearch(INDEX_NAME).setQuery(QueryBuilders.matchAllQuery()).setSize(10).get(), 2 * NUM_DOCS);
             assertTrue("merged segment not promoted yet, family state " + stateOf(warmShard, mergedFdt), isPromoted(warmShard, mergedFdt));
         }, DOWNLOAD_TIMEOUT.seconds(), TimeUnit.SECONDS);
-        assertEquals(promotedBefore + 1, warmShard.manager.stats().promoted());
+        assertEquals(promotedBefore + 1, warmShard.manager.counters().get("promoted").longValue());
         assertEquals(FullFileState.State.FULL, stateOf(warmShard, mergedFdt));
 
         deleteIndex(INDEX_NAME);
+    }
+
+    public void testWritesAndMergeWhileDownloadHeldCloseThePromotingFamilyAndPromoteTheMergedSegment() throws Exception {
+        // Writes, a flush and a force merge while the first segment's download is held in PROMOTING. The merge retires
+        // that segment, so its family closes mid-download: the download is cancelled, its slot and budget are given
+        // back and nothing is published for it. The merged segment is a new family that promotes on the next searches.
+        String warmNode = startCluster();
+        WarmShard warmShard = prepareEligibleIndex(INDEX_NAME, warmNode);
+        String promotingFdt = eligibleFdt(warmShard);
+        Path promotingWholeFile = warmShard.directory.getFilePath(promotingFdt);
+        long promotedBefore = warmShard.manager.counters().get("promoted").longValue();
+
+        CountDownLatch entered = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        warmShard.manager.setBeforeDownloadHook(holdDownload(entered, release));
+        FullFileState promotingFamily;
+        try {
+            searchWithSource(INDEX_NAME);
+            assertTrue("download never reached the hook", entered.await(WAIT_TIMEOUT.seconds(), TimeUnit.SECONDS));
+            promotingFamily = requireFamilyState(warmShard, promotingFdt);
+            assertEquals(FullFileState.State.PROMOTING, promotingFamily.state());
+            assertThat("budget reserved while in flight", warmShard.manager.counters().get("reservedBytes").longValue(), greaterThan(0L));
+
+            indexDocs(INDEX_NAME, NUM_DOCS, 2 * NUM_DOCS);
+            flushAndRefresh(INDEX_NAME);
+            assertHitCount(client().prepareSearch(INDEX_NAME).setQuery(QueryBuilders.matchAllQuery()).setSize(0).get(), 2 * NUM_DOCS);
+            assertEquals("still downloading while the second segment is written", FullFileState.State.PROMOTING, promotingFamily.state());
+
+            assertNoFailures(client().admin().indices().prepareForceMerge(INDEX_NAME).setMaxNumSegments(1).get());
+            flushAndRefresh(INDEX_NAME);
+        } finally {
+            warmShard.manager.setBeforeDownloadHook(null);
+        }
+        List<String> mergedFdts = fdts(warmShard.shard);
+        assertEquals("expected one segment after the merge: " + mergedFdts, 1, mergedFdts.size());
+        String mergedFdt = mergedFdts.get(0);
+        assertNotEquals(promotingFdt, mergedFdt);
+
+        // The merged-away family closed while its download was held: it ends CLOSED once the old reader lets go, the
+        // held download is released and fails as cancelled, and its slot and budget come back with nothing published.
+        assertBusy(() -> assertEquals(FullFileState.State.CLOSED, promotingFamily.state()), DOWNLOAD_TIMEOUT.seconds(), TimeUnit.SECONDS);
+        release.countDown();
+        assertBusy(() -> {
+            assertEquals(
+                "slot of the cancelled download not released",
+                0L,
+                warmShard.manager.counters().get("activeDownloads").longValue()
+            );
+            assertEquals(
+                "budget of the cancelled download not released",
+                0L,
+                warmShard.manager.counters().get("reservedBytes").longValue()
+            );
+            assertNull("a mapping was published for a closed family", promotingFamily.localMaster());
+            assertFalse(
+                "whole-file cache entry of the merged-away segment left behind",
+                hasWholeFileCacheEntry(warmShard.fileCache, promotingWholeFile)
+            );
+        }, DOWNLOAD_TIMEOUT.seconds(), TimeUnit.SECONDS);
+        assertEquals(
+            "nothing promoted for the merged-away segment",
+            promotedBefore,
+            warmShard.manager.counters().get("promoted").longValue()
+        );
+
+        // The merged segment promotes on the next searches, with every document.
+        assertBusy(() -> {
+            FullFileState mergedFamily = familyState(warmShard, mergedFdt);
+            assertNotNull("no family for the merged segment yet", mergedFamily);
+            assertTrue("merged segment not uploaded yet", mergedFamily.isRemoteMode());
+        }, BLOCK_MODE_TIMEOUT.seconds(), TimeUnit.SECONDS);
+        assertAdmissibleLength(mergedFdt, warmShard.directory.fileLength(mergedFdt), perSegmentBudget(warmShard));
+        assertBusy(() -> {
+            assertHitCount(client().prepareSearch(INDEX_NAME).setQuery(QueryBuilders.matchAllQuery()).setSize(10).get(), 2 * NUM_DOCS);
+            assertTrue("merged segment not promoted yet, family state " + stateOf(warmShard, mergedFdt), isPromoted(warmShard, mergedFdt));
+        }, DOWNLOAD_TIMEOUT.seconds(), TimeUnit.SECONDS);
+        assertEquals(promotedBefore + 1, warmShard.manager.counters().get("promoted").longValue());
     }
 
     public void testDeleteIndexWhileDownloadHeld() throws Exception {
@@ -640,9 +725,9 @@ public class WarmFullFileIT extends WarmFullFileBaseIT {
         // The restarted node has a fresh manager: the first searches promote by validating and reusing the leftover.
         WarmShard restarted = warmShard(INDEX_NAME, warmNode);
         searchUntilPromoted(INDEX_NAME, restarted, fdt);
-        WarmFullFileStats stats = restarted.manager.stats();
-        assertEquals("the leftover was not reused: " + stats, 1L, stats.reused());
-        assertEquals("the leftover was downloaded again: " + stats, 0L, stats.downloadedBytes());
+        Map<String, Long> stats = restarted.manager.counters();
+        assertEquals("the leftover was not reused: " + stats, 1L, stats.get("reused").longValue());
+        assertEquals("the leftover was downloaded again: " + stats, 0L, stats.get("downloadedBytes").longValue());
         assertEquals(FullFileState.State.FULL, stateOf(restarted, fdt));
         assertEquals(beforeRestart, queryFingerprint(INDEX_NAME));
 
@@ -723,14 +808,14 @@ public class WarmFullFileIT extends WarmFullFileBaseIT {
         assertBusy(() -> {
             assertEquals(FullFileState.State.CLOSED, sourceFamily.state());
             assertTrue("source mapping not released", sourceFamily.cleanupDone());
-            assertEquals("source budget not released", 0L, source.manager.stats().reservedBytes());
+            assertEquals("source budget not released", 0L, source.manager.counters().get("reservedBytes").longValue());
         }, DOWNLOAD_TIMEOUT.seconds(), TimeUnit.SECONDS);
 
         // The target promotes on its own, within its own budget, with the same results.
         WarmShard target = warmShard(INDEX_NAME, targetNode);
         searchUntilPromoted(INDEX_NAME, target, fdt);
         assertEquals(FullFileState.State.FULL, stateOf(target, fdt));
-        assertThat(target.manager.stats().promoted(), greaterThanOrEqualTo(1L));
+        assertThat(target.manager.counters().get("promoted").longValue(), greaterThanOrEqualTo(1L));
         assertEquals(beforeMove, queryFingerprint(INDEX_NAME));
 
         deleteIndex(INDEX_NAME);
@@ -767,14 +852,8 @@ public class WarmFullFileIT extends WarmFullFileBaseIT {
         ensureGreen(ENSURE_GREEN_TIMEOUT, INDEX_NAME);
 
         WarmShard restarted = warmShard(INDEX_NAME, warmNode);
-        AtomicInteger downloads = new AtomicInteger();
-        restarted.manager.setBeforeDownloadHook(downloads::incrementAndGet);
-        try {
-            searchUntilPromoted(INDEX_NAME, restarted, fdt);
-        } finally {
-            restarted.manager.setBeforeDownloadHook(null);
-        }
-        assertThat("no whole-file download after the restart", downloads.get(), greaterThanOrEqualTo(1));
+        searchUntilPromoted(INDEX_NAME, restarted, fdt);
+        assertThat("no whole-file download after the restart", restarted.manager.counters().get("started"), greaterThanOrEqualTo(1L));
         assertEquals(beforeRestart, queryFingerprint(INDEX_NAME));
 
         deleteIndex(INDEX_NAME);

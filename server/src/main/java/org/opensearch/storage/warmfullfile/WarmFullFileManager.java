@@ -17,6 +17,8 @@ import org.apache.lucene.store.IndexInput;
 import org.apache.lucene.store.MMapDirectory;
 import org.apache.lucene.store.MemorySegmentAccessInput;
 import org.opensearch.common.annotation.ExperimentalApi;
+import org.opensearch.common.lease.Releasable;
+import org.opensearch.common.metrics.CounterMetric;
 import org.opensearch.common.util.CancellableThreads;
 import org.opensearch.index.store.remote.file.AbstractBlockIndexInput;
 import org.opensearch.index.store.remote.filecache.CachedFullFileIndexInput;
@@ -25,13 +27,15 @@ import org.opensearch.index.store.remote.filecache.FileCache;
 import org.opensearch.index.store.remote.utils.BlobFetchRequest;
 import org.opensearch.index.store.remote.utils.TransferManager;
 import org.opensearch.storage.indexinput.CachedSwitchableIndexInput;
-import org.opensearch.storage.warmfullfile.WarmFullFileStats.DeclineReason;
 
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.EnumMap;
+import java.util.EnumSet;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -39,8 +43,6 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executor;
 import java.util.concurrent.Semaphore;
-import java.util.concurrent.atomic.AtomicLong;
-import java.util.concurrent.atomic.AtomicLongArray;
 import java.util.function.LongSupplier;
 
 /**
@@ -52,7 +54,7 @@ import java.util.function.LongSupplier;
  * family's own memory mapping and flips the state to {@link FullFileState.State#FULL}. A whole file already on local
  * disk, such as one left by a previous run of the node, is reused instead of downloaded when its length and checksum
  * match the remote store's. On any decline or failure the state returns to {@link FullFileState.State#BLOCK} with a
- * retry time set. Every promotion that reaches FULL is logged at INFO with its download time, and {@link #stats()}
+ * retry time set. Every promotion that reaches FULL is logged at INFO with its download time, and {@link #counters()}
  * returns the node's promotion and decline counters.
  *
  * @opensearch.experimental
@@ -64,6 +66,46 @@ public class WarmFullFileManager {
 
     /** Default download part size: one block, the same size the block path reads. */
     static final long DEFAULT_PART_SIZE = AbstractBlockIndexInput.Builder.DEFAULT_BLOCK_SIZE;
+
+    /**
+     * Why a promotion did not reach FULL. Each decline or failure is counted under exactly one reason.
+     *
+     * @opensearch.experimental
+     */
+    @ExperimentalApi
+    public enum DeclineReason {
+        /** Every download slot was in use. */
+        NO_SLOT,
+        /** The file did not fit the per-segment whole-file budget. */
+        BUDGET_EXCEEDED,
+        /** The file is not below the local directory's mmap chunk size. */
+        TOO_LARGE,
+        /** The local directory serves the file with an input that is not Lucene's memory-mapped input. */
+        NOT_MMAP,
+        /** A remote read failed. */
+        DOWNLOAD_FAILED,
+        /** The downloaded file does not have the expected length. */
+        LENGTH_MISMATCH,
+        /** The downloaded file's checksum does not match the one the remote store holds. */
+        CHECKSUM_MISMATCH,
+        /** The whole-file cache entry was evicted before the family reached FULL. */
+        ENTRY_EVICTED,
+        /** The family closed while the download or the publish was in progress; a download in flight is cancelled. */
+        FAMILY_CLOSED,
+        /** An unexpected exception while starting the download or publishing the mapping. */
+        ERROR
+    }
+
+    /**
+     * Declines that are an ordinary outcome of admission or of a close, logged at DEBUG. NOT_MMAP is here because
+     * {@link #declinePermanently} logs it at WARN once per extension. Every other reason is logged at WARN.
+     */
+    private static final Set<DeclineReason> EXPECTED_DECLINES = EnumSet.of(
+        DeclineReason.NO_SLOT,
+        DeclineReason.BUDGET_EXCEEDED,
+        DeclineReason.FAMILY_CLOSED,
+        DeclineReason.NOT_MMAP
+    );
     /** Retry delay after a failure or any decline other than no-slot. */
     static final long RETRY_DELAY_MILLIS = 60_000L;
     /**
@@ -74,10 +116,12 @@ public class WarmFullFileManager {
     /** Whole-file bytes admitted per cache segment must stay at or below this fraction of the segment's capacity. */
     static final double DEFAULT_BUDGET_FRACTION = 0.5;
     /**
-     * Whether a whole file found on local disk is read end to end and checksummed before it is reused. The length and
-     * footer checks alone cannot see corruption in the middle of a file whose footer is intact.
+     * Whether a whole file found on local disk is read end to end and checksummed before it is reused. Off by default:
+     * after a restart every reusable file would otherwise be read in full before it serves, which is too costly for
+     * multi-GB files. The length and footer checks still run; they cannot see corruption in the middle of a file whose
+     * footer is intact.
      */
-    static final boolean DEFAULT_VERIFY_ENTIRE_FILE = true;
+    static final boolean DEFAULT_VERIFY_ENTIRE_FILE = false;
 
     /**
      * Largest file that may be promoted: strictly below Lucene's default mmap chunk size (16 GiB on 64-bit JVMs), so the
@@ -85,55 +129,40 @@ public class WarmFullFileManager {
      */
     public static final long MAX_WHOLE_FILE_BYTES = MMapDirectory.DEFAULT_MAX_CHUNK_SIZE;
 
-    /** How long a closed FULL family may keep open handles before a WARN is logged (leak detection). */
-    static final long STUCK_HANDLE_WARN_DELAY_MILLIS = 5 * 60_000L;
-
     private final FileCache fileCache;
     private final Executor executor;
     private final LongSupplier clock;
-    private final DelayedScheduler scheduler;
     private final int maxConcurrentDownloads;
     private final Semaphore slots;
-    private final int segments;
-    private final long perSegmentBudgetBytes;
+    private final SegmentBudget budget;
     private final long partSize;
     private final boolean verifyEntireFile;
-    private final AtomicLongArray perSegmentWholeFileBytes;
-    private final AtomicLong requested = new AtomicLong();
-    private final AtomicLong started = new AtomicLong();
-    private final AtomicLong reused = new AtomicLong();
-    private final AtomicLong demoted = new AtomicLong();
-    private final AtomicLong restored = new AtomicLong();
-    private final AtomicLong downloadedBytes = new AtomicLong();
+    private final CounterMetric requested = new CounterMetric();
+    private final CounterMetric started = new CounterMetric();
+    private final CounterMetric reused = new CounterMetric();
+    private final CounterMetric demoted = new CounterMetric();
+    private final CounterMetric restored = new CounterMetric();
+    private final CounterMetric downloadedBytes = new CounterMetric();
     // The families currently FULL on this node, so a settings change can find the ones to demote.
     private final Set<FullFileState> fullFamilies = ConcurrentHashMap.newKeySet();
     // Demoted families still holding their mapping, so a settings change can restore the ones whose extension returns.
     private final Set<FullFileState> demotedFamilies = ConcurrentHashMap.newKeySet();
+    /**
+     * FULL families that closed while a reader still held handles. Each keeps its mapping, its whole file and its cache
+     * reference until the last handle closes; one that never leaves is a leaked IndexInput somewhere above.
+     */
+    private final Set<FullFileState> awaitingHandleClose = ConcurrentHashMap.newKeySet();
     // The extensions the setting currently allows; the trigger re-checks this so a change applies to open handles too.
     private volatile Set<String> eligibleExtensions = Set.of();
-    private final AtomicLong promoted = new AtomicLong();
-    private final AtomicLong promotedBytes = new AtomicLong();
-    private final AtomicLong downloadMillis = new AtomicLong();
-    private final AtomicLongArray declinedByReason = new AtomicLongArray(DeclineReason.values().length);
+    private final CounterMetric promoted = new CounterMetric();
+    private final CounterMetric promotedBytes = new CounterMetric();
+    private final CounterMetric downloadMillis = new CounterMetric();
+    private final Map<DeclineReason, CounterMetric> declinedByReason = new EnumMap<>(DeclineReason.class);
     // Extensions already reported as permanently declined on this node (one WARN per extension, DEBUG per file after).
     private final Set<String> permanentlyDeclinedExtensions = ConcurrentHashMap.newKeySet();
     // Runs on the promotion executor after admission (slot and budget held) and before the first remote read.
-    // No-op in production; tests install a blocking hook to hold a download at a known point.
-    private volatile Runnable beforeDownloadHook = () -> {};
-
-    /**
-     * Runs a task once after a delay (injectable for tests; production uses the node ThreadPool).
-     *
-     * @opensearch.experimental
-     */
-    @ExperimentalApi
-    @FunctionalInterface
-    public interface DelayedScheduler {
-        void schedule(Runnable task, long delayMillis);
-    }
-
-    /** A scheduler that drops tasks; used where leak warnings are not needed. */
-    static final DelayedScheduler NO_OP_SCHEDULER = (task, delayMillis) -> {};
+    // No-op in production; tests pass a blocking hook to hold a download at a known point.
+    private volatile Runnable beforeDownloadHook;
 
     /**
      * Production constructor.
@@ -143,15 +172,8 @@ public class WarmFullFileManager {
      *                             (never the search thread, never the FileCache listener thread)
      * @param clock                a monotonic millis clock (e.g. {@code threadPool::relativeTimeInMillis})
      * @param allocatedProcessors  the node's allocated processor count
-     * @param scheduler            delayed-task scheduler for the stuck-handle warning
      */
-    public WarmFullFileManager(
-        FileCache fileCache,
-        Executor executor,
-        LongSupplier clock,
-        int allocatedProcessors,
-        DelayedScheduler scheduler
-    ) {
+    public WarmFullFileManager(FileCache fileCache, Executor executor, LongSupplier clock, int allocatedProcessors) {
         this(
             fileCache,
             executor,
@@ -159,8 +181,7 @@ public class WarmFullFileManager {
             // Download slots: one per eight allocated processors, at least one (4 on a 32 vCPU node).
             Math.max(1, allocatedProcessors / 8),
             DEFAULT_BUDGET_FRACTION,
-            DEFAULT_PART_SIZE,
-            scheduler
+            DEFAULT_PART_SIZE
         );
     }
 
@@ -173,10 +194,10 @@ public class WarmFullFileManager {
         double budgetFraction,
         long partSize
     ) {
-        this(fileCache, executor, clock, maxConcurrentDownloads, budgetFraction, partSize, NO_OP_SCHEDULER);
+        this(fileCache, executor, clock, maxConcurrentDownloads, budgetFraction, partSize, DEFAULT_VERIFY_ENTIRE_FILE, () -> {});
     }
 
-    /** Package-private constructor for tests that also need a scheduler. */
+    /** Package-private constructor for tests that also choose whether a reused local file is read end to end. */
     WarmFullFileManager(
         FileCache fileCache,
         Executor executor,
@@ -184,34 +205,41 @@ public class WarmFullFileManager {
         int maxConcurrentDownloads,
         double budgetFraction,
         long partSize,
-        DelayedScheduler scheduler
-    ) {
-        this(fileCache, executor, clock, maxConcurrentDownloads, budgetFraction, partSize, scheduler, DEFAULT_VERIFY_ENTIRE_FILE);
-    }
-
-    /** The constructor every other constructor delegates to. The budget is kept per segment of {@code fileCache}. */
-    WarmFullFileManager(
-        FileCache fileCache,
-        Executor executor,
-        LongSupplier clock,
-        int maxConcurrentDownloads,
-        double budgetFraction,
-        long partSize,
-        DelayedScheduler scheduler,
         boolean verifyEntireFile
     ) {
+        this(fileCache, executor, clock, maxConcurrentDownloads, budgetFraction, partSize, verifyEntireFile, () -> {});
+    }
+
+    /**
+     * The constructor every other constructor delegates to. The budget is kept per segment of {@code fileCache}.
+     *
+     * @param beforeDownloadHook runs once per download, on the promotion executor, after the slot and the budget are
+     *                           held and before the first remote read; a no-op in production, a blocking hook in tests
+     */
+    WarmFullFileManager(
+        FileCache fileCache,
+        Executor executor,
+        LongSupplier clock,
+        int maxConcurrentDownloads,
+        double budgetFraction,
+        long partSize,
+        boolean verifyEntireFile,
+        Runnable beforeDownloadHook
+    ) {
         this.fileCache = fileCache;
+        this.beforeDownloadHook = beforeDownloadHook;
         this.executor = executor;
         this.clock = clock;
-        this.scheduler = scheduler == null ? NO_OP_SCHEDULER : scheduler;
         this.maxConcurrentDownloads = Math.max(1, maxConcurrentDownloads);
         this.slots = new Semaphore(this.maxConcurrentDownloads);
-        this.segments = fileCache.segmentCount();
-        long perSegmentCapacity = (fileCache.capacity() + this.segments - 1) / this.segments;
-        this.perSegmentBudgetBytes = (long) (perSegmentCapacity * budgetFraction);
+        int segments = fileCache.segmentCount();
+        long perSegmentCapacity = (fileCache.capacity() + segments - 1) / segments;
+        this.budget = new SegmentBudget(segments, (long) (perSegmentCapacity * budgetFraction));
         this.partSize = partSize > 0 ? partSize : DEFAULT_PART_SIZE;
         this.verifyEntireFile = verifyEntireFile;
-        this.perSegmentWholeFileBytes = new AtomicLongArray(this.segments);
+        for (DeclineReason reason : DeclineReason.values()) {
+            declinedByReason.put(reason, new CounterMetric());
+        }
     }
 
     /** @return the executor promote() must be submitted to (never the search thread) */
@@ -220,13 +248,14 @@ public class WarmFullFileManager {
     }
 
     /**
-     * Installs a hook that {@link #promote} runs once per download, on the promotion executor, after the slot and the
-     * budget are held and before the first remote read. Visible for testing: a blocking hook holds a download at that
-     * point so a test can act (close the shard, delete the index) while a promotion is in flight. Not for production use.
+     * Replaces the download hook of a running manager. For the integration tests in this package, which get the
+     * manager from the node and so cannot pass the hook to the constructor: a blocking hook holds a download after the
+     * slot and the budget are held and before the first remote read, so a test can act (close the shard, delete the
+     * index) while a promotion is in flight.
      *
      * @param hook the hook; null restores the no-op
      */
-    public void setBeforeDownloadHook(Runnable hook) {
+    void setBeforeDownloadHook(Runnable hook) {
         this.beforeDownloadHook = hook == null ? () -> {} : hook;
     }
 
@@ -240,243 +269,297 @@ public class WarmFullFileManager {
      * background executor. On decline or failure, returns the state to BLOCK and sets retryAt.
      */
     public void promote(FullFileState st) {
-        requested.incrementAndGet();
+        requested.inc();
         // The family closed (shard closed, entry evicted or replaced) between the trigger's CAS and this run: nothing
         // to promote, and no slot or budget to spend on a download nobody will use. (A download already running when the
         // family closes is cancelled by closeFamily; its completion handler releases the slot and the budget.)
         if (st.state() != FullFileState.State.PROMOTING) {
             return;
         }
-        final long length = st.fileLength();
-        final Path path = st.fullFilePath();
-        final int segment = fileCache.segmentIndexFor(path);
-
-        // Single-chunk guard. Eligibility already excludes these; this also covers a
-        // local directory configured with a smaller chunk size. Checked before taking a slot or reserving bytes.
-        if (length >= maxChunkSize(st.localDirectory())) {
-            decline(st, DeclineReason.TOO_LARGE, "file of " + length + " bytes exceeds the mmap chunk size");
-            return;
-        }
-
-        // Admission: a free slot AND the per-segment whole-file budget.
-        if (slots.tryAcquire() == false) {
-            decline(st, DeclineReason.NO_SLOT, "no free download slot", clock.getAsLong() + NO_SLOT_RETRY_DELAY_MILLIS);
-            return;
-        }
-        boolean bytesReserved = false;
-        try {
-            if (reserveSegmentBytes(segment, length, perSegmentBudgetBytes) == false) {
-                slots.release(); // the slot was taken above; give it back or every budget decline leaks one
-                decline(st, DeclineReason.BUDGET_EXCEEDED, "per-segment whole-file budget exceeded");
-                return;
-            }
-            bytesReserved = true;
-
-            // An entry already at the whole-file key: fetchBlobAsync can only drive its own in-flight placeholder (a
-            // private type); on any other live entry its asyncLoadIndexInput returns null and leaks the compute
-            // reference. A restore placeholder stands for a whole file left on disk by a previous run of the node:
-            // fetchBlobAsync replaces it (it reports itself closed) and opens the file without fetching anything, so
-            // the file is kept when it validates. Other known entry types are removed; anything else is left for
-            // fetchBlobAsync.
-            boolean reuse = false;
-            CachedIndexInput existing = fileCache.get(path);
-            if (existing != null) {
-                boolean restored = existing instanceof FileCache.RestoredCachedIndexInput;
-                boolean nonReusable = isKnownNonReusableEntry(existing);
-                fileCache.decRef(path);
-                if (restored) {
-                    reuse = validateExisting(st);
-                    if (reuse == false) {
-                        fileCache.remove(path); // closes the placeholder and deletes the file
-                    }
-                } else if (nonReusable) {
-                    fileCache.remove(path);
-                }
-            } else if (Files.exists(path)) {
-                // A whole file with no cache entry (e.g. left by a crash): kept when it validates, else deleted.
-                reuse = validateExisting(st);
-                if (reuse == false) {
-                    Files.delete(path);
-                }
-            }
-
-            BlobFetchRequest request = buildRequest(st, length);
-            beforeDownloadHook.run();
-            final long startedAt = clock.getAsLong();
-            if (reuse == false) {
-                started.incrementAndGet();
-            }
-            CompletableFuture<IndexInput> future = st.transferManager().fetchBlobAsync(request, st.downloadCancellation());
-            if (future == null) {
-                // fetchBlobAsync found a live entry it cannot drive (one put at the key after the check above).
-                throw new IllegalStateException("whole-file entry at " + path + " cannot be downloaded into");
-            }
-            // The future's value is the cache entry's own (non-clone) input; it must NOT be closed here (closing it
-            // would close the entry's master input). The family serves from its own mapping opened below.
-            final boolean reusedLocalFile = reuse;
-            future.whenComplete((indexInput, throwable) -> onDownloadComplete(st, segment, length, startedAt, reusedLocalFile, throwable));
-            // Ownership of slot + reserved bytes has passed to the completion handler; do not release them here.
-            bytesReserved = false;
-        } catch (Exception e) {
-            logger.warn("whole-file promotion failed to start for {}", path, e);
-            if (bytesReserved) {
-                releaseSegmentBytes(segment, length);
-            }
-            slots.release();
-            decline(st, DeclineReason.ERROR, "exception starting download: " + e.getMessage());
-        }
-    }
-
-    private void onDownloadComplete(
-        FullFileState st,
-        int segment,
-        long length,
-        long startedAt,
-        boolean reusedLocalFile,
-        Throwable throwable
-    ) {
-        final Path path = st.fullFilePath();
-        boolean refTaken = false;
-        boolean published = false;
-        try {
-            if (throwable != null) {
-                if (isCancellation(throwable)) {
-                    failPromotion(st, segment, length, DeclineReason.FAMILY_CLOSED, "download cancelled: family closed");
-                } else {
-                    failPromotion(st, segment, length, DeclineReason.DOWNLOAD_FAILED, "download failed: " + throwable.getMessage());
-                }
-                return;
-            }
-            if (reusedLocalFile == false) {
-                downloadedBytes.addAndGet(length);
-            }
-            // fetchBlobAsync releases its own reference on success; take the family's reference now.
-            CachedIndexInput entry = fileCache.get(path);
-            if (entry == null) {
-                failPromotion(st, segment, length, DeclineReason.ENTRY_EVICTED, "entry evicted before FULL");
-                return;
-            }
-            refTaken = true;
-            FSDirectory localDirectory = st.localDirectory();
-            if (localDirectory.fileLength(st.fileName()) != length) {
-                // Remove the entry (closes it and deletes the truncated file). Without this, the completed
-                // DelayedCreation entry stays live and the next retry reuses the same truncated file and fails again.
-                dropEntry(path);
-                failPromotion(st, segment, length, DeclineReason.LENGTH_MISMATCH, "downloaded length mismatch");
-                return;
-            }
-            // A reused local file was validated before the entry was created; a fresh download is checked against
-            // the remote store's checksum here (its footer only, the bytes were just streamed from the store).
-            if (reusedLocalFile == false && matchesRemoteChecksum(st, false) == false) {
-                dropEntry(path);
-                failPromotion(st, segment, length, DeclineReason.CHECKSUM_MISMATCH, "downloaded checksum mismatch");
-                return;
-            }
-            // Open the family's OWN mapping with the RANDOM hint (do not reuse the cache entry's input).
-            IndexInput master = localDirectory.openInput(st.fileName(), IOContext.DEFAULT.withHints(DataAccessHint.RANDOM));
-            // The master must be Lucene's mmap input. Views of an NIO master would go through
-            // BufferedIndexInput (a copy per read, no k-NN SIMD), which is not the feature. This happens only if the
-            // extension is on the local directory's NIO list (hybridfs), so it will not change for this family.
-            if ((master instanceof MemorySegmentAccessInput) == false) {
-                closeQuietly(master);
-                // Drop the useless whole file so it is not charged against the cache until eviction, and so nothing
-                // reuses it.
-                dropEntry(path);
-                declinePermanently(
-                    st,
-                    segment,
-                    length,
-                    "the local directory serves it as " + master.getClass().getSimpleName() + ", not mmap"
-                );
-                return;
-            }
-            // Attach the teardown, then publish localMaster, then CAS to FULL (all three before the CAS). If the family
-            // closes after the CAS, closeFamily() releases the budget and the deferred cleanup unmaps + decRefs.
-            st.attachCleanup(executor, () -> {
-                releaseSegmentBytes(segment, length);
-                fullFamilies.remove(st);
-                demotedFamilies.remove(st);
-            }, () -> scheduleStuckHandleWarning(st));
-            if (st.compareAndSetLocalMaster(null, master) == false) {
-                // Another completion handler for this family already installed its mapping (two promote() calls joined
-                // the same download). Keep theirs and unwind only what this handler holds.
-                closeQuietly(master);
-                fileCache.decRef(path);
-                releaseAdmission(segment, length);
-                logger.debug("whole-file mapping for {} was already published by another completion", path);
-                return;
-            }
-            // Registered before the CAS: a close right after the CAS runs the budget release, which must find the
-            // family in the registry to take it out again.
-            fullFamilies.add(st);
-            if (st.casState(FullFileState.State.PROMOTING, FullFileState.State.FULL) == false) {
-                // The family closed during the publish (closeFamily saw PROMOTING, so it owes no cleanup). Unwind this
-                // handler's own mapping only; never touch a mapping installed by another handler.
-                fullFamilies.remove(st);
-                closeQuietly(master);
-                st.compareAndSetLocalMaster(master, null);
-                fileCache.decRef(path);
-                releaseAdmission(segment, length);
-                decline(st, DeclineReason.FAMILY_CLOSED, "family closed during publish");
-                return;
-            }
-            // From here the family owns the reference and the budget, and the slot is given back below: nothing after
-            // this point may unwind admission.
-            published = true;
-            slots.release();
-            final long elapsedMillis = clock.getAsLong() - startedAt;
-            promoted.incrementAndGet();
-            promotedBytes.addAndGet(length);
-            if (reusedLocalFile) {
-                reused.incrementAndGet();
-                logger.info("promoted [{}] to a whole file: {} bytes reused from the local copy (cache segment {})", path, length, segment);
-            } else {
-                downloadMillis.addAndGet(elapsedMillis);
-                logger.info(
-                    "promoted [{}] to a whole file: {} bytes in {} ms ({} parts of {} bytes, cache segment {})",
-                    path,
-                    length,
-                    elapsedMillis,
-                    partCount(length),
-                    partSize,
-                    segment
-                );
-            }
-            // The setting may have dropped the extension while the download ran; such a family was not FULL when
-            // the change was applied, so it is demoted here instead.
-            demoteIfNoLongerEligible(st);
-        } catch (Exception e) {
-            if (published) {
-                // The family is FULL and serving; its reference, budget and slot are already settled.
-                logger.warn("whole-file bookkeeping after publishing [{}] failed", path, e);
-                return;
-            }
-            if (refTaken) {
-                fileCache.decRef(path); // do not leak the family reference taken above
-            }
-            failPromotion(st, segment, length, DeclineReason.ERROR, "exception publishing FULL: " + e.getMessage());
-        }
+        new PromotionAttempt(st).start();
     }
 
     /**
-     * Leak detection: if the family closed while handles were still open, warn once after a delay if they are still
-     * open. The mapping and the whole file stay until those handles close (never unmapped under a live handle).
+     * One promotion of one family, from admission to FULL or to its decline. What the attempt has taken so far are its
+     * fields: the download slot, the reserved budget bytes, a reference on the whole-file cache entry and the mapping.
+     * {@link #close()} gives back whatever is still held, so every failure is a close() plus an
+     * {@link #abandonPromotion}, and {@link #completePromotion()} hands the bytes, the reference and the mapping to the
+     * family together or not at all. {@link #start()} runs on the promotion executor and
+     * {@link #onDownloadComplete} on the download's completion thread, one after the other.
      */
-    private void scheduleStuckHandleWarning(FullFileState st) {
-        try {
-            scheduler.schedule(() -> {
-                if (st.cleanupDone() == false && st.handleCount() > 0) {
-                    logger.warn(
-                        "whole-file family [{}] closed {} ms ago but still has [{}] open handle(s); its mapping and "
-                            + "whole file are kept until they close. A caller may not be closing an IndexInput.",
-                        st.fullFilePath(),
-                        STUCK_HANDLE_WARN_DELAY_MILLIS,
-                        st.handleCount()
+    private final class PromotionAttempt {
+        private final FullFileState st;
+        private final Path path;
+        private final long length;
+        private final int segment;
+        private boolean holdsSlot;
+        private Releasable bytes;
+        private boolean holdsReference;
+        private IndexInput mapping;
+        // Set once the family has taken the bytes, the reference and the mapping; only the slot is left to give back.
+        private boolean published;
+        private boolean reusedLocalFile;
+        private long startedAt;
+
+        PromotionAttempt(FullFileState st) {
+            this.st = st;
+            this.path = st.fullFilePath();
+            this.length = st.fileLength();
+            this.segment = fileCache.segmentIndexFor(path);
+        }
+
+        /** Admission, the local-file reuse check and the start of the download, which completes in {@link #onDownloadComplete}. */
+        void start() {
+            try {
+                // Single-chunk guard. Eligibility already excludes these; this also covers a
+                // local directory configured with a smaller chunk size. Checked before taking a slot or reserving bytes.
+                if (length >= maxChunkSize(st.localDirectory())) {
+                    abandonPromotion(DeclineReason.TOO_LARGE, "file of " + length + " bytes exceeds the mmap chunk size");
+                    return;
+                }
+
+                // Admission: a free slot AND the per-segment whole-file budget.
+                if (slots.tryAcquire() == false) {
+                    abandonPromotion(DeclineReason.NO_SLOT, "no free download slot", clock.getAsLong() + NO_SLOT_RETRY_DELAY_MILLIS);
+                    return;
+                }
+                holdsSlot = true;
+                bytes = budget.reserve(segment, length);
+                if (bytes == null) {
+                    close();
+                    abandonPromotion(DeclineReason.BUDGET_EXCEEDED, "per-segment whole-file budget exceeded");
+                    return;
+                }
+
+                // An entry already at the whole-file key: fetchBlobAsync can only drive its own in-flight placeholder (a
+                // private type); on any other live entry its asyncLoadIndexInput returns null and leaks the compute
+                // reference. A restore placeholder stands for a whole file left on disk by a previous run of the node:
+                // fetchBlobAsync replaces it (it reports itself closed) and opens the file without fetching anything, so
+                // the file is kept when it validates. Other known entry types are removed; anything else is left for
+                // fetchBlobAsync.
+                boolean reuse = false;
+                CachedIndexInput existing = fileCache.get(path);
+                if (existing != null) {
+                    holdsReference = true;
+                    if (existing instanceof FileCache.RestoredCachedIndexInput) {
+                        // Validated under the reference taken above: a referenced entry is not evictable, so the file
+                        // cannot be deleted under the validation. The reference is kept until fetchBlobAsync has replaced
+                        // the placeholder (the node keeps its count across the replacement) and released after it.
+                        reuse = validateExisting(st);
+                        if (reuse == false) {
+                            dropEntry(); // closes the placeholder and deletes the file
+                        }
+                    } else {
+                        releaseReference();
+                        if (isKnownNonReusableEntry(existing)) {
+                            fileCache.remove(path);
+                        }
+                    }
+                } else if (Files.exists(path)) {
+                    // A whole file with no cache entry (e.g. left by a crash): kept when it validates, else deleted.
+                    reuse = validateExisting(st);
+                    if (reuse == false) {
+                        Files.delete(path);
+                    }
+                }
+
+                BlobFetchRequest request = buildRequest(st, length);
+                beforeDownloadHook.run();
+                startedAt = clock.getAsLong();
+                reusedLocalFile = reuse;
+                if (reuse == false) {
+                    started.inc();
+                }
+                CompletableFuture<IndexInput> future;
+                try {
+                    future = st.transferManager().fetchBlobAsync(request, st.downloadCancellation());
+                } finally {
+                    releaseReference();
+                }
+                if (future == null) {
+                    // fetchBlobAsync found a live entry it cannot drive (one put at the key after the check above).
+                    throw new IllegalStateException("whole-file entry at " + path + " cannot be downloaded into");
+                }
+                // The future's value is the cache entry's own (non-clone) input; it must NOT be closed here (closing it
+                // would close the entry's master input). The family serves from its own mapping opened on completion.
+                future.whenComplete((indexInput, throwable) -> onDownloadComplete(throwable));
+            } catch (Exception e) {
+                logger.warn("whole-file promotion failed to start for {}", path, e);
+                close();
+                abandonPromotion(DeclineReason.ERROR, "exception starting download: " + e.getMessage());
+            }
+        }
+
+        private void onDownloadComplete(Throwable throwable) {
+            try {
+                if (throwable != null) {
+                    close();
+                    if (isCancellation(throwable)) {
+                        abandonPromotion(DeclineReason.FAMILY_CLOSED, "download cancelled: family closed");
+                    } else {
+                        abandonPromotion(DeclineReason.DOWNLOAD_FAILED, "download failed: " + throwable.getMessage());
+                    }
+                    return;
+                }
+                if (reusedLocalFile == false) {
+                    downloadedBytes.inc(length);
+                }
+                // fetchBlobAsync releases its own reference on success; take the family's reference now.
+                if (fileCache.get(path) == null) {
+                    close();
+                    abandonPromotion(DeclineReason.ENTRY_EVICTED, "entry evicted before FULL");
+                    return;
+                }
+                holdsReference = true;
+                FSDirectory localDirectory = st.localDirectory();
+                if (localDirectory.fileLength(st.fileName()) != length) {
+                    // Remove the entry (closes it and deletes the truncated file). Without this, the completed
+                    // DelayedCreation entry stays live and the next retry reuses the same truncated file and fails again.
+                    close();
+                    dropEntry();
+                    abandonPromotion(DeclineReason.LENGTH_MISMATCH, "downloaded length mismatch");
+                    return;
+                }
+                // A reused local file was validated before the entry was created; a fresh download is checked against
+                // the remote store's checksum here (its footer only, the bytes were just streamed from the store).
+                if (reusedLocalFile == false && matchesRemoteChecksum(st, false) == false) {
+                    close();
+                    dropEntry();
+                    abandonPromotion(DeclineReason.CHECKSUM_MISMATCH, "downloaded checksum mismatch");
+                    return;
+                }
+                // Open the family's OWN mapping with the RANDOM hint (do not reuse the cache entry's input).
+                mapping = localDirectory.openInput(st.fileName(), IOContext.DEFAULT.withHints(DataAccessHint.RANDOM));
+                // The master must be Lucene's mmap input. Views of an NIO master would go through
+                // BufferedIndexInput (a copy per read, no k-NN SIMD), which is not the feature. This happens only if the
+                // extension is on the local directory's NIO list (hybridfs), so it will not change for this family.
+                if ((mapping instanceof MemorySegmentAccessInput) == false) {
+                    String servedAs = mapping.getClass().getSimpleName();
+                    // Drop the useless whole file so it is not charged against the cache until eviction, and so nothing
+                    // reuses it.
+                    close();
+                    dropEntry();
+                    declinePermanently(st, "the local directory serves it as " + servedAs + ", not mmap");
+                    return;
+                }
+                if (completePromotion() == false) {
+                    close();
+                    return;
+                }
+                close(); // the family owns the rest; this gives back the slot
+                final long elapsedMillis = clock.getAsLong() - startedAt;
+                promoted.inc();
+                promotedBytes.inc(length);
+                if (reusedLocalFile) {
+                    reused.inc();
+                    logger.info(
+                        "promoted [{}] to a whole file: {} bytes reused from the local copy (cache segment {})",
+                        path,
+                        length,
+                        segment
+                    );
+                } else {
+                    downloadMillis.inc(elapsedMillis);
+                    logger.info(
+                        "promoted [{}] to a whole file: {} bytes in {} ms ({} parts of {} bytes, cache segment {})",
+                        path,
+                        length,
+                        elapsedMillis,
+                        partCount(length),
+                        partSize,
+                        segment
                     );
                 }
-            }, STUCK_HANDLE_WARN_DELAY_MILLIS);
-        } catch (RuntimeException e) {
-            logger.debug("could not schedule stuck-handle check for {}", st.fullFilePath(), e);
+                // The setting may have dropped the extension while the download ran; such a family was not FULL when
+                // the change was applied, so it is demoted here instead.
+                demoteIfNoLongerEligible(st);
+            } catch (Exception e) {
+                if (published) {
+                    // The family is FULL and serving; its reference, budget and slot are already settled.
+                    logger.warn("whole-file bookkeeping after publishing [{}] failed", path, e);
+                    return;
+                }
+                close();
+                abandonPromotion(DeclineReason.ERROR, "exception publishing FULL: " + e.getMessage());
+            }
+        }
+
+        /**
+         * Hands the reserved bytes, the cache reference and the mapping to the family, which publishes the mapping and
+         * moves to FULL in one step. All three or none: when another completion handler published first, or the family
+         * left PROMOTING, this attempt still holds them for its {@link #close()}.
+         *
+         * @return true if the family is FULL and owns them
+         */
+        private boolean completePromotion() {
+            // Registered before the publish: a close right after it schedules the teardown, which must find the family
+            // in the registry to take it out again.
+            fullFamilies.add(st);
+            Releasable reservation = bytes;
+            FullFileState.Completion completion = st.completePromotion(mapping, executor, () -> {
+                reservation.close();
+                fullFamilies.remove(st);
+                demotedFamilies.remove(st);
+            }, () -> awaitingHandleClose.add(st), () -> awaitingHandleClose.remove(st));
+            switch (completion) {
+                case PUBLISHED_BY_OTHER -> {
+                    // Concurrent promote() calls join one in-flight download, so each gets a completion. The handler
+                    // that published first owns the state and the registration.
+                    logger.debug("whole-file mapping for {} was already published by another completion", path);
+                    return false;
+                }
+                case NOT_PROMOTING -> {
+                    // The family closed during the download or the publish; nothing was installed.
+                    fullFamilies.remove(st);
+                    abandonPromotion(DeclineReason.FAMILY_CLOSED, "family closed during publish");
+                    return false;
+                }
+                default -> {
+                    bytes = null;
+                    holdsReference = false;
+                    mapping = null;
+                    published = true;
+                    return true;
+                }
+            }
+        }
+
+        /** Gives back whatever this attempt still holds: the mapping, the cache reference, the budget bytes, the slot. */
+        void close() {
+            if (mapping != null) {
+                closeQuietly(mapping);
+                mapping = null;
+            }
+            releaseReference();
+            if (bytes != null) {
+                bytes.close();
+                bytes = null;
+            }
+            if (holdsSlot) {
+                holdsSlot = false;
+                slots.release();
+            }
+        }
+
+        private void releaseReference() {
+            if (holdsReference) {
+                holdsReference = false;
+                fileCache.decRef(path);
+            }
+        }
+
+        /** Releases this attempt's reference on the whole-file entry and removes the entry, closing it and deleting its file. */
+        private void dropEntry() {
+            releaseReference();
+            fileCache.remove(path);
+        }
+
+        private void abandonPromotion(DeclineReason reason, String detail) {
+            decline(st, reason, detail);
+        }
+
+        private void abandonPromotion(DeclineReason reason, String detail, long retryAt) {
+            decline(st, reason, detail, retryAt);
         }
     }
 
@@ -489,8 +572,7 @@ public class WarmFullFileManager {
      * surface once per segment per shard, so only the first file of each extension is logged at WARN on this node;
      * later files of that extension are logged at DEBUG by {@link #decline(FullFileState, DeclineReason, String, long)}.
      */
-    private void declinePermanently(FullFileState st, int segment, long length, String reason) {
-        releaseAdmission(segment, length);
+    private void declinePermanently(FullFileState st, String reason) {
         if (decline(st, DeclineReason.NOT_MMAP, reason, Long.MAX_VALUE)) {
             String extension = WarmFullFileSettings.extensionOf(st.fileName());
             if (extension != null && permanentlyDeclinedExtensions.add(extension)) {
@@ -506,23 +588,6 @@ public class WarmFullFileManager {
                 );
             }
         }
-    }
-
-    private void failPromotion(FullFileState st, int segment, long length, DeclineReason reason, String detail) {
-        releaseAdmission(segment, length);
-        decline(st, reason, detail);
-    }
-
-    /** Gives back what admission granted a promotion: its reserved budget bytes and its download slot. */
-    private void releaseAdmission(int segment, long length) {
-        releaseSegmentBytes(segment, length);
-        slots.release();
-    }
-
-    /** Releases this handler's reference on the whole-file entry and removes the entry, closing it and deleting its file. */
-    private void dropEntry(Path path) {
-        fileCache.decRef(path);
-        fileCache.remove(path);
     }
 
     /**
@@ -589,18 +654,22 @@ public class WarmFullFileManager {
     }
 
     /**
-     * Returns the family to BLOCK with the given retry time and counts the decline under {@code reason}. Sets
-     * {@code retryAt} BEFORE the CAS so a trigger racing this decline cannot start a new promotion in between.
+     * Returns the family to BLOCK with the given retry time and counts the decline under {@code reason}.
      *
      * @return true if the family went back to BLOCK; false if it closed meanwhile. A download cancelled by the close
      *         ends here as {@link DeclineReason#FAMILY_CLOSED} and is logged at DEBUG; any other end after a close is
      *         logged at WARN, since that download ran to completion for a family nobody will use
      */
     private boolean decline(FullFileState st, DeclineReason reason, String detail, long retryAt) {
-        declinedByReason.incrementAndGet(reason.ordinal());
-        st.setRetryAt(retryAt);
-        if (st.casState(FullFileState.State.PROMOTING, FullFileState.State.BLOCK)) {
-            logger.debug("whole-file promotion declined ({}) for {}", detail, st.fullFilePath());
+        declinedByReason.get(reason).inc();
+        if (st.abandonPromotion(retryAt)) {
+            if (EXPECTED_DECLINES.contains(reason)) {
+                // Admission refusals and closes are the normal steady state and retry on their own; a WARN per file
+                // per retry across every warm shard would drown the log. The counters carry them.
+                logger.debug("whole-file promotion declined ({}) for {}", detail, st.fullFilePath());
+            } else {
+                logger.warn("whole-file promotion declined ({}) for {}", detail, st.fullFilePath());
+            }
             return true;
         }
         if (st.state() == FullFileState.State.CLOSED) {
@@ -634,7 +703,7 @@ public class WarmFullFileManager {
         eligibleExtensions = extensions;
         for (FullFileState st : fullFamilies) {
             if (st.state() == FullFileState.State.CLOSED) {
-                // Closed just as it was registered or restored; its budget release ran before the registration.
+                // Closed; its teardown takes it out when the deferred cleanup runs, or this does if sooner.
                 fullFamilies.remove(st);
                 continue;
             }
@@ -657,7 +726,7 @@ public class WarmFullFileManager {
         }
         fullFamilies.remove(st);
         demotedFamilies.add(st);
-        demoted.incrementAndGet();
+        demoted.inc();
         logger.info(
             "demoted [{}] back to blocks: extension [{}] is no longer configured; its mapping is released once its {} handle(s) close",
             st.fullFilePath(),
@@ -678,7 +747,7 @@ public class WarmFullFileManager {
         }
         demotedFamilies.remove(st);
         fullFamilies.add(st);
-        restored.incrementAndGet();
+        restored.inc();
         logger.info(
             "restored [{}] to its whole file: extension [{}] is configured again and the mapping was still held",
             st.fullFilePath(),
@@ -694,35 +763,71 @@ public class WarmFullFileManager {
         return extension != null && eligibleExtensions.contains(extension);
     }
 
+    /** The decline reasons that mean a download or publish was attempted and did not reach FULL (not admission). */
+    private static final Set<DeclineReason> FAILURE_REASONS = EnumSet.of(
+        DeclineReason.NOT_MMAP,
+        DeclineReason.DOWNLOAD_FAILED,
+        DeclineReason.LENGTH_MISMATCH,
+        DeclineReason.CHECKSUM_MISMATCH,
+        DeclineReason.ENTRY_EVICTED,
+        DeclineReason.FAMILY_CLOSED,
+        DeclineReason.ERROR
+    );
+
     /**
-     * A snapshot of this node's promotion counters.
+     * This node's promotion counters, by name. Cumulative counters ({@code requested}, {@code started}, {@code reused},
+     * {@code promoted}, {@code demoted}, {@code restored}, {@code downloadedBytes}, {@code promotedBytes},
+     * {@code downloadMillis}, {@code declined.<reason>} with the totals {@code declined} and {@code failed}) never
+     * decrease for the life of the node; {@code reservedBytes}, {@code activeDownloads},
+     * {@code familiesAwaitingHandleClose} and {@code bytesAwaitingHandleClose} describe the current moment. Read by
+     * tests and node-local code; it has no wire format and is not part of any API.
      *
-     * @return the current counters
+     * @return an unmodifiable snapshot
      */
-    public WarmFullFileStats stats() {
-        Map<DeclineReason, Long> declined = new EnumMap<>(DeclineReason.class);
+    public Map<String, Long> counters() {
+        Map<String, Long> counters = new LinkedHashMap<>();
+        counters.put("requested", requested.count());
+        counters.put("started", started.count());
+        counters.put("reused", reused.count());
+        counters.put("promoted", promoted.count());
+        counters.put("demoted", demoted.count());
+        counters.put("restored", restored.count());
+        counters.put("downloadedBytes", downloadedBytes.count());
+        counters.put("promotedBytes", promotedBytes.count());
+        counters.put("downloadMillis", downloadMillis.count());
+        long declined = 0;
+        long failed = 0;
         for (DeclineReason reason : DeclineReason.values()) {
-            declined.put(reason, declinedByReason.get(reason.ordinal()));
+            long count = declinedByReason.get(reason).count();
+            counters.put("declined." + reason, count);
+            declined += count;
+            if (FAILURE_REASONS.contains(reason)) {
+                failed += count;
+            }
         }
-        long[] reservedPerSegment = new long[segments];
-        for (int i = 0; i < segments; i++) {
-            reservedPerSegment[i] = perSegmentWholeFileBytes.get(i);
+        counters.put("declined", declined);
+        counters.put("failed", failed);
+        counters.put("reservedBytes", budget.totalReserved());
+        counters.put("activeDownloads", (long) (maxConcurrentDownloads - slots.availablePermits()));
+        int awaitingFamilies = 0;
+        long awaitingBytes = 0;
+        for (FullFileState st : awaitingHandleClose) {
+            awaitingFamilies++;
+            awaitingBytes += st.fileLength();
         }
-        return new WarmFullFileStats(
-            requested.get(),
-            started.get(),
-            reused.get(),
-            promoted.get(),
-            demoted.get(),
-            restored.get(),
-            downloadedBytes.get(),
-            promotedBytes.get(),
-            downloadMillis.get(),
-            declined,
-            reservedPerSegment,
-            perSegmentBudgetBytes,
-            maxConcurrentDownloads - slots.availablePermits()
-        );
+        counters.put("familiesAwaitingHandleClose", (long) awaitingFamilies);
+        counters.put("bytesAwaitingHandleClose", awaitingBytes);
+        return Collections.unmodifiableMap(counters);
+    }
+
+    /** @return the whole-file bytes currently reserved in each cache segment, by segment index */
+    public long[] reservedBytesPerSegment() {
+        return budget.reservedPerSegment();
+    }
+
+    /** @return the most whole-file bytes one cache segment may hold; a promotion that would exceed it is declined */
+    public long perSegmentBudgetBytes() {
+        return budget.capPerSegment();
     }
 
     /** The number of parts a download of {@code length} bytes is split into. */
@@ -745,22 +850,6 @@ public class WarmFullFileManager {
             offset += partLen;
         }
         return parts;
-    }
-
-    private boolean reserveSegmentBytes(int segment, long length, long cap) {
-        while (true) {
-            long current = perSegmentWholeFileBytes.get(segment);
-            if (current + length > cap) {
-                return false;
-            }
-            if (perSegmentWholeFileBytes.compareAndSet(segment, current, current + length)) {
-                return true;
-            }
-        }
-    }
-
-    private void releaseSegmentBytes(int segment, long length) {
-        perSegmentWholeFileBytes.addAndGet(segment, -length);
     }
 
     /** The local directory's mmap chunk size if it is an MMapDirectory, else Lucene's default. */

@@ -17,7 +17,6 @@ import org.opensearch.index.store.remote.filecache.FileCache;
 import org.opensearch.plugins.IndexStorePlugin;
 import org.opensearch.storage.prefetch.TieredStoragePrefetchSettings;
 import org.opensearch.storage.warmfullfile.WarmFullFileManager;
-import org.opensearch.storage.warmfullfile.WarmFullFileSettings;
 import org.opensearch.threadpool.ThreadPool;
 
 import java.io.IOException;
@@ -34,22 +33,18 @@ public class TieredDirectoryFactory implements IndexStorePlugin.CompositeDirecto
     private static final Logger logger = LogManager.getLogger(TieredDirectoryFactory.class);
 
     private final Supplier<TieredStoragePrefetchSettings> tieredStoragePrefetchSettingsSupplier;
-    private final Supplier<WarmFullFileSettings> warmFullFileSettingsSupplier;
     private final WarmFullFileManager warmFullFileManager;
 
     /**
      * Creates a new TieredDirectoryFactory.
      * @param tieredStoragePrefetchSettingsSupplier supplier for prefetch settings
-     * @param warmFullFileSettingsSupplier supplier for whole-file promotion settings (may supply null when disabled)
      * @param warmFullFileManager the node-level whole-file promotion manager (null when disabled)
      */
     public TieredDirectoryFactory(
         Supplier<TieredStoragePrefetchSettings> tieredStoragePrefetchSettingsSupplier,
-        Supplier<WarmFullFileSettings> warmFullFileSettingsSupplier,
         WarmFullFileManager warmFullFileManager
     ) {
         this.tieredStoragePrefetchSettingsSupplier = tieredStoragePrefetchSettingsSupplier;
-        this.warmFullFileSettingsSupplier = warmFullFileSettingsSupplier;
         this.warmFullFileManager = warmFullFileManager;
     }
 
@@ -70,7 +65,6 @@ public class TieredDirectoryFactory implements IndexStorePlugin.CompositeDirecto
             fileCache,
             threadPool,
             tieredStoragePrefetchSettingsSupplier,
-            warmFullFileSettingsSupplier,
             warmFullFileManager
         );
     }

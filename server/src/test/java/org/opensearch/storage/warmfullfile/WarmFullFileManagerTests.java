@@ -26,9 +26,10 @@ import org.opensearch.index.store.remote.filecache.FileCache;
 import org.opensearch.index.store.remote.filecache.FileCacheFactory;
 import org.opensearch.index.store.remote.utils.BlobFetchRequest;
 import org.opensearch.index.store.remote.utils.TransferManager;
-import org.opensearch.storage.warmfullfile.WarmFullFileStats.DeclineReason;
+import org.opensearch.storage.warmfullfile.WarmFullFileManager.DeclineReason;
 import org.opensearch.test.MockLogAppender;
 import org.opensearch.test.OpenSearchTestCase;
+import org.opensearch.test.junit.annotations.TestLogging;
 import org.opensearch.threadpool.TestThreadPool;
 import org.opensearch.threadpool.ThreadPool;
 import org.junit.After;
@@ -43,6 +44,7 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
@@ -229,6 +231,28 @@ public class WarmFullFileManagerTests extends OpenSearchTestCase {
         return withFaissEligible(new WarmFullFileManager(fileCache, Runnable::run, clock, slots, budgetFraction, PART_SIZE));
     }
 
+    /** As above, with a hook that runs after admission and before the first remote read of every download. */
+    private static WarmFullFileManager newManager(
+        FileCache fileCache,
+        LongSupplier clock,
+        int slots,
+        double budgetFraction,
+        Runnable beforeDownloadHook
+    ) {
+        return withFaissEligible(
+            new WarmFullFileManager(
+                fileCache,
+                Runnable::run,
+                clock,
+                slots,
+                budgetFraction,
+                PART_SIZE,
+                WarmFullFileManager.DEFAULT_VERIFY_ENTIRE_FILE,
+                beforeDownloadHook
+            )
+        );
+    }
+
     /** Tells the manager the setting lists {@code faiss}, as the settings listener does in production. */
     private static WarmFullFileManager withFaissEligible(WarmFullFileManager manager) {
         manager.onExtensionsChanged(Set.of("faiss"));
@@ -239,9 +263,9 @@ public class WarmFullFileManagerTests extends OpenSearchTestCase {
         return new FullFileState(tm, localDirectory, fileCache, name, length, localDirectory.getDirectory().resolve(name));
     }
 
-    /** What the trigger does: CAS the family BLOCK -> PROMOTING and hand it to the manager. */
+    /** What the trigger does: move the family BLOCK -> PROMOTING and hand it to the manager. */
     private static void startPromotion(WarmFullFileManager mgr, FullFileState st) {
-        assertTrue(st.casState(FullFileState.State.BLOCK, FullFileState.State.PROMOTING));
+        assertTrue(st.onAccess(mgr.relativeTimeInMillis()));
         mgr.promote(st);
     }
 
@@ -291,16 +315,7 @@ public class WarmFullFileManagerTests extends OpenSearchTestCase {
     /** As {@link #newManager(FileCache, int, double)} with 4 slots, half the cache as budget, and the given entire-file setting. */
     private WarmFullFileManager newManager(FileCache fileCache, boolean verifyEntireFile) {
         return withFaissEligible(
-            new WarmFullFileManager(
-                fileCache,
-                Runnable::run,
-                threadPool::relativeTimeInMillis,
-                4,
-                0.5,
-                PART_SIZE,
-                WarmFullFileManager.NO_OP_SCHEDULER,
-                verifyEntireFile
-            )
+            new WarmFullFileManager(fileCache, Runnable::run, threadPool::relativeTimeInMillis, 4, 0.5, PART_SIZE, verifyEntireFile)
         );
     }
 
@@ -412,17 +427,17 @@ public class WarmFullFileManagerTests extends OpenSearchTestCase {
 
         FullFileState st = newState(tm, fileCache, name, FILE_LENGTH);
         startPromotion(mgr, st); // returns once the download is queued; the reader blocks on the latch
-        assertEquals("bytes reserved while downloading", FILE_LENGTH, mgr.stats().reservedBytesPerSegment()[0]);
+        assertEquals("bytes reserved while downloading", FILE_LENGTH, mgr.reservedBytesPerSegment()[0]);
 
         st.closeFamily(); // e.g. the shard closed mid-download
         release.countDown();
 
-        assertBusy(() -> assertEquals("bytes released", 0L, mgr.stats().reservedBytesPerSegment()[0]), 30, TimeUnit.SECONDS);
+        assertBusy(() -> assertEquals("bytes released", 0L, mgr.reservedBytesPerSegment()[0]), 30, TimeUnit.SECONDS);
         assertEquals(FullFileState.State.CLOSED, st.state());
         assertNull("nothing published", st.localMaster());
         assertFalse(st.cleanupDone());
         assertNull("the cancelled download's entry is gone", fileCache.getRef(dir.resolve(name)));
-        assertEquals("counted as a close, not a download failure", 1L, mgr.stats().declined().get(DeclineReason.FAMILY_CLOSED).longValue());
+        assertEquals("counted as a close, not a download failure", 1L, mgr.counters().get("declined.FAMILY_CLOSED").longValue());
     }
 
     public void testClosingTheFamilyCancelsABlockedDownloadAndReleasesAdmission() throws Exception {
@@ -438,24 +453,24 @@ public class WarmFullFileManagerTests extends OpenSearchTestCase {
 
         FullFileState st = newState(tm, fileCache, name, FILE_LENGTH);
         startPromotion(mgr, st);
-        assertEquals("the one slot is held", 1, mgr.stats().activeDownloads());
-        assertEquals(FILE_LENGTH, mgr.stats().reservedBytesPerSegment()[0]);
+        assertEquals("the one slot is held", 1, mgr.counters().get("activeDownloads").longValue());
+        assertEquals(FILE_LENGTH, mgr.reservedBytesPerSegment()[0]);
 
         st.closeFamily();
 
         assertBusy(() -> {
-            assertEquals("slot released", 0, mgr.stats().activeDownloads());
-            assertEquals("budget released", 0L, mgr.stats().reservedBytesPerSegment()[0]);
+            assertEquals("slot released", 0, mgr.counters().get("activeDownloads").longValue());
+            assertEquals("budget released", 0L, mgr.reservedBytesPerSegment()[0]);
             assertNull("no entry left", fileCache.get(path));
             assertFalse("no partial file left", Files.exists(path));
         }, 30, TimeUnit.SECONDS);
         assertEquals("the reader was never released", 1L, release.getCount());
         assertEquals(FullFileState.State.CLOSED, st.state());
         assertNull(st.localMaster());
-        WarmFullFileStats stats = mgr.stats();
-        assertEquals(1L, stats.declined().get(DeclineReason.FAMILY_CLOSED).longValue());
-        assertEquals(0L, stats.declined().get(DeclineReason.DOWNLOAD_FAILED).longValue());
-        assertEquals(0L, stats.promoted());
+        Map<String, Long> stats = mgr.counters();
+        assertEquals(1L, stats.get("declined.FAMILY_CLOSED").longValue());
+        assertEquals(0L, stats.get("declined.DOWNLOAD_FAILED").longValue());
+        assertEquals(0L, stats.get("promoted").longValue());
         release.countDown();
     }
 
@@ -482,15 +497,15 @@ public class WarmFullFileManagerTests extends OpenSearchTestCase {
         startPromotion(mgr, st);
 
         assertBusy(() -> {
-            assertEquals(0, mgr.stats().activeDownloads());
-            assertEquals(0L, mgr.stats().reservedBytesPerSegment()[0]);
+            assertEquals(0, mgr.counters().get("activeDownloads").longValue());
+            assertEquals(0L, mgr.reservedBytesPerSegment()[0]);
             assertNull(fileCache.get(path));
             assertFalse(Files.exists(path));
         }, 30, TimeUnit.SECONDS);
         assertEquals("the third part was never requested", 2, inner.readCount());
         assertEquals(FullFileState.State.CLOSED, st.state());
-        assertEquals(1L, mgr.stats().declined().get(DeclineReason.FAMILY_CLOSED).longValue());
-        assertEquals(0L, mgr.stats().declined().get(DeclineReason.DOWNLOAD_FAILED).longValue());
+        assertEquals(1L, mgr.counters().get("declined.FAMILY_CLOSED").longValue());
+        assertEquals(0L, mgr.counters().get("declined.DOWNLOAD_FAILED").longValue());
     }
 
     public void testConcurrentFamilyCloseAndPromotionDoNotDeadlock() throws Exception {
@@ -548,7 +563,7 @@ public class WarmFullFileManagerTests extends OpenSearchTestCase {
                 return;
             }
             for (FullFileState st : states) {
-                if (st.casState(FullFileState.State.BLOCK, FullFileState.State.PROMOTING)) {
+                if (st.onAccess(mgr.relativeTimeInMillis())) {
                     mgr.executor().execute(() -> mgr.promote(st));
                 }
             }
@@ -578,7 +593,7 @@ public class WarmFullFileManagerTests extends OpenSearchTestCase {
                 assertNull("no mapping left behind for " + st.fullFilePath(), st.localMaster());
             }
             for (int s = 0; s < 4; s++) {
-                assertEquals("budget fully released in segment " + s, 0L, mgr.stats().reservedBytesPerSegment()[s]);
+                assertEquals("budget fully released in segment " + s, 0L, mgr.reservedBytesPerSegment()[s]);
             }
         }, 30, TimeUnit.SECONDS);
     }
@@ -604,7 +619,7 @@ public class WarmFullFileManagerTests extends OpenSearchTestCase {
             assertTrue("the trigger never fires again", mgr.relativeTimeInMillis() < st.retryAt());
             assertNull("useless whole file removed from the cache", fileCache.get(path));
             assertFalse("and deleted from disk", Files.exists(path));
-            assertEquals("budget released", 0L, mgr.stats().reservedBytesPerSegment()[0]);
+            assertEquals("budget released", 0L, mgr.reservedBytesPerSegment()[0]);
         }
 
         // The slot was released: an mmap-served file now promotes.
@@ -659,6 +674,50 @@ public class WarmFullFileManagerTests extends OpenSearchTestCase {
         }
     }
 
+    @TestLogging(value = "org.opensearch.storage.warmfullfile.WarmFullFileManager:DEBUG", reason = "the admission decline line is DEBUG")
+    public void testFailureDeclinesLogAtWarnAndAdmissionDeclinesAtDebug() throws Exception {
+        // A decline that means something went wrong (here a checksum mismatch on a fresh download) is a WARN. An
+        // admission decline (no budget) is the normal steady state on a full cache and stays at DEBUG.
+        FileCache fileCache = newFileCache();
+        String loggerName = WarmFullFileManager.class.getName();
+        try (MockLogAppender appender = MockLogAppender.createForLoggers(LogManager.getLogger(WarmFullFileManager.class))) {
+            appender.addExpectation(
+                new MockLogAppender.SeenEventExpectation(
+                    "checksum mismatch is a WARN",
+                    loggerName,
+                    Level.WARN,
+                    "*whole-file promotion declined (downloaded checksum mismatch) for *_warn.faiss*"
+                )
+            );
+            appender.addExpectation(
+                new MockLogAppender.SeenEventExpectation(
+                    "budget decline is a DEBUG",
+                    loggerName,
+                    Level.DEBUG,
+                    "*whole-file promotion declined (per-segment whole-file budget exceeded) for *_debug.faiss*"
+                )
+            );
+            appender.addExpectation(
+                new MockLogAppender.UnseenEventExpectation("budget decline is not a WARN", loggerName, Level.WARN, "*_debug.faiss*")
+            );
+
+            byte[] content = footeredContent(FILE_LENGTH);
+            TransferManager tm = new TransferManager(new FixedContentStreamReader(content), fileCache, threadPool);
+            WarmFullFileManager failing = newManager(fileCache, 1, 0.5);
+            String otherChecksum = Long.toString(Long.parseLong(footerChecksum(content)) + 1);
+            FullFileState failed = newStateWithChecksum(tm, fileCache, "_warn.faiss", content.length, otherChecksum);
+            startPromotion(failing, failed);
+            awaitState(failed, FullFileState.State.BLOCK);
+
+            WarmFullFileManager noBudget = newManager(fileCache, 1, 0.0);
+            FullFileState declined = newState(tm, fileCache, "_debug.faiss", FILE_LENGTH);
+            startPromotion(noBudget, declined);
+            assertEquals(FullFileState.State.BLOCK, declined.state());
+
+            assertBusy(appender::assertAllExpectationsMatched, 10, TimeUnit.SECONDS);
+        }
+    }
+
     public void testPromoteOnClosedFamilyTakesNoSlotAndReadsNothing() throws Exception {
         // The trigger CAS'd BLOCK -> PROMOTING and submitted promote(); the shard then closed before the executor ran it.
         // promote() must return at once: no slot, no budget reservation, no remote read, no file.
@@ -669,13 +728,13 @@ public class WarmFullFileManagerTests extends OpenSearchTestCase {
         WarmFullFileManager mgr = newManager(fileCache, 1, 0.5);
 
         FullFileState closed = newState(tm, fileCache, "_closed.faiss", FILE_LENGTH);
-        assertTrue(closed.casState(FullFileState.State.BLOCK, FullFileState.State.PROMOTING));
+        assertTrue(closed.onAccess(mgr.relativeTimeInMillis()));
         closed.closeFamily();
         mgr.promote(closed);
 
         assertEquals(FullFileState.State.CLOSED, closed.state());
         assertEquals("no remote read", 0, reader.readCount());
-        assertEquals("no bytes reserved", 0L, mgr.stats().reservedBytesPerSegment()[0]);
+        assertEquals("no bytes reserved", 0L, mgr.reservedBytesPerSegment()[0]);
         assertNull("nothing published", closed.localMaster());
         assertFalse("no file written", Files.exists(dir.resolve("_closed.faiss")));
         assertNull("no cache entry", fileCache.get(dir.resolve("_closed.faiss")));
@@ -702,11 +761,11 @@ public class WarmFullFileManagerTests extends OpenSearchTestCase {
 
         startPromotion(mgr, st); // starts the download and holds slot 1
         mgr.promote(st); // joins the in-flight download and holds slot 2
-        assertEquals("both calls reserved budget while in flight", 2 * FILE_LENGTH, mgr.stats().reservedBytesPerSegment()[0]);
+        assertEquals("both calls reserved budget while in flight", 2 * FILE_LENGTH, mgr.reservedBytesPerSegment()[0]);
         release.countDown();
 
         awaitState(st, FullFileState.State.FULL);
-        assertBusy(() -> assertEquals("the losing handler released its budget", FILE_LENGTH, mgr.stats().reservedBytesPerSegment()[0]));
+        assertBusy(() -> assertEquals("the losing handler released its budget", FILE_LENGTH, mgr.reservedBytesPerSegment()[0]));
         assertNotNull("the winning mapping is kept", st.localMaster());
         assertArrayEquals(expectedBytes(FILE_LENGTH), readAll(st.localMaster(), FILE_LENGTH));
         assertEquals("downloaded once", 4, reader.readCount());
@@ -735,11 +794,10 @@ public class WarmFullFileManagerTests extends OpenSearchTestCase {
         PositionDependentStreamReader reader = new PositionDependentStreamReader();
         TransferManager tm = new TransferManager(reader, fileCache, threadPool);
         AtomicLong clock = new AtomicLong(5_000);
-        WarmFullFileManager mgr = newManager(fileCache, clock::get, 1, 0.5);
         AtomicInteger hookRuns = new AtomicInteger();
         CountDownLatch hookEntered = new CountDownLatch(1);
         CountDownLatch release = new CountDownLatch(1);
-        mgr.setBeforeDownloadHook(() -> {
+        WarmFullFileManager mgr = newManager(fileCache, clock::get, 1, 0.5, () -> {
             hookRuns.incrementAndGet();
             hookEntered.countDown();
             try {
@@ -750,12 +808,12 @@ public class WarmFullFileManagerTests extends OpenSearchTestCase {
         });
 
         FullFileState held = newState(tm, fileCache, "_held.faiss", FILE_LENGTH);
-        assertTrue(held.casState(FullFileState.State.BLOCK, FullFileState.State.PROMOTING));
+        assertTrue(held.onAccess(mgr.relativeTimeInMillis()));
         threadPool.generic().execute(() -> mgr.promote(held));
         assertTrue("hook entered", hookEntered.await(30, TimeUnit.SECONDS));
 
         assertEquals("nothing read while held", 0, reader.readCount());
-        assertEquals("budget held", FILE_LENGTH, mgr.stats().reservedBytesPerSegment()[0]);
+        assertEquals("budget held", FILE_LENGTH, mgr.reservedBytesPerSegment()[0]);
         assertEquals(FullFileState.State.PROMOTING, held.state());
         FullFileState other = newState(tm, fileCache, "_other.faiss", FILE_LENGTH);
         startPromotion(mgr, other);
@@ -767,12 +825,6 @@ public class WarmFullFileManagerTests extends OpenSearchTestCase {
         awaitState(held, FullFileState.State.FULL);
         assertEquals("one download", 4, reader.readCount());
         assertEquals("hook ran once for that download", 1, hookRuns.get());
-
-        mgr.setBeforeDownloadHook(null);
-        FullFileState plain = newState(tm, fileCache, "_plain.faiss", FILE_LENGTH);
-        startPromotion(mgr, plain);
-        awaitState(plain, FullFileState.State.FULL);
-        assertEquals("no-op hook restored", 1, hookRuns.get());
     }
 
     public void testBudgetDeclinesDoNotLeakDownloadSlots() throws Exception {
@@ -794,7 +846,7 @@ public class WarmFullFileManagerTests extends OpenSearchTestCase {
         FullFileState small = newState(tm, fileCache, "_small.faiss", FILE_LENGTH);
         startPromotion(mgr, small);
         awaitState(small, FullFileState.State.FULL);
-        assertEquals(FILE_LENGTH, mgr.stats().reservedBytesPerSegment()[0]);
+        assertEquals(FILE_LENGTH, mgr.reservedBytesPerSegment()[0]);
     }
 
     public void testFileAtOrAboveMmapChunkSizeIsDeclinedWithoutDownload() throws Exception {
@@ -814,7 +866,7 @@ public class WarmFullFileManagerTests extends OpenSearchTestCase {
             assertEquals(FullFileState.State.BLOCK, st.state());
             assertEquals(100 + WarmFullFileManager.RETRY_DELAY_MILLIS, st.retryAt());
             assertEquals("no download", 0, reader.readCount());
-            assertEquals("no bytes reserved", 0L, mgr.stats().reservedBytesPerSegment()[0]);
+            assertEquals("no bytes reserved", 0L, mgr.reservedBytesPerSegment()[0]);
         }
         assertEquals(
             "the default limit is Lucene's default chunk size",
@@ -873,8 +925,8 @@ public class WarmFullFileManagerTests extends OpenSearchTestCase {
         FullFileState holder = newState(blockedTm, fileCache, "_holder.faiss", FILE_LENGTH);
         startPromotion(mgr, holder); // returns with the download queued and the single slot held
         assertEquals(FullFileState.State.PROMOTING, holder.state());
-        assertEquals(FILE_LENGTH, mgr.stats().reservedBytesPerSegment()[0]);
-        assertEquals(1, mgr.stats().activeDownloads());
+        assertEquals(FILE_LENGTH, mgr.reservedBytesPerSegment()[0]);
+        assertEquals(1, mgr.counters().get("activeDownloads").longValue());
 
         FullFileState declined = newState(freeTm, fileCache, "_noslot.faiss", FILE_LENGTH);
         startPromotion(mgr, declined);
@@ -882,26 +934,27 @@ public class WarmFullFileManagerTests extends OpenSearchTestCase {
         assertEquals("declined on the slot", FullFileState.State.BLOCK, declined.state());
         assertEquals(5_000 + WarmFullFileManager.NO_SLOT_RETRY_DELAY_MILLIS, declined.retryAt());
         assertTrue("the slot retry is shorter than the failure retry", declined.retryAt() < 5_000 + WarmFullFileManager.RETRY_DELAY_MILLIS);
-        assertEquals("only the holder's bytes are reserved", FILE_LENGTH, mgr.stats().reservedBytesPerSegment()[0]);
+        assertEquals("only the holder's bytes are reserved", FILE_LENGTH, mgr.reservedBytesPerSegment()[0]);
         assertEquals("no remote read for the declined family", 0, declinedReader.readCount());
         assertFalse("no file for the declined family", Files.exists(dir.resolve("_noslot.faiss")));
         assertNull("no cache entry for the declined family", fileCache.get(dir.resolve("_noslot.faiss")));
         assertEquals("the holder's download has not started reading", 0, holderReader.readCount());
-        WarmFullFileStats whileHeld = mgr.stats();
-        assertEquals(1L, whileHeld.declined().get(WarmFullFileStats.DeclineReason.NO_SLOT).longValue());
-        assertEquals(2L, whileHeld.requested());
-        assertEquals("only the holder started", 1L, whileHeld.started());
-        assertEquals("the holder still holds the slot", 1, whileHeld.activeDownloads());
+        Map<String, Long> whileHeld = mgr.counters();
+        assertEquals(1L, whileHeld.get("declined.NO_SLOT").longValue());
+        assertEquals(2L, whileHeld.get("requested").longValue());
+        assertEquals("only the holder started", 1L, whileHeld.get("started").longValue());
+        assertEquals("the holder still holds the slot", 1, whileHeld.get("activeDownloads").longValue());
 
         release.countDown();
         awaitState(holder, FullFileState.State.FULL);
         assertEquals(4, holderReader.readCount());
         assertBusy(() -> {
-            assertEquals(1L, mgr.stats().promoted());
-            assertEquals(0, mgr.stats().activeDownloads());
+            assertEquals(1L, mgr.counters().get("promoted").longValue());
+            assertEquals(0, mgr.counters().get("activeDownloads").longValue());
         }, 10, TimeUnit.SECONDS);
 
-        // The slot is free again once the holder is FULL: the declined family now promotes.
+        // The slot is free again once the holder is FULL: at its retry time the declined family promotes.
+        clock.set(declined.retryAt());
         startPromotion(mgr, declined);
         awaitState(declined, FullFileState.State.FULL);
         assertEquals(4, declinedReader.readCount());
@@ -929,7 +982,7 @@ public class WarmFullFileManagerTests extends OpenSearchTestCase {
         assertEquals("two parts were read before the failure", 2, failing.streamsReturned());
         assertFalse("partial file deleted", Files.exists(path));
         assertNull("no cache entry left at the whole-file key", fileCache.get(path));
-        assertEquals("bytes released", 0L, mgr.stats().reservedBytesPerSegment()[0]);
+        assertEquals("bytes released", 0L, mgr.reservedBytesPerSegment()[0]);
         assertEquals("no usage left in the cache", 0L, fileCache.usage());
 
         // The slot was released: a following promotion of another file succeeds with the single slot.
@@ -939,7 +992,7 @@ public class WarmFullFileManagerTests extends OpenSearchTestCase {
         startPromotion(mgr, ok);
         awaitState(ok, FullFileState.State.FULL);
         assertEquals(4, good.readCount());
-        assertEquals(FILE_LENGTH, mgr.stats().reservedBytesPerSegment()[0]);
+        assertEquals(FILE_LENGTH, mgr.reservedBytesPerSegment()[0]);
     }
 
     // ---------- every reader stream is closed ----------
@@ -983,10 +1036,9 @@ public class WarmFullFileManagerTests extends OpenSearchTestCase {
         PositionDependentStreamReader reader = new PositionDependentStreamReader();
         FileCache fileCache = newFileCache();
         TransferManager tm = new TransferManager(reader, fileCache, threadPool);
-        WarmFullFileManager mgr = newManager(fileCache, 1, 0.5);
         Files.write(path, wrongBytes(FILE_LENGTH));
         IndexInput late = localDirectory.openInput(name, IOContext.DEFAULT);
-        mgr.setBeforeDownloadHook(() -> {
+        WarmFullFileManager mgr = newManager(fileCache, threadPool::relativeTimeInMillis, 1, 0.5, () -> {
             fileCache.put(path, new CachedFullFileIndexInput(fileCache, path, late));
             fileCache.decRef(path);
         });
@@ -995,60 +1047,38 @@ public class WarmFullFileManagerTests extends OpenSearchTestCase {
         startPromotion(mgr, st);
 
         assertEquals(FullFileState.State.BLOCK, st.state());
-        WarmFullFileStats stats = mgr.stats();
-        assertEquals("counted as an error decline", 1L, stats.declined().get(WarmFullFileStats.DeclineReason.ERROR).longValue());
-        assertEquals("reserved bytes given back", 0L, stats.reservedBytes());
-        assertEquals("slot given back", 0, stats.activeDownloads());
+        Map<String, Long> stats = mgr.counters();
+        assertEquals("counted as an error decline", 1L, stats.get("declined.ERROR").longValue());
+        assertEquals("reserved bytes given back", 0L, stats.get("reservedBytes").longValue());
+        assertEquals("slot given back", 0, stats.get("activeDownloads").longValue());
         assertEquals("nothing read from the remote store", 0, reader.readCount());
         fileCache.remove(path);
     }
 
-    public void testStuckHandleWarningFiresOnlyWhileHandlesStayOpen() throws Exception {
-        // A FULL family that closes with a handle still open schedules one delayed check. The check warns if the handle
-        // is still open when it runs, and stays silent once the handle has closed and the cleanup has run.
-        String name = "_stuck.faiss";
-        List<Runnable> scheduled = new ArrayList<>();
-        List<Long> delays = new ArrayList<>();
+    public void testFamiliesClosedWithOpenHandlesAreCountedUntilTheyRelease() throws Exception {
+        // A FULL family that closes with a handle still open keeps its mapping until that handle closes. The stats count
+        // such families and the bytes they hold, and drop them once the deferred cleanup has run.
+        String name = "_awaiting.faiss";
         FileCache fileCache = newFileCache();
         TransferManager tm = new TransferManager(new PositionDependentStreamReader(), fileCache, threadPool);
-        WarmFullFileManager mgr = withFaissEligible(
-            new WarmFullFileManager(fileCache, Runnable::run, threadPool::relativeTimeInMillis, 4, 0.5, PART_SIZE, (task, delay) -> {
-                scheduled.add(task);
-                delays.add(delay);
-            })
-        );
+        WarmFullFileManager mgr = newManager(fileCache, 4, 0.5);
         FullFileState st = newState(tm, fileCache, name, FILE_LENGTH);
         startPromotion(mgr, st);
         awaitState(st, FullFileState.State.FULL);
+        assertEquals(0, mgr.counters().get("familiesAwaitingHandleClose").longValue());
         st.incHandles();
 
         st.closeFamily();
-        assertEquals("one check scheduled when the family closes with a handle open", 1, scheduled.size());
-        assertEquals(WarmFullFileManager.STUCK_HANDLE_WARN_DELAY_MILLIS, delays.get(0).longValue());
-
-        String loggerName = WarmFullFileManager.class.getName();
-        try (MockLogAppender appender = MockLogAppender.createForLoggers(LogManager.getLogger(WarmFullFileManager.class))) {
-            appender.addExpectation(
-                new MockLogAppender.SeenEventExpectation(
-                    "warns while the handle is open",
-                    loggerName,
-                    Level.WARN,
-                    "*" + name + "*open handle*"
-                )
-            );
-            scheduled.get(0).run();
-            appender.assertAllExpectationsMatched();
-        }
+        Map<String, Long> closed = mgr.counters();
+        assertEquals("one family waiting on its handle", 1, closed.get("familiesAwaitingHandleClose").longValue());
+        assertEquals("holding the whole file's bytes", FILE_LENGTH, closed.get("bytesAwaitingHandleClose").longValue());
+        assertFalse(st.cleanupDone());
 
         st.decHandles(); // the last handle closes: the deferred cleanup runs on the (inline) executor
         assertBusy(() -> assertTrue(st.cleanupDone()), 10, TimeUnit.SECONDS);
-        try (MockLogAppender appender = MockLogAppender.createForLoggers(LogManager.getLogger(WarmFullFileManager.class))) {
-            appender.addExpectation(
-                new MockLogAppender.UnseenEventExpectation("silent once cleaned up", loggerName, Level.WARN, "*" + name + "*open handle*")
-            );
-            scheduled.get(0).run();
-            appender.assertAllExpectationsMatched();
-        }
+        Map<String, Long> released = mgr.counters();
+        assertEquals("released once the handle closed", 0, released.get("familiesAwaitingHandleClose").longValue());
+        assertEquals(0L, released.get("bytesAwaitingHandleClose").longValue());
     }
 
     public void testLiveCachedFullFileEntryAtKeyIsRemovedAndRedownloaded() throws Exception {
@@ -1150,7 +1180,7 @@ public class WarmFullFileManagerTests extends OpenSearchTestCase {
         assertSame("the placeholder entry itself was reused", placeholder, current);
         fileCache.decRef(path);
         assertEquals("exactly the family's reference, nothing leaked", Integer.valueOf(1), fileCache.getRef(path));
-        assertEquals(FILE_LENGTH, mgr.stats().reservedBytesPerSegment()[0]);
+        assertEquals(FILE_LENGTH, mgr.reservedBytesPerSegment()[0]);
     }
 
     public void testStrayFileWithoutEntryIsDeletedAndRedownloaded() throws Exception {
@@ -1206,7 +1236,7 @@ public class WarmFullFileManagerTests extends OpenSearchTestCase {
         FullFileState st = promoteToFull(mgr, fileCache, name, content, tm);
         int parts = partsFor(name, content.length);
         assertEquals(parts, reader.readCount());
-        assertEquals(content.length, mgr.stats().reservedBytesPerSegment()[0]);
+        assertEquals(content.length, mgr.reservedBytesPerSegment()[0]);
 
         mgr.onExtensionsChanged(Set.of());
 
@@ -1214,19 +1244,57 @@ public class WarmFullFileManagerTests extends OpenSearchTestCase {
         assertBusy(() -> {
             assertTrue("deferred release ran", st.cleanupDone());
             assertNull("mapping closed", st.localMaster());
-            assertEquals("budget released", 0L, mgr.stats().reservedBytesPerSegment()[0]);
+            assertEquals("budget released", 0L, mgr.reservedBytesPerSegment()[0]);
             assertNull("whole file dropped from the cache", fileCache.get(path));
             assertFalse("whole file deleted", Files.exists(path));
         }, 30, TimeUnit.SECONDS);
         assertFalse(st.isMappingReleasePending());
-        assertEquals(1L, mgr.stats().demoted());
+        assertEquals(1L, mgr.counters().get("demoted").longValue());
 
         mgr.onExtensionsChanged(Set.of("faiss"));
         startPromotion(mgr, st);
         awaitState(st, FullFileState.State.FULL);
         assertEquals("downloaded again after the demotion", 2 * parts, reader.readCount());
-        assertEquals(content.length, mgr.stats().reservedBytesPerSegment()[0]);
-        assertEquals(2L, mgr.stats().promoted());
+        assertEquals(content.length, mgr.reservedBytesPerSegment()[0]);
+        assertEquals(2L, mgr.counters().get("promoted").longValue());
+    }
+
+    public void testASecondDemotionAfterARepromotionReleasesAgain() throws Exception {
+        // Demote, release, promote, demote with a real download each time: the second demotion releases the new
+        // mapping, the new whole-file entry and the new budget reservation just as the first did.
+        String name = "_demote_twice.faiss";
+        Path path = dir.resolve(name);
+        byte[] content = footeredContent(FILE_LENGTH);
+        FixedContentStreamReader reader = new FixedContentStreamReader(content);
+        FileCache fileCache = newFileCache();
+        TransferManager tm = new TransferManager(reader, fileCache, threadPool);
+        WarmFullFileManager mgr = newManager(fileCache, 4, 0.5);
+        mgr.onExtensionsChanged(Set.of("faiss"));
+        FullFileState st = promoteToFull(mgr, fileCache, name, content, tm);
+        int parts = partsFor(name, content.length);
+
+        mgr.onExtensionsChanged(Set.of());
+        assertBusy(() -> assertTrue(st.cleanupDone()), 30, TimeUnit.SECONDS);
+        mgr.onExtensionsChanged(Set.of("faiss"));
+        startPromotion(mgr, st);
+        awaitState(st, FullFileState.State.FULL);
+        assertEquals(2 * parts, reader.readCount());
+        assertEquals(content.length, mgr.reservedBytesPerSegment()[0]);
+        assertFalse("the new period owes nothing yet", st.cleanupDone());
+
+        mgr.onExtensionsChanged(Set.of());
+
+        assertEquals(FullFileState.State.BLOCK, st.state());
+        assertBusy(() -> {
+            assertTrue("second release ran", st.cleanupDone());
+            assertNull("second mapping closed", st.localMaster());
+            assertEquals("second budget released", 0L, mgr.reservedBytesPerSegment()[0]);
+            assertNull("second whole file dropped from the cache", fileCache.get(path));
+            assertFalse("second whole file deleted", Files.exists(path));
+        }, 30, TimeUnit.SECONDS);
+        assertFalse(st.isMappingReleasePending());
+        assertEquals(2L, mgr.counters().get("demoted").longValue());
+        assertEquals(0L, mgr.counters().get("familiesAwaitingHandleClose").longValue());
     }
 
     public void testDemotionWithOpenHandleWaitsForItsClose() throws Exception {
@@ -1247,7 +1315,7 @@ public class WarmFullFileManagerTests extends OpenSearchTestCase {
         assertEquals(FullFileState.State.BLOCK, st.state());
         assertTrue("release waits for the handle", st.isMappingReleasePending());
         assertNotNull("mapping kept under the open handle", st.localMaster());
-        assertEquals("budget still held", content.length, mgr.stats().reservedBytesPerSegment()[0]);
+        assertEquals("budget still held", content.length, mgr.reservedBytesPerSegment()[0]);
         assertNotNull(fileCache.get(path));
         fileCache.decRef(path);
         assertFalse(st.cleanupDone());
@@ -1256,7 +1324,7 @@ public class WarmFullFileManagerTests extends OpenSearchTestCase {
         assertBusy(() -> {
             assertTrue(st.cleanupDone());
             assertNull(st.localMaster());
-            assertEquals(0L, mgr.stats().reservedBytesPerSegment()[0]);
+            assertEquals(0L, mgr.reservedBytesPerSegment()[0]);
             assertNull(fileCache.get(path));
         }, 30, TimeUnit.SECONDS);
         assertFalse(st.isMappingReleasePending());
@@ -1284,10 +1352,10 @@ public class WarmFullFileManagerTests extends OpenSearchTestCase {
             assertEquals(FullFileState.State.BLOCK, st.state());
             assertTrue(st.cleanupDone());
             assertNull(fileCache.get(path));
-            assertEquals(0L, mgr.stats().reservedBytesPerSegment()[0]);
+            assertEquals(0L, mgr.reservedBytesPerSegment()[0]);
         }, 30, TimeUnit.SECONDS);
-        assertEquals(1L, mgr.stats().promoted());
-        assertEquals(1L, mgr.stats().demoted());
+        assertEquals(1L, mgr.counters().get("promoted").longValue());
+        assertEquals(1L, mgr.counters().get("demoted").longValue());
     }
 
     public void testSettingsChangeThatKeepsTheExtensionDuringTheDownloadLeavesTheFamilyFull() throws Exception {
@@ -1307,8 +1375,8 @@ public class WarmFullFileManagerTests extends OpenSearchTestCase {
 
         awaitState(st, FullFileState.State.FULL);
         assertNotNull(st.localMaster());
-        assertEquals(0L, mgr.stats().demoted());
-        assertEquals(content.length, mgr.stats().reservedBytesPerSegment()[0]);
+        assertEquals(0L, mgr.counters().get("demoted").longValue());
+        assertEquals(content.length, mgr.reservedBytesPerSegment()[0]);
     }
 
     public void testReAddingTheExtensionRestoresADemotedFamilyWhileItsHandleIsOpen() throws Exception {
@@ -1337,10 +1405,10 @@ public class WarmFullFileManagerTests extends OpenSearchTestCase {
         assertFalse("nothing left to release", st.isMappingReleasePending());
         assertSame("the same mapping is served", master, st.localMaster());
         assertEquals("no remote read", parts, reader.readCount());
-        assertEquals(1L, mgr.stats().demoted());
-        assertEquals(1L, mgr.stats().restored());
-        assertEquals("one promotion in total", 1L, mgr.stats().promoted());
-        assertEquals(content.length, mgr.stats().reservedBytesPerSegment()[0]);
+        assertEquals(1L, mgr.counters().get("demoted").longValue());
+        assertEquals(1L, mgr.counters().get("restored").longValue());
+        assertEquals("one promotion in total", 1L, mgr.counters().get("promoted").longValue());
+        assertEquals(content.length, mgr.reservedBytesPerSegment()[0]);
         assertServedWithOneReference(st, fileCache, path, content);
 
         st.decHandles();
@@ -1353,9 +1421,9 @@ public class WarmFullFileManagerTests extends OpenSearchTestCase {
             assertTrue(st.cleanupDone());
             assertNull(st.localMaster());
             assertNull(fileCache.get(path));
-            assertEquals(0L, mgr.stats().reservedBytesPerSegment()[0]);
+            assertEquals(0L, mgr.reservedBytesPerSegment()[0]);
         }, 30, TimeUnit.SECONDS);
-        assertEquals(2L, mgr.stats().demoted());
+        assertEquals(2L, mgr.counters().get("demoted").longValue());
     }
 
     public void testReAddingTheExtensionAfterTheReleaseIsNotARestore() throws Exception {
@@ -1375,7 +1443,7 @@ public class WarmFullFileManagerTests extends OpenSearchTestCase {
         mgr.onExtensionsChanged(Set.of("faiss"));
 
         assertEquals(FullFileState.State.BLOCK, st.state());
-        assertEquals(0L, mgr.stats().restored());
+        assertEquals(0L, mgr.counters().get("restored").longValue());
         assertFalse(st.isMappingReleasePending());
         startPromotion(mgr, st);
         awaitState(st, FullFileState.State.FULL);
@@ -1396,10 +1464,10 @@ public class WarmFullFileManagerTests extends OpenSearchTestCase {
 
         assertEquals(FullFileState.State.BLOCK, graph.state());
         assertEquals(FullFileState.State.FULL, codes.state());
-        assertEquals(1L, mgr.stats().demoted());
+        assertEquals(1L, mgr.counters().get("demoted").longValue());
         assertBusy(() -> assertTrue(graph.cleanupDone()), 30, TimeUnit.SECONDS);
         assertNotNull("the kept family still serves its mapping", codes.localMaster());
-        assertEquals("the kept family's bytes stay reserved", content.length, mgr.stats().reservedBytesPerSegment()[0]);
+        assertEquals("the kept family's bytes stay reserved", content.length, mgr.reservedBytesPerSegment()[0]);
     }
 
     // ---------- whole files left on disk, validated against the remote checksum ----------
@@ -1426,11 +1494,46 @@ public class WarmFullFileManagerTests extends OpenSearchTestCase {
         assertServedWithOneReference(st, fileCache, path, content);
         assertNotSame("the placeholder was replaced by a live entry", restored, fileCache.get(path));
         fileCache.decRef(path);
-        WarmFullFileStats stats = mgr.stats();
-        assertEquals("counted as reused", 1L, stats.reused());
-        assertEquals("no download started", 0L, stats.started());
-        assertEquals("no bytes downloaded", 0L, stats.downloadedBytes());
-        assertEquals(1L, stats.promoted());
+        Map<String, Long> stats = mgr.counters();
+        assertEquals("counted as reused", 1L, stats.get("reused").longValue());
+        assertEquals("no download started", 0L, stats.get("started").longValue());
+        assertEquals("no bytes downloaded", 0L, stats.get("downloadedBytes").longValue());
+        assertEquals(1L, stats.get("promoted").longValue());
+    }
+
+    public void testRestoredLeftoverSurvivesAnEvictionDuringItsReuse() throws Exception {
+        // The restore placeholder is unreferenced in the cache. While the manager validates the file and until
+        // fetchBlobAsync has replaced the placeholder, an eviction must not take it, or the listener deletes the file
+        // under the manager and the download that follows is counted as a reuse. The manager holds a reference across
+        // that window; here the cache overflows inside it, from another entry, and the file is still reused.
+        String name = "_reuse_evicted.faiss";
+        Path path = dir.resolve(name);
+        byte[] content = footeredContent(FILE_LENGTH);
+        FixedContentStreamReader reader = new FixedContentStreamReader(content);
+        FileCache fileCache = FileCacheFactory.createConcurrentLRUFileCache(content.length + 64, 1);
+        TransferManager tm = new TransferManager(reader, fileCache, threadPool);
+        Files.write(path, content);
+        putRestoredPlaceholder(fileCache, path, content.length);
+        Path other = dir.resolve("_other.faiss");
+        WarmFullFileManager mgr = newManager(fileCache, threadPool::relativeTimeInMillis, 4, 1.0, () -> {
+            // Runs after validation, before fetchBlobAsync: an entry that overflows the cache, dropped at once, so the
+            // evictor runs over every unreferenced entry.
+            fileCache.put(other, new FileCache.RestoredCachedIndexInput(content.length));
+            fileCache.decRef(other);
+            assertTrue("the whole file is still on disk", Files.exists(path));
+            assertNull("the overflowing entry, not the placeholder, was evicted", fileCache.get(other));
+        });
+
+        FullFileState st = newStateWithChecksum(tm, fileCache, name, content.length, footerChecksum(content));
+        startPromotion(mgr, st);
+        awaitState(st, FullFileState.State.FULL);
+
+        assertEquals("nothing read from the remote store", 0, reader.readCount());
+        assertServedWithOneReference(st, fileCache, path, content);
+        Map<String, Long> stats = mgr.counters();
+        assertEquals("counted as reused", 1L, stats.get("reused").longValue());
+        assertEquals("no download started", 0L, stats.get("started").longValue());
+        assertEquals("no bytes downloaded", 0L, stats.get("downloadedBytes").longValue());
     }
 
     public void testCompleteStrayFileIsReusedWithoutDownload() throws Exception {
@@ -1453,11 +1556,11 @@ public class WarmFullFileManagerTests extends OpenSearchTestCase {
 
         assertEquals("nothing read from the remote store", 0, reader.readCount());
         assertServedWithOneReference(st, fileCache, path, content);
-        WarmFullFileStats stats = mgr.stats();
-        assertEquals("counted as reused", 1L, stats.reused());
-        assertEquals("no download started", 0L, stats.started());
-        assertEquals("no bytes downloaded", 0L, stats.downloadedBytes());
-        assertEquals(1L, stats.promoted());
+        Map<String, Long> stats = mgr.counters();
+        assertEquals("counted as reused", 1L, stats.get("reused").longValue());
+        assertEquals("no download started", 0L, stats.get("started").longValue());
+        assertEquals("no bytes downloaded", 0L, stats.get("downloadedBytes").longValue());
+        assertEquals(1L, stats.get("promoted").longValue());
     }
 
     public void testCompletedEntryOfAnEarlierFamilyIsJoinedAfterItsClose() throws Exception {
@@ -1480,7 +1583,7 @@ public class WarmFullFileManagerTests extends OpenSearchTestCase {
         assertNotNull("the whole-file entry outlives the family", fileCache.get(path));
         fileCache.decRef(path);
         assertEquals("unreferenced after the close", Integer.valueOf(0), fileCache.getRef(path));
-        assertEquals(0L, mgr.stats().reservedBytesPerSegment()[0]);
+        assertEquals(0L, mgr.reservedBytesPerSegment()[0]);
 
         FullFileState second = newStateWithChecksum(tm, fileCache, name, content.length, footerChecksum(content));
         startPromotion(mgr, second);
@@ -1488,11 +1591,11 @@ public class WarmFullFileManagerTests extends OpenSearchTestCase {
 
         assertEquals("no remote read for the joined entry", parts, reader.readCount());
         assertServedWithOneReference(second, fileCache, path, content);
-        WarmFullFileStats stats = mgr.stats();
-        assertEquals("joining a complete download is not a local-copy reuse", 0L, stats.reused());
-        assertEquals(2L, stats.started());
-        assertEquals(2L, stats.promoted());
-        assertEquals(content.length, stats.reservedBytesPerSegment()[0]);
+        Map<String, Long> stats = mgr.counters();
+        assertEquals("joining a complete download is not a local-copy reuse", 0L, stats.get("reused").longValue());
+        assertEquals(2L, stats.get("started").longValue());
+        assertEquals(2L, stats.get("promoted").longValue());
+        assertEquals(content.length, mgr.reservedBytesPerSegment()[0]);
     }
 
     public void testTruncatedLeftoverIsDeletedAndRedownloaded() throws Exception {
@@ -1516,10 +1619,10 @@ public class WarmFullFileManagerTests extends OpenSearchTestCase {
         assertEquals("re-downloaded, one read per part", partsFor(name, content.length), reader.readCount());
         assertArrayEquals("file on disk was rewritten", content, Files.readAllBytes(path));
         assertServedWithOneReference(st, fileCache, path, content);
-        WarmFullFileStats stats = mgr.stats();
-        assertEquals("not reused", 0L, stats.reused());
-        assertEquals("one download started", 1L, stats.started());
-        assertEquals(content.length, stats.downloadedBytes());
+        Map<String, Long> stats = mgr.counters();
+        assertEquals("not reused", 0L, stats.get("reused").longValue());
+        assertEquals("one download started", 1L, stats.get("started").longValue());
+        assertEquals(content.length, stats.get("downloadedBytes").longValue());
     }
 
     public void testFullLengthLeftoverWithWrongFooterChecksumIsRedownloaded() throws Exception {
@@ -1547,10 +1650,10 @@ public class WarmFullFileManagerTests extends OpenSearchTestCase {
         assertEquals("re-downloaded, one read per part", partsFor(name, content.length), reader.readCount());
         assertArrayEquals("file on disk was rewritten", content, Files.readAllBytes(path));
         assertServedWithOneReference(st, fileCache, path, content);
-        WarmFullFileStats stats = mgr.stats();
-        assertEquals("not reused", 0L, stats.reused());
-        assertEquals("one download started", 1L, stats.started());
-        assertEquals(content.length, stats.downloadedBytes());
+        Map<String, Long> stats = mgr.counters();
+        assertEquals("not reused", 0L, stats.get("reused").longValue());
+        assertEquals("one download started", 1L, stats.get("started").longValue());
+        assertEquals(content.length, stats.get("downloadedBytes").longValue());
     }
 
     public void testCorruptedMiddleBytesAreRejectedOnlyWithEntireFileCheck() throws Exception {
@@ -1578,8 +1681,8 @@ public class WarmFullFileManagerTests extends OpenSearchTestCase {
 
         assertEquals("re-downloaded, one read per part", partsFor(verifiedName, content.length), verifiedReader.readCount());
         assertServedWithOneReference(verified, verifiedCache, verifiedPath, content);
-        assertEquals("not reused", 0L, verifying.stats().reused());
-        assertEquals(1L, verifying.stats().started());
+        assertEquals("not reused", 0L, verifying.counters().get("reused").longValue());
+        assertEquals(1L, verifying.counters().get("started").longValue());
 
         String unverifiedName = "_mid_unverified.faiss";
         Path unverifiedPath = dir.resolve(unverifiedName);
@@ -1596,8 +1699,8 @@ public class WarmFullFileManagerTests extends OpenSearchTestCase {
 
         assertEquals("nothing read from the remote store", 0, unverifiedReader.readCount());
         assertServedWithOneReference(unverified, unverifiedCache, unverifiedPath, corrupted);
-        assertEquals("the corrupted copy was reused", 1L, footerOnly.stats().reused());
-        assertEquals(0L, footerOnly.stats().started());
+        assertEquals("the corrupted copy was reused", 1L, footerOnly.counters().get("reused").longValue());
+        assertEquals(0L, footerOnly.counters().get("started").longValue());
     }
 
     public void testFreshDownloadWithMismatchedChecksumEndsInBlockWithNothingLeft() throws Exception {
@@ -1625,13 +1728,13 @@ public class WarmFullFileManagerTests extends OpenSearchTestCase {
             assertNull("entry removed", fileCache.get(path));
             assertFalse("file deleted", Files.exists(path));
         }, 10, TimeUnit.SECONDS);
-        WarmFullFileStats stats = mgr.stats();
-        assertEquals(1L, stats.declined().get(WarmFullFileStats.DeclineReason.CHECKSUM_MISMATCH).longValue());
-        assertEquals(1L, stats.failed());
-        assertEquals(1L, stats.started());
-        assertEquals(0L, stats.promoted());
-        assertEquals("budget released", 0L, stats.reservedBytesPerSegment()[0]);
-        assertEquals("slot released", 0, stats.activeDownloads());
+        Map<String, Long> stats = mgr.counters();
+        assertEquals(1L, stats.get("declined.CHECKSUM_MISMATCH").longValue());
+        assertEquals(1L, stats.get("failed").longValue());
+        assertEquals(1L, stats.get("started").longValue());
+        assertEquals(0L, stats.get("promoted").longValue());
+        assertEquals("budget released", 0L, mgr.reservedBytesPerSegment()[0]);
+        assertEquals("slot released", 0, stats.get("activeDownloads").longValue());
     }
 
     // ---------- concurrent promote() of one family ----------
@@ -1648,7 +1751,7 @@ public class WarmFullFileManagerTests extends OpenSearchTestCase {
         WarmFullFileManager mgr = newManager(fileCache, 4, 0.5);
 
         FullFileState st = newState(tm, fileCache, name, FILE_LENGTH);
-        assertTrue(st.casState(FullFileState.State.BLOCK, FullFileState.State.PROMOTING));
+        assertTrue(st.onAccess(mgr.relativeTimeInMillis()));
 
         int callers = 4;
         CountDownLatch start = new CountDownLatch(1);
@@ -1674,7 +1777,7 @@ public class WarmFullFileManagerTests extends OpenSearchTestCase {
         assertBusy(() -> {
             assertEquals(FullFileState.State.FULL, st.state());
             assertEquals("one download's worth of part reads", 4, reader.readCount());
-            assertEquals("one file's worth of budget", FILE_LENGTH, mgr.stats().reservedBytesPerSegment()[0]);
+            assertEquals("one file's worth of budget", FILE_LENGTH, mgr.reservedBytesPerSegment()[0]);
             assertEquals("exactly the family's reference", Integer.valueOf(1), fileCache.getRef(path));
         }, 30, TimeUnit.SECONDS);
         assertEquals(FILE_LENGTH, localDirectory.fileLength(name));
@@ -1690,7 +1793,7 @@ public class WarmFullFileManagerTests extends OpenSearchTestCase {
             assertEquals("admitted (slot " + i + " was free)", FullFileState.State.PROMOTING, s.state());
             later.add(s);
         }
-        assertEquals("budget: the raced family plus 4 in flight", FILE_LENGTH * (callers + 1), mgr.stats().reservedBytesPerSegment()[0]);
+        assertEquals("budget: the raced family plus 4 in flight", FILE_LENGTH * (callers + 1), mgr.reservedBytesPerSegment()[0]);
         release.countDown();
         for (FullFileState s : later) {
             awaitState(s, FullFileState.State.FULL);
@@ -1709,12 +1812,16 @@ public class WarmFullFileManagerTests extends OpenSearchTestCase {
         AtomicLong clock = new AtomicLong(5_000);
         WarmFullFileManager mgr = newManager(fileCache, clock::get, 2, 0.5);
 
-        WarmFullFileStats before = mgr.stats();
-        assertEquals(0L, before.promoted());
-        assertEquals(0L, before.totalDeclined());
-        assertEquals(0L, before.reservedBytes());
-        assertEquals(0, before.activeDownloads());
-        assertEquals("every reason is present", WarmFullFileStats.DeclineReason.values().length, before.declined().size());
+        Map<String, Long> before = mgr.counters();
+        assertEquals(0L, before.get("promoted").longValue());
+        assertEquals(0L, before.get("declined").longValue());
+        assertEquals(0L, before.get("reservedBytes").longValue());
+        assertEquals(0, before.get("activeDownloads").longValue());
+        assertEquals(
+            "every reason is present",
+            DeclineReason.values().length,
+            before.keySet().stream().filter(k -> k.startsWith("declined.")).count()
+        );
 
         String loggerName = WarmFullFileManager.class.getName();
         try (MockLogAppender appender = MockLogAppender.createForLoggers(LogManager.getLogger(WarmFullFileManager.class))) {
@@ -1729,10 +1836,10 @@ public class WarmFullFileManagerTests extends OpenSearchTestCase {
             FullFileState st = newState(tm, fileCache, name, FILE_LENGTH);
             startPromotion(mgr, st); // the reader blocks on the latch, so the download is in flight
 
-            WarmFullFileStats inFlight = mgr.stats();
-            assertEquals("slot held while downloading", 1, inFlight.activeDownloads());
-            assertEquals("bytes reserved while downloading", FILE_LENGTH, inFlight.reservedBytes());
-            assertEquals(0L, inFlight.promoted());
+            Map<String, Long> inFlight = mgr.counters();
+            assertEquals("slot held while downloading", 1, inFlight.get("activeDownloads").longValue());
+            assertEquals("bytes reserved while downloading", FILE_LENGTH, inFlight.get("reservedBytes").longValue());
+            assertEquals(0L, inFlight.get("promoted").longValue());
 
             clock.addAndGet(250); // all download time passes before the first byte is served
             release.countDown();
@@ -1740,18 +1847,18 @@ public class WarmFullFileManagerTests extends OpenSearchTestCase {
 
             // The counters and the INFO line follow the state change to FULL, so poll for them.
             assertBusy(() -> {
-                WarmFullFileStats after = mgr.stats();
-                assertEquals(1L, after.requested());
-                assertEquals(1L, after.started());
-                assertEquals(1L, after.promoted());
-                assertEquals(0L, after.failed());
-                assertEquals(FILE_LENGTH, after.downloadedBytes());
-                assertEquals(FILE_LENGTH, after.promotedBytes());
-                assertArrayEquals("one segment, the file's bytes", new long[] { FILE_LENGTH }, after.reservedBytesPerSegment());
-                assertEquals("download time is measured with the manager clock", 250L, after.downloadMillis());
-                assertEquals("FULL keeps the budget reserved", FILE_LENGTH, after.reservedBytes());
-                assertEquals("slot released at FULL", 0, after.activeDownloads());
-                assertEquals(0L, after.totalDeclined());
+                Map<String, Long> after = mgr.counters();
+                assertEquals(1L, after.get("requested").longValue());
+                assertEquals(1L, after.get("started").longValue());
+                assertEquals(1L, after.get("promoted").longValue());
+                assertEquals(0L, after.get("failed").longValue());
+                assertEquals(FILE_LENGTH, after.get("downloadedBytes").longValue());
+                assertEquals(FILE_LENGTH, after.get("promotedBytes").longValue());
+                assertArrayEquals("one segment, the file's bytes", new long[] { FILE_LENGTH }, mgr.reservedBytesPerSegment());
+                assertEquals("download time is measured with the manager clock", 250L, after.get("downloadMillis").longValue());
+                assertEquals("FULL keeps the budget reserved", FILE_LENGTH, after.get("reservedBytes").longValue());
+                assertEquals("slot released at FULL", 0, after.get("activeDownloads").longValue());
+                assertEquals(0L, after.get("declined").longValue());
                 appender.assertAllExpectationsMatched();
             }, 10, TimeUnit.SECONDS);
         }
@@ -1767,11 +1874,11 @@ public class WarmFullFileManagerTests extends OpenSearchTestCase {
         FullFileState overBudget = newState(tm, fileCache, "_budget.faiss", FILE_LENGTH);
         startPromotion(budgetMgr, overBudget);
         assertEquals(FullFileState.State.BLOCK, overBudget.state());
-        assertEquals(1L, budgetMgr.stats().declined().get(WarmFullFileStats.DeclineReason.BUDGET_EXCEEDED).longValue());
-        assertEquals(1L, budgetMgr.stats().totalDeclined());
-        assertEquals("requested but never started", 1L, budgetMgr.stats().requested());
-        assertEquals(0L, budgetMgr.stats().started());
-        assertEquals("an admission decline is not a failure", 0L, budgetMgr.stats().failed());
+        assertEquals(1L, budgetMgr.counters().get("declined.BUDGET_EXCEEDED").longValue());
+        assertEquals(1L, budgetMgr.counters().get("declined").longValue());
+        assertEquals("requested but never started", 1L, budgetMgr.counters().get("requested").longValue());
+        assertEquals(0L, budgetMgr.counters().get("started").longValue());
+        assertEquals("an admission decline is not a failure", 0L, budgetMgr.counters().get("failed").longValue());
 
         WarmFullFileManager mgr = newManager(fileCache, new AtomicLong()::get, 4, 0.5);
 
@@ -1793,19 +1900,19 @@ public class WarmFullFileManagerTests extends OpenSearchTestCase {
         startPromotion(mgr, failing);
         awaitState(failing, FullFileState.State.BLOCK);
 
-        WarmFullFileStats stats = mgr.stats();
-        assertEquals(1L, stats.declined().get(WarmFullFileStats.DeclineReason.TOO_LARGE).longValue());
-        assertEquals(1L, stats.declined().get(WarmFullFileStats.DeclineReason.NOT_MMAP).longValue());
-        assertEquals(1L, stats.declined().get(WarmFullFileStats.DeclineReason.DOWNLOAD_FAILED).longValue());
-        assertEquals(0L, stats.declined().get(WarmFullFileStats.DeclineReason.NO_SLOT).longValue());
-        assertEquals(3L, stats.totalDeclined());
-        assertEquals("three promote() calls", 3L, stats.requested());
-        assertEquals("the too-large file never started a download", 2L, stats.started());
-        assertEquals("NIO and the failed part both started and did not reach FULL", 2L, stats.failed());
-        assertEquals("only the NIO download completed", FILE_LENGTH, stats.downloadedBytes());
-        assertEquals("nothing promoted", 0L, stats.promoted());
-        assertEquals("every decline released its bytes", 0L, stats.reservedBytes());
-        assertEquals("every decline released its slot", 0, stats.activeDownloads());
+        Map<String, Long> stats = mgr.counters();
+        assertEquals(1L, stats.get("declined.TOO_LARGE").longValue());
+        assertEquals(1L, stats.get("declined.NOT_MMAP").longValue());
+        assertEquals(1L, stats.get("declined.DOWNLOAD_FAILED").longValue());
+        assertEquals(0L, stats.get("declined.NO_SLOT").longValue());
+        assertEquals(3L, stats.get("declined").longValue());
+        assertEquals("three promote() calls", 3L, stats.get("requested").longValue());
+        assertEquals("the too-large file never started a download", 2L, stats.get("started").longValue());
+        assertEquals("NIO and the failed part both started and did not reach FULL", 2L, stats.get("failed").longValue());
+        assertEquals("only the NIO download completed", FILE_LENGTH, stats.get("downloadedBytes").longValue());
+        assertEquals("nothing promoted", 0L, stats.get("promoted").longValue());
+        assertEquals("every decline released its bytes", 0L, stats.get("reservedBytes").longValue());
+        assertEquals("every decline released its slot", 0, stats.get("activeDownloads").longValue());
         assertNotNull(stats.toString());
     }
 }

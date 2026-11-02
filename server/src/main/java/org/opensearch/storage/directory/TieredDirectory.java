@@ -13,6 +13,7 @@ import org.apache.logging.log4j.Logger;
 import org.apache.lucene.index.IndexFileNames;
 import org.apache.lucene.store.DataAccessHint;
 import org.apache.lucene.store.Directory;
+import org.apache.lucene.store.FSDirectory;
 import org.apache.lucene.store.IOContext;
 import org.apache.lucene.store.IndexInput;
 import org.apache.lucene.store.ReadOnceHint;
@@ -24,6 +25,8 @@ import org.opensearch.index.store.remote.filecache.CachedIndexInput;
 import org.opensearch.index.store.remote.filecache.FileCache;
 import org.opensearch.index.store.remote.utils.FileTypeUtils;
 import org.opensearch.storage.indexinput.CachedSwitchableIndexInput;
+import org.opensearch.storage.indexinput.PromotableCachedSwitchableIndexInput;
+import org.opensearch.storage.indexinput.PromotableSwitchableIndexInputWrapper;
 import org.opensearch.storage.indexinput.SwitchableIndexInput;
 import org.opensearch.storage.indexinput.SwitchableIndexInputWrapper;
 import org.opensearch.storage.prefetch.TieredStoragePrefetchSettings;
@@ -39,7 +42,6 @@ import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
 import java.util.Arrays;
 import java.util.Collection;
-import java.util.Optional;
 import java.util.function.Supplier;
 import java.util.stream.Stream;
 
@@ -62,7 +64,6 @@ public class TieredDirectory extends CompositeDirectory {
     static final long ONE_BLOCK_BYTES = AbstractBlockIndexInput.Builder.DEFAULT_BLOCK_SIZE;
 
     private final Supplier<TieredStoragePrefetchSettings> tieredStoragePrefetchSettingsSupplier;
-    private final Supplier<WarmFullFileSettings> warmFullFileSettingsSupplier;
     private final WarmFullFileManager warmFullFileManager;
 
     public TieredDirectory(
@@ -71,12 +72,10 @@ public class TieredDirectory extends CompositeDirectory {
         FileCache fileCache,
         ThreadPool threadPool,
         Supplier<TieredStoragePrefetchSettings> tieredStoragePrefetchSettingsSupplier,
-        Supplier<WarmFullFileSettings> warmFullFileSettingsSupplier,
         WarmFullFileManager warmFullFileManager
     ) {
         super(localDirectory, remoteDirectory, fileCache, threadPool);
         this.tieredStoragePrefetchSettingsSupplier = tieredStoragePrefetchSettingsSupplier;
-        this.warmFullFileSettingsSupplier = warmFullFileSettingsSupplier;
         this.warmFullFileManager = warmFullFileManager;
     }
 
@@ -169,46 +168,40 @@ public class TieredDirectory extends CompositeDirectory {
         }
         try {
             SwitchableIndexInput original = (SwitchableIndexInput) indexInput.getIndexInput();
-            // Decide eligibility once per handle, here, because only openInput sees the IOContext.
-            boolean eligible = isEligibleForFullFile(name, context, original);
-            FullFileState fullFileState = indexInput.fullFileState();
-            return new SwitchableIndexInputWrapper(
-                "SwitchableIndexInput (path=" + getFilePath(name) + ")",
-                (SwitchableIndexInput) original.clone(),
-                fullFileState,
-                eligible,
-                warmFullFileManager
-            );
+            String resourceDescription = "SwitchableIndexInput (path=" + getFilePath(name) + ")";
+            // A promotable entry hands out the promotable wrapper, and only to a handle that passes the open-time rules,
+            // decided here because only openInput sees the IOContext. Every other handle is the existing wrapper: it
+            // reads blocks as before, never triggers and never reads the mapping.
+            if (indexInput instanceof PromotableCachedSwitchableIndexInput promotable && isEligibleForFullFile(name, context, original)) {
+                return new PromotableSwitchableIndexInputWrapper(
+                    resourceDescription,
+                    (SwitchableIndexInput) original.clone(),
+                    promotable.fullFileState(),
+                    warmFullFileManager
+                );
+            }
+            return new SwitchableIndexInputWrapper(resourceDescription, (SwitchableIndexInput) original.clone());
         } finally {
             fileCache.decRef(key);
         }
     }
 
     /**
-     * Decides, once per opened handle, whether this handle may trigger whole-file promotion. All conditions must hold:
+     * Decides, once per opened handle, whether this handle takes part in whole-file promotion (may trigger it and reads
+     * the mapping once FULL) or stays a plain block handle. All conditions must hold:
      * the file is larger than one block and below the mmap chunk size; the context is a plain DEFAULT read (excludes
      * merges and FLUSH); and it carries no ReadOnce/SEQUENTIAL hint (excludes recovery checksum reads). Temp/corrupted
      * files never reach here (handled earlier in openInput).
      *
-     * <p>Neither the extension setting nor remote (block) mode is part of this decision: the searcher opens its
-     * handles at refresh time and never reopens them for an unchanged segment, so a handle must be able to become
-     * promotable later, when the segment is uploaded or the extension is added to the setting, and must stop being
-     * promotable when the extension is removed. The wrapper checks both at trigger time instead; see
-     * {@link FullFileState#markRemoteMode(String)} and {@link WarmFullFileManager#isExtensionEligible(String)}.
+     * <p>The extension is not part of this decision: it selects the entry type when the family is created (see
+     * {@code newSwitchableEntry}), and the wrapper reads the setting again at trigger time so that an extension removed
+     * since then stops promoting. Remote (block) mode is not part of it either: the searcher opens its handles at
+     * refresh time and never reopens them for an unchanged segment, so a handle must be able to become promotable later,
+     * once the segment is uploaded; see {@link FullFileState#markRemoteMode(String)}.
      */
     // visible for testing
     boolean isEligibleForFullFile(String name, IOContext context, SwitchableIndexInput original) {
-        String rejection = ineligibleReason(name, context, original);
-        if (rejection == null) {
-            return true;
-        }
-        // A rejection is worth a line only for an extension the setting lists, when debugging a node that never
-        // promotes. This runs once per openInput, never on a read.
-        Optional.ofNullable(warmFullFileSettingsSupplier)
-            .map(Supplier::get)
-            .filter(settings -> settings.isExtensionEligible(WarmFullFileSettings.extensionOf(name)))
-            .ifPresent(settings -> logger.debug("whole-file promotion: [{}] opened with {} is not eligible: {}", name, context, rejection));
-        return false;
+        return ineligibleReason(name, context, original) == null;
     }
 
     /** The rule that rejects a file at open, or null when its handles may trigger a promotion. */
@@ -247,50 +240,6 @@ public class TieredDirectory extends CompositeDirectory {
 
         // perform the full file to block switch for the switchable index input (currently called here for testing)
         switchFileToRemote(file);
-
-        // Whole-file promotion may start only now that the local copy is gone; see FullFileState.markRemoteMode.
-        markFamilyRemote(file);
-    }
-
-    /**
-     * Flags the family as remote-mode only if its original input has actually switched to remote. When the switch
-     * failed (or the entry is gone), the family keeps serving the local copy and must stay non-promotable, since
-     * whole-file promotion removes the family's local cache entry.
-     */
-    private void markFamilyRemote(String file) {
-        withSwitchableEntry(file, (entry, input) -> {
-            FullFileState fullFileState = entry.fullFileState();
-            if (fullFileState != null && input.hasSwitchedToRemote()) {
-                fullFileState.markRemoteMode(FullFileState.uploadedChecksum(remoteDirectory, file));
-            }
-        }, "Failed to confirm the switch to remote; the family stays on blocks");
-    }
-
-    /** An action on the switchable input behind a family's cache entry. */
-    @FunctionalInterface
-    private interface SwitchableEntryAction {
-        void accept(CachedIndexInput entry, SwitchableIndexInput input) throws IOException;
-    }
-
-    /**
-     * Runs {@code action} on the switchable entry of {@code file}, holding a reference on the entry for the duration and
-     * releasing it afterwards. Does nothing when the entry is gone. A failure is logged with {@code failureMessage}.
-     */
-    private void withSwitchableEntry(String file, SwitchableEntryAction action, String failureMessage) {
-        Path key = getFilePathSwitchable(localDirectory, file);
-        CachedIndexInput entry = fileCache.get(key);
-        if (entry == null) {
-            return;
-        }
-        try {
-            if (entry.getIndexInput() instanceof SwitchableIndexInput input) {
-                action.accept(entry, input);
-            }
-        } catch (IOException | IllegalStateException e) {
-            logger.warn("{} - {}", failureMessage, file, e);
-        } finally {
-            fileCache.decRef(key);
-        }
     }
 
     @Override
@@ -303,7 +252,21 @@ public class TieredDirectory extends CompositeDirectory {
      * @param file
      */
     public void switchFileToRemote(String file) {
-        withSwitchableEntry(file, (entry, input) -> input.switchToRemote(), "Failed to switch full file to blocked");
+        Path filePath = getFilePathSwitchable(localDirectory, file);
+        try {
+            CachedIndexInput entry = fileCache.get(filePath);
+            SwitchableIndexInput switchableIndexInput = ((SwitchableIndexInput) entry.getIndexInput());
+            switchableIndexInput.switchToRemote();
+            // A promotable family may start promoting only once its local copy is gone, because promotion removes the
+            // family's local cache entry. A family whose switch did not happen keeps serving the local copy on blocks.
+            if (entry instanceof PromotableCachedSwitchableIndexInput promotable && switchableIndexInput.hasSwitchedToRemote()) {
+                promotable.fullFileState().markRemoteMode(FullFileState.uploadedChecksum(remoteDirectory, file));
+            }
+        } catch (IOException | IllegalStateException e) {
+            logger.error("Failed to switch full file to blocked - " + file, e);
+        } finally {
+            fileCache.decRef(filePath);
+        }
     }
 
     @Override
@@ -369,16 +332,39 @@ public class TieredDirectory extends CompositeDirectory {
         }
     }
 
+    /**
+     * A file whose extension the setting lists gets the promotable entry, which owns the family's promotion state. Every
+     * other file, and every file when there is no manager, gets the existing entry. The setting is read when the entry
+     * is created, so a change to it applies to families created afterwards.
+     */
     private CachedSwitchableIndexInput newSwitchableEntry(String fileName, boolean cacheFromRemote) throws IOException {
+        FSDirectory fsDirectory = DirectoryUtils.unwrapFSDirectory(localDirectory);
+        if (isCandidate(fileName)) {
+            return new PromotableCachedSwitchableIndexInput(
+                fileCache,
+                fileName,
+                fsDirectory,
+                remoteDirectory,
+                transferManager,
+                cacheFromRemote,
+                threadPool,
+                tieredStoragePrefetchSettingsSupplier
+            );
+        }
         return new CachedSwitchableIndexInput(
             fileCache,
             fileName,
-            DirectoryUtils.unwrapFSDirectory(localDirectory),
+            fsDirectory,
             remoteDirectory,
             transferManager,
             cacheFromRemote,
             threadPool,
             tieredStoragePrefetchSettingsSupplier
         );
+    }
+
+    /** Whether the file's extension is listed in the promotion setting; never without a manager. */
+    private boolean isCandidate(String fileName) {
+        return warmFullFileManager != null && warmFullFileManager.isExtensionEligible(WarmFullFileSettings.extensionOf(fileName));
     }
 }

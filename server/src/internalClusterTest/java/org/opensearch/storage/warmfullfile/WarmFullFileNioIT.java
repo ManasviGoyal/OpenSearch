@@ -6,7 +6,7 @@
  * compatible open source license.
  */
 
-package org.opensearch.storage;
+package org.opensearch.storage.warmfullfile;
 
 import org.apache.logging.log4j.Level;
 import org.apache.logging.log4j.LogManager;
@@ -16,8 +16,6 @@ import org.opensearch.common.regex.Regex;
 import org.opensearch.index.query.QueryBuilders;
 import org.opensearch.index.store.remote.filecache.CachedIndexInput;
 import org.opensearch.index.store.remote.utils.FileTypeUtils;
-import org.opensearch.storage.warmfullfile.FullFileState;
-import org.opensearch.storage.warmfullfile.WarmFullFileManager;
 import org.opensearch.test.MockLogAppender;
 
 import java.io.IOException;
@@ -81,8 +79,7 @@ public class WarmFullFileNioIT extends WarmFullFileBaseIT {
         Path wholeFileKey = nio.directory.getFilePath(fdt);
         assertStateLengthMatchesDirectory(nio, fdt);
 
-        AtomicInteger downloads = new AtomicInteger();
-        manager.setBeforeDownloadHook(downloads::incrementAndGet);
+        long startedBefore = manager.counters().get("started");
         try (MockLogAppender appender = MockLogAppender.createForLoggers(LogManager.getLogger(WarmFullFileManager.class))) {
             appender.addExpectation(
                 new MockLogAppender.SeenEventExpectation("one WARN for fdt", MANAGER_LOGGER, Level.WARN, fdtDeclinedWarnFor(wholeFileKey))
@@ -93,7 +90,7 @@ public class WarmFullFileNioIT extends WarmFullFileBaseIT {
             // The first search clones the stored-fields input and starts the download.
             assertBusy(() -> {
                 assertSearchCorrect(NIO_INDEX, knownBody);
-                assertEquals(1, downloads.get());
+                assertEquals(1, downloadsSince(manager, startedBefore));
             }, WAIT_TIMEOUT.seconds(), TimeUnit.SECONDS);
             // The download completes and the family is declined for good.
             assertBusy(() -> {
@@ -106,7 +103,7 @@ public class WarmFullFileNioIT extends WarmFullFileBaseIT {
             for (int i = 0; i < 100; i++) {
                 assertSearchCorrect(NIO_INDEX, knownBody);
             }
-            assertEquals("exactly one whole-file download", 1, downloads.get());
+            assertEquals("exactly one whole-file download", 1, downloadsSince(manager, startedBefore));
 
             // The downloaded copy is gone: no plain .fdt in the shard directory and no whole-file cache entry.
             assertBusy(() -> assertNoWholeFile(nio, fdt), WAIT_TIMEOUT.seconds(), TimeUnit.SECONDS);
@@ -120,8 +117,6 @@ public class WarmFullFileNioIT extends WarmFullFileBaseIT {
             assertEquals(FullFileState.State.BLOCK, state.state());
             assertEquals(Long.MAX_VALUE, state.retryAt());
             appender.assertAllExpectationsMatched();
-        } finally {
-            manager.setBeforeDownloadHook(null);
         }
 
         deleteIndex(NIO_INDEX);
@@ -149,8 +144,7 @@ public class WarmFullFileNioIT extends WarmFullFileBaseIT {
         assertStateLengthMatchesDirectory(first, fdt1);
         assertStateLengthMatchesDirectory(second, fdt2);
 
-        AtomicInteger downloads = new AtomicInteger();
-        manager.setBeforeDownloadHook(downloads::incrementAndGet);
+        long startedBefore = manager.counters().get("started");
         try (MockLogAppender appender = MockLogAppender.createForLoggers(LogManager.getLogger(WarmFullFileManager.class))) {
             appender.addExpectation(
                 new MockLogAppender.SeenEventExpectation(
@@ -173,7 +167,7 @@ public class WarmFullFileNioIT extends WarmFullFileBaseIT {
             // First index: download, decline, WARN.
             assertBusy(() -> {
                 assertSearchCorrect(NIO_INDEX, knownBody1);
-                assertEquals(1, downloads.get());
+                assertEquals(1, downloadsSince(manager, startedBefore));
             }, WAIT_TIMEOUT.seconds(), TimeUnit.SECONDS);
             assertBusy(
                 () -> assertEquals(Long.MAX_VALUE, requireFamilyState(first, fdt1).retryAt()),
@@ -184,7 +178,7 @@ public class WarmFullFileNioIT extends WarmFullFileBaseIT {
             // Second index: download, decline, no WARN.
             assertBusy(() -> {
                 assertSearchCorrect(NIO_INDEX_2, knownBody2);
-                assertEquals(2, downloads.get());
+                assertEquals(2, downloadsSince(manager, startedBefore));
             }, WAIT_TIMEOUT.seconds(), TimeUnit.SECONDS);
             assertBusy(
                 () -> assertEquals(Long.MAX_VALUE, requireFamilyState(second, fdt2).retryAt()),
@@ -196,7 +190,7 @@ public class WarmFullFileNioIT extends WarmFullFileBaseIT {
                 assertSearchCorrect(NIO_INDEX, knownBody1);
                 assertSearchCorrect(NIO_INDEX_2, knownBody2);
             }
-            assertEquals("one download per file", 2, downloads.get());
+            assertEquals("one download per file", 2, downloadsSince(manager, startedBefore));
             assertEquals(FullFileState.State.BLOCK, requireFamilyState(first, fdt1).state());
             assertEquals(FullFileState.State.BLOCK, requireFamilyState(second, fdt2).state());
             assertBusy(() -> {
@@ -204,8 +198,6 @@ public class WarmFullFileNioIT extends WarmFullFileBaseIT {
                 assertNoWholeFile(second, fdt2);
             }, WAIT_TIMEOUT.seconds(), TimeUnit.SECONDS);
             appender.assertAllExpectationsMatched();
-        } finally {
-            manager.setBeforeDownloadHook(null);
         }
 
         deleteIndex(NIO_INDEX, NIO_INDEX_2);
@@ -233,8 +225,7 @@ public class WarmFullFileNioIT extends WarmFullFileBaseIT {
         long nioLength = assertStateLengthMatchesDirectory(nio, nioFdt);
         long mmapLength = assertStateLengthMatchesDirectory(mmap, mmapFdt);
 
-        AtomicInteger downloads = new AtomicInteger();
-        manager.setBeforeDownloadHook(downloads::incrementAndGet);
+        long startedBefore = manager.counters().get("started");
         try (MockLogAppender appender = MockLogAppender.createForLoggers(LogManager.getLogger(WarmFullFileManager.class))) {
             appender.addExpectation(
                 new MockLogAppender.SeenEventExpectation(
@@ -256,7 +247,7 @@ public class WarmFullFileNioIT extends WarmFullFileBaseIT {
             // NIO-served index: downloaded once, declined for good.
             assertBusy(() -> {
                 assertSearchCorrect(NIO_INDEX, nioBody);
-                assertEquals(1, downloads.get());
+                assertEquals(1, downloadsSince(manager, startedBefore));
             }, WAIT_TIMEOUT.seconds(), TimeUnit.SECONDS);
             assertBusy(
                 () -> assertEquals(Long.MAX_VALUE, requireFamilyState(nio, nioFdt).retryAt()),
@@ -268,7 +259,7 @@ public class WarmFullFileNioIT extends WarmFullFileBaseIT {
             // mmap-served index on the same node: downloaded once and promoted to FULL.
             assertBusy(() -> {
                 assertSearchCorrect(MMAP_INDEX, mmapBody);
-                assertEquals(2, downloads.get());
+                assertEquals(2, downloadsSince(manager, startedBefore));
             }, WAIT_TIMEOUT.seconds(), TimeUnit.SECONDS);
             assertBusy(
                 () -> assertEquals(FullFileState.State.FULL, requireFamilyState(mmap, mmapFdt).state()),
@@ -292,7 +283,7 @@ public class WarmFullFileNioIT extends WarmFullFileBaseIT {
                 assertSearchCorrect(NIO_INDEX, nioBody);
                 assertSearchCorrect(MMAP_INDEX, mmapBody);
             }
-            assertEquals("one download per file", 2, downloads.get());
+            assertEquals("one download per file", 2, downloadsSince(manager, startedBefore));
             FullFileState nioState = requireFamilyState(nio, nioFdt);
             assertEquals(FullFileState.State.BLOCK, nioState.state());
             assertEquals(Long.MAX_VALUE, nioState.retryAt());
@@ -300,11 +291,14 @@ public class WarmFullFileNioIT extends WarmFullFileBaseIT {
             assertEquals(FullFileState.State.FULL, requireFamilyState(mmap, mmapFdt).state());
             assertBusy(() -> assertNoWholeFile(nio, nioFdt), WAIT_TIMEOUT.seconds(), TimeUnit.SECONDS);
             appender.assertAllExpectationsMatched();
-        } finally {
-            manager.setBeforeDownloadHook(null);
         }
 
         deleteIndex(NIO_INDEX, MMAP_INDEX);
+    }
+
+    /** The whole-file downloads the manager has started since {@code startedBefore} was read from its counters. */
+    private static long downloadsSince(WarmFullFileManager manager, long startedBefore) {
+        return manager.counters().get("started") - startedBefore;
     }
 
     /**

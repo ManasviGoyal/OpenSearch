@@ -283,7 +283,7 @@ public class SwitchableIndexInputTests extends TieredStorageBaseTestCase {
             threadPool,
             getPrefetchSettingsSupplier()
         );
-        SwitchableIndexInputWrapper wrapper = new SwitchableIndexInputWrapper("wrapper", switchableIndexInput, null, false, null);
+        SwitchableIndexInputWrapper wrapper = new SwitchableIndexInputWrapper("wrapper", switchableIndexInput);
 
         IndexInput clone = wrapper.clone();
         IndexInput slice = wrapper.slice("slice", 0, wrapper.length());

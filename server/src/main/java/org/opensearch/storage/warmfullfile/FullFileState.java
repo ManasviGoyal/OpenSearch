@@ -27,7 +27,7 @@ import java.util.concurrent.atomic.AtomicReference;
 /**
  * Per-file-family state for warm-tier whole-file promotion.
  *
- * <p>One instance is owned by each {@code CachedSwitchableIndexInput} (the family's cache entry). It tracks the
+ * <p>One instance is owned by each {@code PromotableCachedSwitchableIndexInput} (the family's cache entry). It tracks the
  * promotion lifecycle and holds what the node-level manager needs to download the whole file and later unmap it:
  *
  * <pre>
@@ -37,10 +37,13 @@ import java.util.concurrent.atomic.AtomicReference;
  *   any --(family closes)--&gt;  CLOSED
  * </pre>
  *
- * The mapping is published before the CAS to {@link State#FULL}. When a FULL family closes, the budget is released at
- * once and the unmap plus the release of the family's FileCache reference run exactly once on the cleanup executor,
- * after the last handle closes; whichever of "family closed" and "last handle closed" happens second schedules it, so
- * no thread waits and nothing re-enters the FileCache from the removal listener.
+ * Every transition is a named method of this class, taken under one lock: {@link #onAccess}, {@link #abandonPromotion},
+ * {@link #completePromotion}, {@link #demote}, {@link #restore}, {@link #closeFamily} and the release that the last
+ * {@link #decHandles} schedules. The mapping is published and the family moves to {@link State#FULL} in one step, so a
+ * reader that sees FULL sees the mapping. When a FULL family closes, the unmap, the release of
+ * the family's FileCache reference and the release of its budget run exactly once on the cleanup executor, after the
+ * last handle closes; whichever of "family closed" and "last handle closed" happens second schedules it, so no thread
+ * waits and nothing re-enters the FileCache from the removal listener.
  *
  * @opensearch.experimental
  */
@@ -85,22 +88,23 @@ public final class FullFileState {
     private volatile long retryAt;
     private final AtomicInteger handleCount = new AtomicInteger(0);
 
-    // Teardown wiring, attached by the manager before the CAS to FULL.
+    // Teardown wiring, set by completePromotion together with the mapping.
     private volatile Executor cleanupExecutor;
     private volatile Runnable budgetRelease;
     private volatile Runnable onClosedWithLiveHandles;
+    private volatile Runnable onCleanupDone;
     // Set when the family left FULL (closed or demoted) with a mapping still published: the deferred unmap and decRef
     // are owed exactly in that case.
     private volatile boolean mappingReleaseOwed;
-    // Orders the transitions out of FULL (close, demote), restore and the scheduling of the release against each
-    // other; never held across cache calls.
+    // Orders the transitions out of FULL (close, demote), restore, the scheduling of the release and the start of a new
+    // FULL period against each other; never held across cache calls.
     private final Object releaseLock = new Object();
-    private final AtomicBoolean budgetReleased = new AtomicBoolean(false);
+    // One-shot per FULL period: re-armed by completePromotion.
     private final AtomicBoolean cleanupScheduled = new AtomicBoolean(false);
     private volatile boolean cleanupDone;
 
     // Everything promote() needs to build the download request and open the family's own mapping, all available from
-    // the CachedSwitchableIndexInput constructor.
+    // the PromotableCachedSwitchableIndexInput constructor.
     private final TransferManager transferManager;
     private final FSDirectory localDirectory;
     private final FileCache fileCache;
@@ -175,11 +179,40 @@ public final class FullFileState {
     }
 
     /**
-     * Atomically moves from {@code expect} to {@code next}.
-     * @return true if the transition was applied
+     * The trigger: a clone or slice of a handle finds the family in BLOCK. Moves it to PROMOTING when the retry time has
+     * passed and no previous mapping is still waiting for its release (a promotion in that window would map the file a
+     * second time). The state and the retry time are read without the lock first, so the lock is taken only when a
+     * promotion is about to start.
+     *
+     * @param nowMillis the current monotonic time
+     * @return true if this call moved the family to PROMOTING; the caller then promotes it or abandons the promotion
      */
-    public boolean casState(State expect, State next) {
-        return state.compareAndSet(expect, next);
+    public boolean onAccess(long nowMillis) {
+        if (state.get() != State.BLOCK || nowMillis < retryAt) {
+            return false;
+        }
+        synchronized (releaseLock) {
+            if (state.get() != State.BLOCK || nowMillis < retryAt || isMappingReleasePending()) {
+                return false;
+            }
+            state.set(State.PROMOTING);
+            return true;
+        }
+    }
+
+    /**
+     * Ends a promotion that did not reach FULL: PROMOTING goes back to BLOCK and no promotion starts before
+     * {@code retryAt}. The retry time is set even when the family is no longer PROMOTING (it closed meanwhile), so a
+     * trigger racing this call cannot start a new promotion in between.
+     *
+     * @param retryAt the earliest monotonic time a new promotion may be attempted
+     * @return true if the family went back to BLOCK; false if it was in any other state
+     */
+    public boolean abandonPromotion(long retryAt) {
+        synchronized (releaseLock) {
+            this.retryAt = retryAt;
+            return state.compareAndSet(State.PROMOTING, State.BLOCK);
+        }
     }
 
     /** @return the local whole-file mapping, or null before promotion publishes it */
@@ -187,28 +220,61 @@ public final class FullFileState {
         return localMaster.get();
     }
 
+    /** How {@link #completePromotion} ended. */
+    @ExperimentalApi
+    public enum Completion {
+        /** The mapping is published and the family is FULL. */
+        FULL,
+        /** Another completion handler for this family published its mapping first; that handler owns the state. */
+        PUBLISHED_BY_OTHER,
+        /** The family left PROMOTING before the publish (it closed, or its promotion was abandoned); nothing was installed. */
+        NOT_PROMOTING
+    }
+
     /**
-     * Atomically publishes or clears the mapping. The manager publishes with {@code (null, master)} so that only one
-     * completion handler can install a mapping for the family, and unwinds with {@code (master, null)} so that a handler
-     * can only clear the mapping it installed itself.
+     * Publishes the mapping of a PROMOTING family and moves it to FULL in one step, with the teardown that later gives
+     * the mapping, the family's cache reference and its budget back. A new FULL period starts here, so the one-shot
+     * release flags of the previous period are re-armed; that period's release has run by now, because
+     * {@link #onAccess} does not start a promotion while a release is pending and a closed family is never promoted.
      *
-     * @return true if the field held {@code expected} and now holds {@code update}
+     * @param mapping                 the family's own whole-file mapping
+     * @param cleanupExecutor         pool the unmap + decRef run on (never the FileCache listener thread)
+     * @param budgetRelease           returns this file's reserved per-segment budget bytes; run once, by the deferred
+     *                                cleanup, together with the unmap and the release of the cache reference
+     * @param onClosedWithLiveHandles called if the family closes while handles are still open
+     * @param onCleanupDone           called once the deferred unmap + decRef has run
+     * @return {@link Completion#FULL}, or why nothing was installed
      */
-    public boolean compareAndSetLocalMaster(IndexInput expected, IndexInput update) {
-        return localMaster.compareAndSet(expected, update);
+    public Completion completePromotion(
+        IndexInput mapping,
+        Executor cleanupExecutor,
+        Runnable budgetRelease,
+        Runnable onClosedWithLiveHandles,
+        Runnable onCleanupDone
+    ) {
+        synchronized (releaseLock) {
+            if (localMaster.get() != null) {
+                return Completion.PUBLISHED_BY_OTHER;
+            }
+            if (state.get() != State.PROMOTING) {
+                return Completion.NOT_PROMOTING;
+            }
+            this.cleanupExecutor = cleanupExecutor;
+            this.budgetRelease = budgetRelease;
+            this.onClosedWithLiveHandles = onClosedWithLiveHandles;
+            this.onCleanupDone = onCleanupDone;
+            mappingReleaseOwed = false;
+            cleanupScheduled.set(false);
+            cleanupDone = false;
+            localMaster.set(mapping);
+            state.set(State.FULL);
+            return Completion.FULL;
+        }
     }
 
     /** @return the earliest time (monotonic millis) a new promotion may be attempted */
     public long retryAt() {
         return retryAt;
-    }
-
-    /**
-     * Sets the next retry time after a decline or failure.
-     * @param retryAt monotonic millis
-     */
-    public void setRetryAt(long retryAt) {
-        this.retryAt = retryAt;
     }
 
     /**
@@ -248,27 +314,13 @@ public final class FullFileState {
     }
 
     /**
-     * Attaches the teardown for a FULL family. Called by the manager before it publishes FULL.
-     *
-     * @param cleanupExecutor          pool the unmap + decRef run on (never the FileCache listener thread)
-     * @param budgetRelease            returns this file's reserved per-segment budget bytes; run once, at close or
-     *                                 when a demoted family's mapping is released
-     * @param onClosedWithLiveHandles  called if the family closes while handles are still open (leak detection)
-     */
-    void attachCleanup(Executor cleanupExecutor, Runnable budgetRelease, Runnable onClosedWithLiveHandles) {
-        this.cleanupExecutor = cleanupExecutor;
-        this.budgetRelease = budgetRelease;
-        this.onClosedWithLiveHandles = onClosedWithLiveHandles;
-    }
-
-    /**
-     * The family-close routine. Called from {@code CachedSwitchableIndexInput.close()}, which runs
+     * The family-close routine. Called from {@code PromotableCachedSwitchableIndexInput.close()}, which runs
      * inside the FileCache removal listener under a segment lock, so this must not touch the FileCache inline.
      *
-     * <p>Marks the state CLOSED and cancels a download in flight. If it was FULL: releases the budget now, and schedules
-     * the unmap + decRef for when the handle count reaches zero (immediately on the cleanup executor if it already is).
-     * If it was PROMOTING, the cancelled download fails and the manager's completion handler unwinds; if BLOCK, there
-     * is nothing to release.
+     * <p>Marks the state CLOSED and cancels a download in flight. If it was FULL: schedules the unmap, the decRef and
+     * the budget release for when the handle count reaches zero (immediately on the cleanup executor if it already is),
+     * so the bytes count against the segment for as long as the whole file is held in it. If it was PROMOTING, the
+     * cancelled download fails and the manager's completion handler unwinds; if BLOCK, there is nothing to release.
      */
     public void closeFamily() {
         State prev;
@@ -287,7 +339,6 @@ public final class FullFileState {
         if (prev != State.FULL) {
             return;
         }
-        releaseBudgetOnce();
         if (handleCount.get() > 0) {
             Runnable report = onClosedWithLiveHandles;
             if (report != null) {
@@ -349,15 +400,9 @@ public final class FullFileState {
         return mappingReleaseOwed && cleanupDone == false && state.get() != State.CLOSED;
     }
 
-    private void releaseBudgetOnce() {
-        Runnable release = budgetRelease;
-        if (release != null && budgetReleased.compareAndSet(false, true)) {
-            release.run();
-        }
-    }
-
     /**
-     * Schedules the cleanup exactly once, and only when the family left FULL with a mapping and no handle remains.
+     * Schedules the cleanup exactly once per FULL period, and only when the family left FULL with a mapping and no
+     * handle remains.
      * {@link #closeFamily()}, {@link #demote()} and {@link #decHandles()} call this after their own write, so whichever
      * runs second sees both conditions true.
      */
@@ -400,8 +445,17 @@ public final class FullFileState {
         } catch (RuntimeException e) {
             logger.warn("failed to release whole-file cache reference for {}", fullFilePath, e);
         }
-        releaseBudgetOnce(); // already done at close; this is the demotion case, where the bytes were held until now
+        // The budget goes back with the reference, after it: the bytes count against the segment until the whole file
+        // no longer occupies it.
+        Runnable release = budgetRelease;
+        if (release != null) {
+            release.run();
+        }
         cleanupDone = true;
+        Runnable done = onCleanupDone;
+        if (done != null) {
+            done.run();
+        }
     }
 
     /** @return true once the deferred unmap + decRef has run */
