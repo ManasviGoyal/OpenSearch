@@ -13,7 +13,16 @@ import org.apache.logging.log4j.Level;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.core.LogEvent;
 import org.apache.lucene.codecs.CodecUtil;
+import org.apache.lucene.document.Document;
+import org.apache.lucene.index.ConcurrentMergeScheduler;
+import org.apache.lucene.index.IndexWriter;
+import org.apache.lucene.index.IndexWriterConfig;
+import org.apache.lucene.index.MergePolicy;
+import org.apache.lucene.index.MergeScheduler;
+import org.apache.lucene.index.SegmentCommitInfo;
+import org.apache.lucene.index.SegmentInfos;
 import org.apache.lucene.store.AlreadyClosedException;
+import org.apache.lucene.store.ByteBuffersDirectory;
 import org.apache.lucene.store.FSDirectory;
 import org.apache.lucene.store.IOContext;
 import org.apache.lucene.store.IndexInput;
@@ -382,12 +391,12 @@ public class SwitchableIndexInputWrapperWholeFileTests extends TieredStorageBase
         RecordingExecutor exec = new RecordingExecutor();
         SwitchableIndexInputWrapper handle = new PromotableSwitchableIndexInputWrapper("h", in, st, manager(exec, new AtomicLong()));
 
-        // The same clone and slice calls a merge makes, on a thread named the way OpenSearch names merge threads.
+        // The same clone and slice calls a merge makes, on the kind of thread Lucene runs merges on.
         Queue<IndexInput> mergeInputs = new ConcurrentLinkedQueue<>();
-        Thread merge = new Thread(() -> {
+        Thread merge = mergeThread(() -> {
             mergeInputs.add(handle.clone());
             mergeInputs.add(handle.slice("s", 0, Math.min(16, in.length())));
-        }, "opensearch[node1][[index][0]: Lucene Merge Thread #3]");
+        });
         merge.start();
         merge.join();
         assertEquals("a merge thread never requests promotion", 0, exec.submitted.get());
@@ -399,6 +408,30 @@ public class SwitchableIndexInputWrapperWholeFileTests extends TieredStorageBase
         assertEquals(FullFileState.State.PROMOTING, st.state());
         IOUtils.close(mergeInputs);
         IOUtils.close(searchClone, handle);
+    }
+
+    /** A real {@code ConcurrentMergeScheduler.MergeThread}, as Lucene runs merges on, that runs {@code body} instead of a merge. */
+    private static Thread mergeThread(Runnable body) throws IOException {
+        try (ByteBuffersDirectory segments = new ByteBuffersDirectory()) {
+            try (IndexWriter writer = new IndexWriter(segments, new IndexWriterConfig())) {
+                writer.addDocument(new Document());
+                writer.commit();
+            }
+            SegmentCommitInfo segment = SegmentInfos.readLatestCommit(segments).asList().get(0);
+            return new MergeThreadFactory().newMergeThread(new MergePolicy.OneMerge(List.of(segment)), body);
+        }
+    }
+
+    /** {@code MergeThread} is a protected member type of the scheduler, so only a subclass can construct one. */
+    private static final class MergeThreadFactory extends ConcurrentMergeScheduler {
+        Thread newMergeThread(MergePolicy.OneMerge merge, Runnable body) {
+            return new MergeThread(mock(MergeScheduler.MergeSource.class), merge) {
+                @Override
+                public void run() {
+                    body.run();
+                }
+            };
+        }
     }
 
     public void testNoRequestBeforeRetryAt() throws IOException {

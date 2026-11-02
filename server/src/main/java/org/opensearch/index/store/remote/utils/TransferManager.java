@@ -15,6 +15,7 @@ import org.apache.lucene.store.IOContext;
 import org.apache.lucene.store.IndexInput;
 import org.opensearch.common.annotation.ExperimentalApi;
 import org.opensearch.common.util.CancellableThreads;
+import org.opensearch.common.util.io.IOUtils;
 import org.opensearch.index.store.remote.filecache.CachedIndexInput;
 import org.opensearch.index.store.remote.filecache.FileCache;
 import org.opensearch.index.store.remote.filecache.FileCachedIndexInput;
@@ -28,6 +29,7 @@ import java.io.OutputStream;
 import java.io.UncheckedIOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.Executor;
@@ -182,10 +184,10 @@ public class TransferManager {
             }
             if (Files.exists(request.getFilePath()) == false) {
                 logger.trace("Fetching from Remote in createIndexInput of Transfer Manager");
-                if (cancellableThreads == null) {
-                    downloadParts(streamReader, request, null);
+                if (request.isAtomicWrite()) {
+                    downloadAtomically(fileCache, streamReader, request, cancellableThreads);
                 } else {
-                    cancellableThreads.executeIO(() -> downloadParts(streamReader, request, cancellableThreads));
+                    download(streamReader, request, request.getFilePath(), cancellableThreads);
                 }
             }
             final IndexInput luceneIndexInput = request.getDirectory().openInput(request.getFileName(), IOContext.DEFAULT);
@@ -196,13 +198,56 @@ public class TransferManager {
     }
 
     /**
-     * Writes the request's parts to its file in order. With a cancellation handle, stops before the next part once the
-     * handle is cancelled; the interrupt the cancel sends fails the write in progress on its own.
+     * Downloads to the request's temp path, fsyncs it, renames it to the final path and fsyncs the directory, so a
+     * file at the final path is complete even after a crash or a power loss mid-download. A temp file left by an
+     * earlier attempt, and the cache entry a restart may have made for it, are removed first. On any failure the temp
+     * file is deleted; the final path is never touched.
      */
-    private static void downloadParts(StreamReader streamReader, BlobFetchRequest request, CancellableThreads cancellableThreads)
+    private static void downloadAtomically(
+        FileCache fileCache,
+        StreamReader streamReader,
+        BlobFetchRequest request,
+        CancellableThreads cancellableThreads
+    ) throws IOException {
+        final Path temp = request.getTempFilePath();
+        fileCache.remove(temp); // closes and deletes a leftover a restart has registered; a no-op for an unknown key
+        Files.deleteIfExists(temp);
+        try {
+            download(streamReader, request, temp, cancellableThreads);
+            IOUtils.fsync(temp, false);
+            Files.move(temp, request.getFilePath(), StandardCopyOption.ATOMIC_MOVE);
+            IOUtils.fsync(request.getFilePath().getParent(), true);
+        } catch (IOException | RuntimeException e) {
+            try {
+                Files.deleteIfExists(temp);
+            } catch (IOException suppressed) {
+                e.addSuppressed(suppressed);
+            }
+            throw e;
+        }
+    }
+
+    private static void download(StreamReader streamReader, BlobFetchRequest request, Path target, CancellableThreads cancellableThreads)
         throws IOException {
+        if (cancellableThreads == null) {
+            downloadParts(streamReader, request, target, null);
+        } else {
+            cancellableThreads.executeIO(() -> downloadParts(streamReader, request, target, cancellableThreads));
+        }
+    }
+
+    /**
+     * Writes the request's parts to {@code target} in order. With a cancellation handle, stops before the next part
+     * once the handle is cancelled; the interrupt the cancel sends fails the write in progress on its own.
+     */
+    private static void downloadParts(
+        StreamReader streamReader,
+        BlobFetchRequest request,
+        Path target,
+        CancellableThreads cancellableThreads
+    ) throws IOException {
         try (
-            OutputStream fileOutputStream = Files.newOutputStream(request.getFilePath());
+            OutputStream fileOutputStream = Files.newOutputStream(target);
             OutputStream localFileOutputStream = new BufferedOutputStream(fileOutputStream)
         ) {
             for (BlobFetchRequest.BlobPart blobPart : request.blobParts()) {

@@ -28,6 +28,12 @@ import java.util.stream.Collectors;
  * (empty extension list) and is gated behind the writable-warm feature flag at the point where it
  * is constructed.
  *
+ * <p>Removing an extension is not an emergency lever. It stops new promotions and sends new reads of the already
+ * promoted files back to blocks, but it frees nothing on its own: each file's mapping, its whole file in the cache and
+ * its budget stay until the searchers holding that file close their handles, which happens when its segment is merged
+ * away, the shard relocates or the index is closed. Disk and cache pressure are relieved by those events, not by the
+ * setting.
+ *
  * @opensearch.experimental
  */
 @ExperimentalApi
@@ -37,7 +43,8 @@ public class WarmFullFileSettings {
      * Node-level, dynamic setting listing the file extensions eligible for whole-file promotion.
      * Values are the extension only, without a leading dot (for example {@code faiss}, {@code veq}).
      * Defaults to the k-NN graph and code files. Setting an empty list disables the feature; removing the setting
-     * restores the default.
+     * restores the default. Taking an extension off the list frees no disk, cache or budget until the readers holding
+     * its files close their handles (see the class comment).
      */
     public static final Setting<List<String>> EXTENSIONS = Setting.listSetting(
         "tiering.service.full_file.extensions",

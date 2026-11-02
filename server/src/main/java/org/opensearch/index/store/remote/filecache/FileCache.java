@@ -36,6 +36,7 @@ import java.util.stream.Stream;
 import static org.opensearch.env.NodeEnvironment.processDirectoryFiles;
 import static org.opensearch.index.store.remote.directory.RemoteSnapshotDirectoryFactory.LOCAL_STORE_LOCATION;
 import static org.opensearch.index.store.remote.utils.FileTypeUtils.INDICES_FOLDER_IDENTIFIER;
+import static org.opensearch.index.store.remote.utils.FileTypeUtils.isPartialDownloadFile;
 
 /**
  * File Cache (FC) is introduced to solve the problem that the local disk cannot hold
@@ -247,6 +248,11 @@ public class FileCache implements RefCountedCache<Path, CachedIndexInput> {
             }
         }).filter(Files::isRegularFile).forEach(path -> {
             try {
+                if (isPartialDownloadFile(path.getFileName().toString())) {
+                    // A download that never reached its rename: incomplete, so it is dropped rather than registered.
+                    Files.deleteIfExists(path);
+                    return;
+                }
                 put(path.toAbsolutePath(), new RestoredCachedIndexInput(Files.size(path)));
                 decRef(path.toAbsolutePath());
             } catch (IOException e) {

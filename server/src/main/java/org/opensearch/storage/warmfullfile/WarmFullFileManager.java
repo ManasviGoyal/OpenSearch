@@ -50,10 +50,11 @@ import java.util.function.LongSupplier;
  *
  * <p>{@link #promote(FullFileState)} runs on a background executor (never the search thread). It admits a promotion
  * only when a download slot is free and the per-segment whole-file budget allows it, downloads the whole file in
- * parts of {@code partSize} bytes (one block by default) via {@link TransferManager#fetchBlobAsync}, then opens the
+ * parts of {@code partSize} bytes (one block by default) via {@link TransferManager#fetchBlobAsync}, written to a temp
+ * file and renamed into place after an fsync so that a whole file at its final path is always complete, then opens the
  * family's own memory mapping and flips the state to {@link FullFileState.State#FULL}. A whole file already on local
- * disk, such as one left by a previous run of the node, is reused instead of downloaded when its length and checksum
- * match the remote store's. On any decline or failure the state returns to {@link FullFileState.State#BLOCK} with a
+ * disk, such as one left by a previous run of the node, is reused instead of downloaded when its length and footer
+ * checksum match the remote store's. On any decline or failure the state returns to {@link FullFileState.State#BLOCK} with a
  * retry time set. Every promotion that reaches FULL is logged at INFO with its download time, and {@link #counters()}
  * returns the node's promotion and decline counters.
  *
@@ -115,13 +116,6 @@ public class WarmFullFileManager {
     static final long NO_SLOT_RETRY_DELAY_MILLIS = 5_000L;
     /** Whole-file bytes admitted per cache segment must stay at or below this fraction of the segment's capacity. */
     static final double DEFAULT_BUDGET_FRACTION = 0.5;
-    /**
-     * Whether a whole file found on local disk is read end to end and checksummed before it is reused. Off by default:
-     * after a restart every reusable file would otherwise be read in full before it serves, which is too costly for
-     * multi-GB files. The length and footer checks still run; they cannot see corruption in the middle of a file whose
-     * footer is intact.
-     */
-    static final boolean DEFAULT_VERIFY_ENTIRE_FILE = false;
 
     /**
      * Largest file that may be promoted: strictly below Lucene's default mmap chunk size (16 GiB on 64-bit JVMs), so the
@@ -136,7 +130,6 @@ public class WarmFullFileManager {
     private final Semaphore slots;
     private final SegmentBudget budget;
     private final long partSize;
-    private final boolean verifyEntireFile;
     private final CounterMetric requested = new CounterMetric();
     private final CounterMetric started = new CounterMetric();
     private final CounterMetric reused = new CounterMetric();
@@ -194,20 +187,7 @@ public class WarmFullFileManager {
         double budgetFraction,
         long partSize
     ) {
-        this(fileCache, executor, clock, maxConcurrentDownloads, budgetFraction, partSize, DEFAULT_VERIFY_ENTIRE_FILE, () -> {});
-    }
-
-    /** Package-private constructor for tests that also choose whether a reused local file is read end to end. */
-    WarmFullFileManager(
-        FileCache fileCache,
-        Executor executor,
-        LongSupplier clock,
-        int maxConcurrentDownloads,
-        double budgetFraction,
-        long partSize,
-        boolean verifyEntireFile
-    ) {
-        this(fileCache, executor, clock, maxConcurrentDownloads, budgetFraction, partSize, verifyEntireFile, () -> {});
+        this(fileCache, executor, clock, maxConcurrentDownloads, budgetFraction, partSize, () -> {});
     }
 
     /**
@@ -223,7 +203,6 @@ public class WarmFullFileManager {
         int maxConcurrentDownloads,
         double budgetFraction,
         long partSize,
-        boolean verifyEntireFile,
         Runnable beforeDownloadHook
     ) {
         this.fileCache = fileCache;
@@ -236,7 +215,6 @@ public class WarmFullFileManager {
         long perSegmentCapacity = (fileCache.capacity() + segments - 1) / segments;
         this.budget = new SegmentBudget(segments, (long) (perSegmentCapacity * budgetFraction));
         this.partSize = partSize > 0 ? partSize : DEFAULT_PART_SIZE;
-        this.verifyEntireFile = verifyEntireFile;
         for (DeclineReason reason : DeclineReason.values()) {
             declinedByReason.put(reason, new CounterMetric());
         }
@@ -421,8 +399,8 @@ public class WarmFullFileManager {
                     return;
                 }
                 // A reused local file was validated before the entry was created; a fresh download is checked against
-                // the remote store's checksum here (its footer only, the bytes were just streamed from the store).
-                if (reusedLocalFile == false && matchesRemoteChecksum(st, false) == false) {
+                // the remote store's checksum here.
+                if (reusedLocalFile == false && matchesRemoteChecksum(st) == false) {
                     close();
                     dropEntry();
                     abandonPromotion(DeclineReason.CHECKSUM_MISMATCH, "downloaded checksum mismatch");
@@ -591,10 +569,11 @@ public class WarmFullFileManager {
     }
 
     /**
-     * Whether the whole file on local disk at the family's path may be served as is. Cheapest check first, each
-     * failure meaning the file is deleted and downloaded again: the length (writes are sequential, so a complete
-     * length means the write finished), then the footer checksum against the remote store's, then, when
-     * {@code verifyEntireFile} is set, a checksum of every byte. A file whose remote checksum is unknown is never reused.
+     * Whether the whole file on local disk at the family's path may be served as is. A download reaches the final path
+     * only by the rename after its fsync, so a file there is complete; these checks catch a file that is not the one
+     * the remote store holds. Cheapest first, each failure meaning the file is deleted and downloaded again: the
+     * length, then the footer checksum against the remote store's. A file whose remote checksum is unknown is never
+     * reused.
      */
     private boolean validateExisting(FullFileState st) {
         final Path path = st.fullFilePath();
@@ -612,15 +591,14 @@ public class WarmFullFileManager {
             logger.debug("whole file at {} is not reused: its size could not be read", path, e);
             return false;
         }
-        return matchesRemoteChecksum(st, verifyEntireFile);
+        return matchesRemoteChecksum(st);
     }
 
     /**
-     * Compares the local whole file's footer checksum against the remote store's, and with {@code entireFile} also
-     * checks that every byte adds up to that footer. A file with no known remote checksum passes, there being nothing
-     * to compare to; an unreadable, footerless or corrupt file fails.
+     * Compares the local whole file's footer checksum against the remote store's. A file with no known remote checksum
+     * passes, there being nothing to compare to; an unreadable or footerless file fails.
      */
-    private boolean matchesRemoteChecksum(FullFileState st, boolean entireFile) {
+    private boolean matchesRemoteChecksum(FullFileState st) {
         final String expected = st.expectedChecksum();
         if (expected == null) {
             return true;
@@ -637,10 +615,6 @@ public class WarmFullFileManager {
                     expected
                 );
                 return false;
-            }
-            if (entireFile) {
-                // Throws CorruptIndexException when the bytes do not add up to the footer, which already matched.
-                CodecUtil.checksumEntireFile(in);
             }
             return true;
         } catch (IOException | NumberFormatException e) {
@@ -838,7 +812,7 @@ public class WarmFullFileManager {
     /** Builds the download request by hand: ceil(length / partSize) parts at absolute offsets, last clipped, no zero tail. */
     private BlobFetchRequest buildRequest(FullFileState st, long length) {
         List<BlobFetchRequest.BlobPart> parts = buildParts(st.fileName(), length, partSize);
-        return BlobFetchRequest.builder().directory(st.localDirectory()).fileName(st.fileName()).blobParts(parts).build();
+        return BlobFetchRequest.builder().directory(st.localDirectory()).fileName(st.fileName()).blobParts(parts).atomicWrite(true).build();
     }
 
     static List<BlobFetchRequest.BlobPart> buildParts(String name, long length, long partSize) {

@@ -12,6 +12,7 @@ import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.apache.lucene.store.AlreadyClosedException;
 import org.apache.lucene.store.IndexInput;
+import org.opensearch.index.engine.OpenSearchConcurrentMergeScheduler;
 import org.opensearch.storage.warmfullfile.FullFileState;
 import org.opensearch.storage.warmfullfile.WarmFullFileManager;
 import org.opensearch.storage.warmfullfile.WarmFullFileSettings;
@@ -36,8 +37,6 @@ public class PromotableSwitchableIndexInputWrapper extends SwitchableIndexInputW
     private final WarmFullFileManager manager;
     // Non-null only for handles opened by openInput: true while this handle holds its one count on the family state.
     private final AtomicBoolean handleCounted;
-    // Lucene's ConcurrentMergeScheduler names its threads so; OpenSearch keeps the fragment inside its own prefix.
-    private static final String MERGE_THREAD_NAME_FRAGMENT = "Lucene Merge Thread";
     private static final Logger logger = LogManager.getLogger(PromotableSwitchableIndexInputWrapper.class);
 
     /**
@@ -191,8 +190,9 @@ public class PromotableSwitchableIndexInputWrapper extends SwitchableIndexInputW
         }
         // A merge reads a source segment once and then deletes it, so promoting for it only spends a slot, budget and
         // a download on a file with minutes to live. Merges usually read through the searcher's already-open reader,
-        // whose handles passed the open-time context check, so the merge is recognised here by its thread instead.
-        if (Thread.currentThread().getName().contains(MERGE_THREAD_NAME_FRAGMENT)) {
+        // whose handles passed the open-time context check, so the merge is recognised here by the thread Lucene runs
+        // it on instead.
+        if (OpenSearchConcurrentMergeScheduler.isMergeThread(Thread.currentThread())) {
             return;
         }
         if (st.onAccess(manager.relativeTimeInMillis())) {

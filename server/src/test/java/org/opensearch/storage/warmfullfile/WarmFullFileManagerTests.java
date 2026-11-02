@@ -25,6 +25,7 @@ import org.opensearch.index.store.remote.filecache.CachedIndexInput;
 import org.opensearch.index.store.remote.filecache.FileCache;
 import org.opensearch.index.store.remote.filecache.FileCacheFactory;
 import org.opensearch.index.store.remote.utils.BlobFetchRequest;
+import org.opensearch.index.store.remote.utils.FileTypeUtils;
 import org.opensearch.index.store.remote.utils.TransferManager;
 import org.opensearch.storage.warmfullfile.WarmFullFileManager.DeclineReason;
 import org.opensearch.test.MockLogAppender;
@@ -240,16 +241,7 @@ public class WarmFullFileManagerTests extends OpenSearchTestCase {
         Runnable beforeDownloadHook
     ) {
         return withFaissEligible(
-            new WarmFullFileManager(
-                fileCache,
-                Runnable::run,
-                clock,
-                slots,
-                budgetFraction,
-                PART_SIZE,
-                WarmFullFileManager.DEFAULT_VERIFY_ENTIRE_FILE,
-                beforeDownloadHook
-            )
+            new WarmFullFileManager(fileCache, Runnable::run, clock, slots, budgetFraction, PART_SIZE, beforeDownloadHook)
         );
     }
 
@@ -310,13 +302,6 @@ public class WarmFullFileManagerTests extends OpenSearchTestCase {
         FullFileState st = newState(tm, fileCache, name, length);
         st.markRemoteMode(checksum);
         return st;
-    }
-
-    /** As {@link #newManager(FileCache, int, double)} with 4 slots, half the cache as budget, and the given entire-file setting. */
-    private WarmFullFileManager newManager(FileCache fileCache, boolean verifyEntireFile) {
-        return withFaissEligible(
-            new WarmFullFileManager(fileCache, Runnable::run, threadPool::relativeTimeInMillis, 4, 0.5, PART_SIZE, verifyEntireFile)
-        );
     }
 
     /** The number of parts a download of {@code length} bytes takes with {@link #PART_SIZE} parts. */
@@ -1656,51 +1641,38 @@ public class WarmFullFileManagerTests extends OpenSearchTestCase {
         assertEquals(content.length, stats.get("downloadedBytes").longValue());
     }
 
-    public void testCorruptedMiddleBytesAreRejectedOnlyWithEntireFileCheck() throws Exception {
-        // A leftover with the right length and an intact footer but one flipped byte in the middle. With the entire-file
-        // check on, the content checksum catches it and the file is re-downloaded. With the check off, only the length
-        // and the footer are compared, so the corrupted copy is accepted and served as is.
+    public void testDownloadIsRenamedIntoPlaceAndAStaleTempFileIsRemoved() throws Exception {
+        // A temp file left by a download that never reached its rename, registered in the cache by the restart that
+        // found it: the promotion removes it and its entry, downloads to the temp path again and renames the complete
+        // file into place, so only the whole file remains and it serves with the family's single reference.
+        String name = "_renamed.faiss";
+        Path path = dir.resolve(name);
+        Path temp = path.resolveSibling(name + FileTypeUtils.PARTIAL_DOWNLOAD_SUFFIX);
         byte[] content = footeredContent(FILE_LENGTH);
-        byte[] corrupted = content.clone();
-        corrupted[corrupted.length / 2] ^= (byte) 0xff;
-        String checksum = footerChecksum(content);
-        assertEquals("the footer still reads the same", checksum, footerChecksum(corrupted));
+        FixedContentStreamReader reader = new FixedContentStreamReader(content);
+        FileCache fileCache = newFileCache();
+        TransferManager tm = new TransferManager(reader, fileCache, threadPool);
+        WarmFullFileManager mgr = newManager(fileCache, 4, 0.5);
+        Files.write(temp, Arrays.copyOf(content, content.length / 2));
+        putRestoredPlaceholder(fileCache, temp, content.length / 2);
+        long usageBefore = fileCache.usage();
 
-        String verifiedName = "_mid_verified.faiss";
-        Path verifiedPath = dir.resolve(verifiedName);
-        FixedContentStreamReader verifiedReader = new FixedContentStreamReader(content);
-        FileCache verifiedCache = newFileCache();
-        TransferManager verifiedTm = new TransferManager(verifiedReader, verifiedCache, threadPool);
-        WarmFullFileManager verifying = newManager(verifiedCache, true);
-        Files.write(verifiedPath, corrupted);
-        putRestoredPlaceholder(verifiedCache, verifiedPath, content.length);
+        FullFileState st = newStateWithChecksum(tm, fileCache, name, content.length, footerChecksum(content));
+        startPromotion(mgr, st);
+        awaitState(st, FullFileState.State.FULL);
 
-        FullFileState verified = newStateWithChecksum(verifiedTm, verifiedCache, verifiedName, content.length, checksum);
-        startPromotion(verifying, verified);
-        awaitState(verified, FullFileState.State.FULL);
-
-        assertEquals("re-downloaded, one read per part", partsFor(verifiedName, content.length), verifiedReader.readCount());
-        assertServedWithOneReference(verified, verifiedCache, verifiedPath, content);
-        assertEquals("not reused", 0L, verifying.counters().get("reused").longValue());
-        assertEquals(1L, verifying.counters().get("started").longValue());
-
-        String unverifiedName = "_mid_unverified.faiss";
-        Path unverifiedPath = dir.resolve(unverifiedName);
-        FixedContentStreamReader unverifiedReader = new FixedContentStreamReader(content);
-        FileCache unverifiedCache = newFileCache();
-        TransferManager unverifiedTm = new TransferManager(unverifiedReader, unverifiedCache, threadPool);
-        WarmFullFileManager footerOnly = newManager(unverifiedCache, false);
-        Files.write(unverifiedPath, corrupted);
-        putRestoredPlaceholder(unverifiedCache, unverifiedPath, content.length);
-
-        FullFileState unverified = newStateWithChecksum(unverifiedTm, unverifiedCache, unverifiedName, content.length, checksum);
-        startPromotion(footerOnly, unverified);
-        awaitState(unverified, FullFileState.State.FULL);
-
-        assertEquals("nothing read from the remote store", 0, unverifiedReader.readCount());
-        assertServedWithOneReference(unverified, unverifiedCache, unverifiedPath, corrupted);
-        assertEquals("the corrupted copy was reused", 1L, footerOnly.counters().get("reused").longValue());
-        assertEquals(0L, footerOnly.counters().get("started").longValue());
+        assertEquals("one download, one read per part", partsFor(name, content.length), reader.readCount());
+        assertFalse("the stale temp file is gone", Files.exists(temp));
+        assertNull("and so is its cache entry", fileCache.get(temp));
+        assertTrue(Files.exists(path));
+        assertServedWithOneReference(st, fileCache, path, content);
+        assertEquals(
+            "the cache holds the whole file and nothing for the temp",
+            usageBefore - content.length / 2 + content.length,
+            fileCache.usage()
+        );
+        assertEquals(0L, mgr.counters().get("reused").longValue());
+        assertEquals(1L, mgr.counters().get("started").longValue());
     }
 
     public void testFreshDownloadWithMismatchedChecksumEndsInBlockWithNothingLeft() throws Exception {
