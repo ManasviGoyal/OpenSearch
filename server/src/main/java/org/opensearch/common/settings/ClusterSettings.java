@@ -958,6 +958,7 @@ public final class ClusterSettings extends AbstractScopedSettings {
                 TieredStoragePrefetchSettings.READ_AHEAD_BLOCK_COUNT,
                 TieredStoragePrefetchSettings.STORED_FIELDS_PREFETCH_ENABLED_SETTING,
                 WarmFullFileSettings.EXTENSIONS,
+                WarmFullFileSettings.MAX_CONCURRENT_DOWNLOADS,
                 SearchIndexPruningSettings.ENABLED,
                 SearchIndexPruningSettings.MIN_SHARDS,
                 SearchIndexPruningSettings.FIELDS

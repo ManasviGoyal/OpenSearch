@@ -851,6 +851,110 @@ public class WarmFullFileManagerTests extends OpenSearchTestCase {
         assertEquals("hook ran once for that download", 1, hookRuns.get());
     }
 
+    public void testRaisingTheDownloadCapAdmitsAFileDeclinedForNoSlot() throws Exception {
+        // One slot, held by a download parked in the hook: a second family is declined for no slot. Raising the cap
+        // to two admits it without waiting for the first to finish.
+        FileCache fileCache = newFileCache();
+        PositionDependentStreamReader reader = new PositionDependentStreamReader();
+        TransferManager tm = new TransferManager(reader, fileCache, threadPool);
+        AtomicLong clock = new AtomicLong(5_000);
+        CountDownLatch hookEntered = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        WarmFullFileManager mgr = newManager(fileCache, clock::get, 1, 0.5, () -> {
+            hookEntered.countDown();
+            try {
+                release.await();
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        });
+
+        FullFileState held = newState(tm, fileCache, "_held.faiss", FILE_LENGTH);
+        assertTrue(held.onAccess(mgr.relativeTimeInMillis()));
+        threadPool.generic().execute(() -> mgr.promote(held));
+        assertTrue("hook entered", hookEntered.await(30, TimeUnit.SECONDS));
+
+        FullFileState other = newState(tm, fileCache, "_other.faiss", FILE_LENGTH);
+        startPromotion(mgr, other);
+        assertEquals("declined for no slot", FullFileState.State.BLOCK, other.state());
+        assertEquals(1L, mgr.counters().get("declined.NO_SLOT").longValue());
+        assertEquals(1L, mgr.counters().get("activeDownloads").longValue());
+
+        mgr.onMaxConcurrentDownloadsChanged(2);
+        clock.set(other.retryAt());
+        // The second download runs on the calling thread and also parks in the hook, so promote it off-thread.
+        assertTrue(other.onAccess(mgr.relativeTimeInMillis()));
+        threadPool.generic().execute(() -> mgr.promote(other));
+        assertBusy(() -> assertEquals("both admitted", 2L, mgr.counters().get("activeDownloads").longValue()), 30, TimeUnit.SECONDS);
+        assertEquals("no new decline", 1L, mgr.counters().get("declined.NO_SLOT").longValue());
+
+        release.countDown();
+        awaitState(held, FullFileState.State.FULL);
+        awaitState(other, FullFileState.State.FULL);
+        assertEquals(0L, mgr.counters().get("activeDownloads").longValue());
+    }
+
+    public void testLoweringTheDownloadCapBelowTheRunningCountAdmitsNothingUntilEnoughFinish() throws Exception {
+        // Two slots, both held by downloads parked in the hook. Lowering the cap to one does not stop them; a new
+        // family is declined until one of the two has finished, and admitted after that.
+        FileCache fileCache = newFileCache();
+        PositionDependentStreamReader reader = new PositionDependentStreamReader();
+        TransferManager tm = new TransferManager(reader, fileCache, threadPool);
+        AtomicLong clock = new AtomicLong(5_000);
+        CountDownLatch hooksEntered = new CountDownLatch(2);
+        CountDownLatch releaseFirst = new CountDownLatch(1);
+        CountDownLatch releaseSecond = new CountDownLatch(1);
+        AtomicInteger hookRuns = new AtomicInteger();
+        WarmFullFileManager mgr = newManager(fileCache, clock::get, 2, 0.5, () -> {
+            int n = hookRuns.incrementAndGet();
+            hooksEntered.countDown();
+            try {
+                (n == 1 ? releaseFirst : releaseSecond).await();
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        });
+
+        FullFileState a = newState(tm, fileCache, "_a.faiss", FILE_LENGTH);
+        FullFileState b = newState(tm, fileCache, "_b.faiss", FILE_LENGTH);
+        assertTrue(a.onAccess(mgr.relativeTimeInMillis()));
+        threadPool.generic().execute(() -> mgr.promote(a));
+        assertTrue(b.onAccess(mgr.relativeTimeInMillis()));
+        threadPool.generic().execute(() -> mgr.promote(b));
+        assertTrue("both hooks entered", hooksEntered.await(30, TimeUnit.SECONDS));
+        assertEquals(2L, mgr.counters().get("activeDownloads").longValue());
+
+        mgr.onMaxConcurrentDownloadsChanged(1);
+        assertEquals("the two in flight keep running", 2L, mgr.counters().get("activeDownloads").longValue());
+        assertEquals(FullFileState.State.PROMOTING, a.state());
+        assertEquals(FullFileState.State.PROMOTING, b.state());
+
+        FullFileState c = newState(tm, fileCache, "_c.faiss", FILE_LENGTH);
+        startPromotion(mgr, c);
+        assertEquals("over the new cap: declined", FullFileState.State.BLOCK, c.state());
+        assertEquals(1L, mgr.counters().get("declined.NO_SLOT").longValue());
+
+        // One finishes: still at the cap (one running, cap one), so a retry is declined again.
+        releaseFirst.countDown();
+        assertBusy(() -> assertEquals(1L, mgr.counters().get("activeDownloads").longValue()), 30, TimeUnit.SECONDS);
+        clock.set(c.retryAt());
+        startPromotion(mgr, c);
+        assertEquals("still at the cap", FullFileState.State.BLOCK, c.state());
+        assertEquals(2L, mgr.counters().get("declined.NO_SLOT").longValue());
+
+        // The other finishes: under the cap, the next request is admitted and runs to FULL on the calling thread.
+        releaseSecond.countDown();
+        assertBusy(() -> assertEquals(0L, mgr.counters().get("activeDownloads").longValue()), 30, TimeUnit.SECONDS);
+        awaitState(a, FullFileState.State.FULL);
+        awaitState(b, FullFileState.State.FULL);
+        clock.set(c.retryAt());
+        // The hook would park this third download too; let it through.
+        releaseFirst.countDown();
+        startPromotion(mgr, c);
+        awaitState(c, FullFileState.State.FULL);
+        assertEquals(2L, mgr.counters().get("declined.NO_SLOT").longValue());
+    }
+
     public void testBudgetDeclinesDoNotLeakDownloadSlots() throws Exception {
         // One download slot, and a budget of half a 10,000-byte segment = 5,000 bytes. Each 8,192-byte file is declined
         // on budget AFTER the slot is taken; if a decline kept the slot, the following 4,096-byte file would be declined

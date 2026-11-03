@@ -128,8 +128,8 @@ public class WarmFullFileManager {
     private final FileCache fileCache;
     private final Executor executor;
     private final LongSupplier clock;
-    private final int maxConcurrentDownloads;
-    private final Semaphore slots;
+    private volatile int maxConcurrentDownloads;
+    private final ResizableSemaphore slots;
     private final SegmentBudget budget;
     private final long partSize;
     private final CounterMetric requested = new CounterMetric();
@@ -162,22 +162,15 @@ public class WarmFullFileManager {
     /**
      * Production constructor.
      *
-     * @param fileCache            the node file cache
-     * @param executor             the pool to run promote(), the completion handler, and the deferred cleanup on
-     *                             (never the search thread, never the FileCache listener thread)
-     * @param clock                a monotonic millis clock (e.g. {@code threadPool::relativeTimeInMillis})
-     * @param allocatedProcessors  the node's allocated processor count
+     * @param fileCache              the node file cache
+     * @param executor               the pool to run promote(), the completion handler, and the deferred cleanup on
+     *                               (never the search thread, never the FileCache listener thread)
+     * @param clock                  a monotonic millis clock (e.g. {@code threadPool::relativeTimeInMillis})
+     * @param maxConcurrentDownloads the initial download cap, {@link WarmFullFileSettings#MAX_CONCURRENT_DOWNLOADS};
+     *                               later values arrive through {@link #onMaxConcurrentDownloadsChanged}
      */
-    public WarmFullFileManager(FileCache fileCache, Executor executor, LongSupplier clock, int allocatedProcessors) {
-        this(
-            fileCache,
-            executor,
-            clock,
-            // Download slots: one per eight allocated processors, at least one (4 on a 32 vCPU node).
-            Math.max(1, allocatedProcessors / 8),
-            DEFAULT_BUDGET_FRACTION,
-            DEFAULT_PART_SIZE
-        );
+    public WarmFullFileManager(FileCache fileCache, Executor executor, LongSupplier clock, int maxConcurrentDownloads) {
+        this(fileCache, executor, clock, maxConcurrentDownloads, DEFAULT_BUDGET_FRACTION, DEFAULT_PART_SIZE);
     }
 
     /** Package-private constructor for tests (small slot count, budget fraction, and part size). */
@@ -212,7 +205,7 @@ public class WarmFullFileManager {
         this.executor = executor;
         this.clock = clock;
         this.maxConcurrentDownloads = Math.max(1, maxConcurrentDownloads);
-        this.slots = new Semaphore(this.maxConcurrentDownloads);
+        this.slots = new ResizableSemaphore(this.maxConcurrentDownloads);
         int segments = fileCache.segmentCount();
         long perSegmentCapacity = (fileCache.capacity() + segments - 1) / segments;
         this.budget = new SegmentBudget(segments, (long) (perSegmentCapacity * budgetFraction));
@@ -713,6 +706,38 @@ public class WarmFullFileManager {
             }
         }
         return false;
+    }
+
+    /**
+     * Applies a new download cap from {@link WarmFullFileSettings#MAX_CONCURRENT_DOWNLOADS}. Raising it admits more
+     * downloads at once; lowering it lets the ones in flight finish and admits no new one until the count is under
+     * the new cap.
+     *
+     * @param newMax the cap, at least one
+     */
+    public void onMaxConcurrentDownloadsChanged(int newMax) {
+        synchronized (slots) {
+            int target = Math.max(1, newMax);
+            int delta = target - maxConcurrentDownloads;
+            if (delta > 0) {
+                slots.release(delta);
+            } else if (delta < 0) {
+                // Permits may go negative: downloads in flight finish, and no new one is admitted until enough have.
+                slots.reduce(-delta);
+            }
+            maxConcurrentDownloads = target;
+        }
+    }
+
+    /** A {@link Semaphore} whose permit count can also be lowered, for a cap that changes at runtime. */
+    private static final class ResizableSemaphore extends Semaphore {
+        ResizableSemaphore(int permits) {
+            super(permits);
+        }
+
+        void reduce(int permits) {
+            reducePermits(permits);
+        }
     }
 
     /**

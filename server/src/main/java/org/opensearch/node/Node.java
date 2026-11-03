@@ -128,7 +128,6 @@ import org.opensearch.common.unit.TimeValue;
 import org.opensearch.common.util.BigArrays;
 import org.opensearch.common.util.FeatureFlags;
 import org.opensearch.common.util.PageCacheRecycler;
-import org.opensearch.common.util.concurrent.OpenSearchExecutors;
 import org.opensearch.common.util.io.IOUtils;
 import org.opensearch.core.Assertions;
 import org.opensearch.core.common.breaker.CircuitBreaker;
@@ -995,10 +994,11 @@ public class Node implements Closeable {
                         nodeFileCache,
                         threadPool.executor(ThreadPool.Names.GENERIC),
                         threadPool::relativeTimeInMillis,
-                        OpenSearchExecutors.allocatedProcessors(settings)
+                        warmFullFileSettings.getMaxConcurrentDownloads()
                     );
                 if (warmFullFileManager != null) {
                     warmFullFileSettings.addListener(warmFullFileManager::onExtensionsChanged);
+                    warmFullFileSettings.addMaxConcurrentDownloadsListener(warmFullFileManager::onMaxConcurrentDownloadsChanged);
                 }
             } else {
                 tieredStoragePrefetchSettings = null;

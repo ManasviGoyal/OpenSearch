@@ -9,7 +9,9 @@ package org.opensearch.storage.warmfullfile;
 
 import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.common.settings.ClusterSettings;
+import org.opensearch.common.settings.Setting;
 import org.opensearch.common.settings.Settings;
+import org.opensearch.common.util.concurrent.OpenSearchExecutors;
 import org.opensearch.test.ClusterServiceUtils;
 import org.opensearch.test.OpenSearchTestCase;
 import org.opensearch.threadpool.TestThreadPool;
@@ -57,6 +59,44 @@ public class WarmFullFileSettingsTests extends OpenSearchTestCase {
             "WarmFullFileSettings.EXTENSIONS must be registered in BUILT_IN_CLUSTER_SETTINGS",
             BUILT_IN_CLUSTER_SETTINGS.contains(WarmFullFileSettings.EXTENSIONS)
         );
+        assertTrue(
+            "WarmFullFileSettings.MAX_CONCURRENT_DOWNLOADS must be registered in BUILT_IN_CLUSTER_SETTINGS",
+            BUILT_IN_CLUSTER_SETTINGS.contains(WarmFullFileSettings.MAX_CONCURRENT_DOWNLOADS)
+        );
+    }
+
+    public void testMaxConcurrentDownloadsDefaultsToOnePerEightProcessorsAtLeastOne() {
+        Setting<Integer> setting = WarmFullFileSettings.MAX_CONCURRENT_DOWNLOADS;
+        // node.processors above the machine's count logs a deprecation warning, so the many-processor case uses the
+        // machine's own count and the formula.
+        int allocated = OpenSearchExecutors.allocatedProcessors(Settings.EMPTY);
+        assertEquals(Math.max(1, allocated / 8), setting.get(Settings.EMPTY).intValue());
+        assertEquals(1, setting.get(Settings.builder().put("node.processors", Math.min(8, allocated)).build()).intValue());
+        assertEquals("never zero", 1, setting.get(Settings.builder().put("node.processors", 1).build()).intValue());
+        assertEquals("explicit value wins", 7, setting.get(Settings.builder().put(setting.getKey(), 7).build()).intValue());
+        IllegalArgumentException e = expectThrows(
+            IllegalArgumentException.class,
+            () -> setting.get(Settings.builder().put(setting.getKey(), 0).build())
+        );
+        assertTrue(e.getMessage(), e.getMessage().contains("must be >= 1"));
+    }
+
+    public void testMaxConcurrentDownloadsListenerSeesTheCurrentValueAndEveryUpdate() {
+        WarmFullFileSettings settings = new WarmFullFileSettings(clusterService.getClusterSettings());
+        int initial = settings.getMaxConcurrentDownloads();
+        assertTrue(initial >= 1);
+        List<Integer> seen = new ArrayList<>();
+        settings.addMaxConcurrentDownloadsListener(seen::add);
+        assertEquals("called once on registration with the current value", List.of(initial), seen);
+
+        String key = WarmFullFileSettings.MAX_CONCURRENT_DOWNLOADS.getKey();
+        clusterService.getClusterSettings().applySettings(Settings.builder().put(key, 2).build());
+        clusterService.getClusterSettings().applySettings(Settings.builder().put(key, 9).build());
+        assertEquals(List.of(initial, 2, 9), seen);
+        assertEquals(9, settings.getMaxConcurrentDownloads());
+
+        clusterService.getClusterSettings().applySettings(Settings.builder().putNull(key).build());
+        assertEquals("clearing the setting reverts to the default", initial, settings.getMaxConcurrentDownloads());
     }
 
     public void testDynamicUpdateApplies() {

@@ -10,6 +10,7 @@ package org.opensearch.storage.warmfullfile;
 import org.opensearch.common.annotation.ExperimentalApi;
 import org.opensearch.common.settings.ClusterSettings;
 import org.opensearch.common.settings.Setting;
+import org.opensearch.common.util.concurrent.OpenSearchExecutors;
 
 import java.util.List;
 import java.util.Locale;
@@ -17,6 +18,7 @@ import java.util.Set;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.function.Consumer;
 import java.util.function.Function;
+import java.util.function.IntConsumer;
 import java.util.stream.Collectors;
 
 /**
@@ -54,16 +56,35 @@ public class WarmFullFileSettings {
         Setting.Property.NodeScope
     );
 
+    /**
+     * Node-level, dynamic setting for how many whole-file downloads may run at once on this node. Each download holds
+     * one {@code remote_recovery} thread for a serial multi-GB read, so this is a node-wide cap, separate from
+     * {@code indices.recovery.max_concurrent_remote_store_streams}, which bounds the files one shard recovery downloads
+     * at a time. Defaults to one per eight allocated processors, at least one (4 on a 32 vCPU node). Lowering it does
+     * not stop a download in flight; no new one is admitted until enough have finished.
+     */
+    public static final Setting<Integer> MAX_CONCURRENT_DOWNLOADS = new Setting<>(
+        "tiering.service.full_file.max_concurrent_downloads",
+        s -> Integer.toString(Math.max(1, OpenSearchExecutors.allocatedProcessors(s) / 8)),
+        s -> Setting.parseInt(s, 1, "tiering.service.full_file.max_concurrent_downloads"),
+        Setting.Property.Dynamic,
+        Setting.Property.NodeScope
+    );
+
     private volatile Set<String> extensions;
     private final List<Consumer<Set<String>>> listeners = new CopyOnWriteArrayList<>();
+    private volatile int maxConcurrentDownloads;
+    private final List<IntConsumer> maxConcurrentDownloadsListeners = new CopyOnWriteArrayList<>();
 
     /**
-     * Creates a new WarmFullFileSettings instance and registers a dynamic update consumer.
+     * Creates a new WarmFullFileSettings instance and registers the dynamic update consumers.
      * @param clusterSettings the cluster settings
      */
     public WarmFullFileSettings(ClusterSettings clusterSettings) {
         setExtensions(clusterSettings.get(EXTENSIONS));
         clusterSettings.addSettingsUpdateConsumer(EXTENSIONS, this::setExtensions);
+        setMaxConcurrentDownloads(clusterSettings.get(MAX_CONCURRENT_DOWNLOADS));
+        clusterSettings.addSettingsUpdateConsumer(MAX_CONCURRENT_DOWNLOADS, this::setMaxConcurrentDownloads);
     }
 
     /**
@@ -90,6 +111,33 @@ public class WarmFullFileSettings {
     public void addListener(Consumer<Set<String>> listener) {
         listeners.add(listener);
         listener.accept(extensions);
+    }
+
+    /**
+     * Stores the download cap and tells every listener.
+     * @param value the configured cap, at least one
+     */
+    public void setMaxConcurrentDownloads(int value) {
+        this.maxConcurrentDownloads = value;
+        for (IntConsumer listener : maxConcurrentDownloadsListeners) {
+            listener.accept(value);
+        }
+    }
+
+    /**
+     * Registers a listener for the download cap, called once now with the current value and again after every update.
+     * @param listener receives the cap
+     */
+    public void addMaxConcurrentDownloadsListener(IntConsumer listener) {
+        maxConcurrentDownloadsListeners.add(listener);
+        listener.accept(maxConcurrentDownloads);
+    }
+
+    /**
+     * @return how many whole-file downloads may run at once on this node
+     */
+    public int getMaxConcurrentDownloads() {
+        return maxConcurrentDownloads;
     }
 
     /**
