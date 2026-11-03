@@ -138,6 +138,8 @@ public class WarmFullFileManager {
     private final CounterMetric demoted = new CounterMetric();
     private final CounterMetric restored = new CounterMetric();
     private final CounterMetric downloadedBytes = new CounterMetric();
+    // NOT_MMAP declines that came after a completed download (a directory type not known at admission).
+    private final CounterMetric notMmapAfterDownload = new CounterMetric();
     // The families currently FULL on this node, so a settings change can find the ones to demote.
     private final Set<FullFileState> fullFamilies = ConcurrentHashMap.newKeySet();
     // Demoted families still holding their mapping, so a settings change can restore the ones whose extension returns.
@@ -407,6 +409,11 @@ public class WarmFullFileManager {
                 logger.warn("whole-file promotion failed to start for {}", path, e);
                 close();
                 abandonPromotion(DeclineReason.ERROR, "exception starting download: " + e.getMessage());
+            } catch (Error e) {
+                // Unwind before the error propagates, or the family would stay PROMOTING with its slot and budget.
+                close();
+                abandonPromotion(DeclineReason.ERROR, "error starting download: " + e);
+                throw e;
             }
         }
 
@@ -459,6 +466,7 @@ public class WarmFullFileManager {
                     // reuses it.
                     close();
                     dropEntry();
+                    notMmapAfterDownload.inc();
                     declinePermanently(st, "the local directory serves it as " + servedAs + ", not mmap");
                     return;
                 }
@@ -501,6 +509,11 @@ public class WarmFullFileManager {
                 }
                 close();
                 abandonPromotion(DeclineReason.ERROR, "exception publishing FULL: " + e.getMessage());
+            } catch (Error e) {
+                // Unwind before the error propagates, or the family would stay PROMOTING with its slot and budget.
+                close();
+                abandonPromotion(DeclineReason.ERROR, "error completing download: " + e);
+                throw e;
             }
         }
 
@@ -813,7 +826,8 @@ public class WarmFullFileManager {
 
     /**
      * The decline reasons that mean a download or publish was attempted and did not reach FULL (not admission). NOT_MMAP
-     * is not one: it is decided at admission for every known directory type, so it is counted only under its own reason.
+     * is decided at admission for every known directory type, so it is not listed; the NOT_MMAP declines that followed a
+     * download are added to {@code failed} from their own counter.
      */
     private static final Set<DeclineReason> FAILURE_REASONS = EnumSet.of(
         DeclineReason.DOWNLOAD_FAILED,
@@ -856,7 +870,7 @@ public class WarmFullFileManager {
             }
         }
         counters.put("declined", declined);
-        counters.put("failed", failed);
+        counters.put("failed", failed + notMmapAfterDownload.count());
         counters.put("reservedBytes", budget.totalReserved());
         counters.put("activeDownloads", (long) (maxConcurrentDownloads - slots.availablePermits()));
         int awaitingFamilies = 0;

@@ -12,6 +12,7 @@ import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.apache.lucene.store.AlreadyClosedException;
 import org.apache.lucene.store.IndexInput;
+import org.opensearch.common.annotation.ExperimentalApi;
 import org.opensearch.storage.warmfullfile.FullFileState;
 import org.opensearch.storage.warmfullfile.WarmFullFileManager;
 
@@ -27,6 +28,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * promotion ({@link WarmFullFileManager#requestPromotion}) and a block input is returned. An input that already exists
  * is never switched.
  */
+@ExperimentalApi
 public class PromotableSwitchableIndexInputWrapper extends SwitchableIndexInputWrapper {
 
     private final String fullCloneDescription;

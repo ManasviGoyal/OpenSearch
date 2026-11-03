@@ -201,34 +201,26 @@ public class TieredDirectory extends CompositeDirectory {
      */
     // visible for testing
     boolean isEligibleForFullFile(String name, IOContext context, SwitchableIndexInput original) {
-        return ineligibleReason(name, context, original) == null;
-    }
-
-    /** The rule that rejects a file at open, or null when its handles may trigger a promotion. */
-    private static String ineligibleReason(String name, IOContext context, SwitchableIndexInput original) {
-        // Not an ordinary Lucene special file.
+        // Not an ordinary Lucene special file: segments, lock or compound file.
         if (FileTypeUtils.isSegmentsFile(name)
             || FileTypeUtils.isLockFile(name)
             || IndexFileNames.matchesExtension(name, CFS_FILE_SUFFIX)) {
-            return "segments, lock or compound file";
+            return false;
         }
         if (original.length() <= ONE_BLOCK_BYTES) { // original input: offset 0, length == whole file length
-            return "length " + original.length() + " is at most one block";
+            return false;
         }
         // The mapping must be a single mmap chunk (Lucene's default chunk is 16 GiB). Above that,
         // closing a view could unmap the master and segmentSliceOrNull returns null (no k-NN SIMD), so do not promote.
         if (original.length() >= WarmFullFileManager.MAX_WHOLE_FILE_BYTES) {
-            return "length " + original.length() + " is not below the mmap chunk size";
+            return false;
         }
         // Only plain search reads: DEFAULT context (excludes MERGE/FLUSH) with no ReadOnce/SEQUENTIAL hint
         // (excludes recovery checksum reads via IOContext.READONCE).
         if (context.context() != IOContext.Context.DEFAULT) {
-            return "context is " + context.context();
+            return false;
         }
-        if (context.hints().contains(ReadOnceHint.INSTANCE) || context.hints().contains(DataAccessHint.SEQUENTIAL)) {
-            return "read-once or sequential hint";
-        }
-        return null;
+        return context.hints().contains(ReadOnceHint.INSTANCE) == false && context.hints().contains(DataAccessHint.SEQUENTIAL) == false;
     }
 
     @Override

@@ -9,6 +9,7 @@
 package org.opensearch.storage.indexinput;
 
 import org.apache.lucene.store.FSDirectory;
+import org.opensearch.common.annotation.ExperimentalApi;
 import org.opensearch.index.store.RemoteSegmentStoreDirectory;
 import org.opensearch.index.store.remote.filecache.FileCache;
 import org.opensearch.index.store.remote.utils.TransferManager;
@@ -26,6 +27,7 @@ import static org.opensearch.storage.utils.DirectoryUtils.getFilePath;
  * A {@link CachedSwitchableIndexInput} whose file may be promoted to a whole local file. It owns the family's
  * {@link FullFileState} and closes the family when the entry leaves the file cache.
  */
+@ExperimentalApi
 public class PromotableCachedSwitchableIndexInput extends CachedSwitchableIndexInput {
 
     private final FullFileState fullFileState;

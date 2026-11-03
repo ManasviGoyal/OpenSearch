@@ -444,7 +444,8 @@ public final class FullFileState {
             fileCache.decRef(fullFilePath); // release the family's reference; the whole file becomes evictable
             if (state.get() != State.CLOSED) {
                 // Demoted, not closed: the file is no longer served, so drop it from the cache now rather than leave it
-                // to eviction. A closing family leaves that to the directory's close.
+                // to eviction. A closing family leaves its entry in the cache without a reference, evictable, so a
+                // reopen on this node can join it without a download.
                 fileCache.remove(fullFilePath);
             }
         } catch (RuntimeException e) {

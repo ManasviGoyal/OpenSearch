@@ -609,6 +609,7 @@ public class WarmFullFileManagerTests extends OpenSearchTestCase {
             assertEquals("no budget taken", 0L, mgr.reservedBytesPerSegment()[0]);
             assertEquals("never started", 0L, mgr.counters().get("started").longValue());
             assertEquals(1L, mgr.counters().get("declined.NOT_MMAP").longValue());
+            assertEquals("an admission decline is not a failure", 0L, mgr.counters().get("failed").longValue());
         }
 
         // The slot was never taken: an mmap-served file promotes.
@@ -644,6 +645,7 @@ public class WarmFullFileManagerTests extends OpenSearchTestCase {
             assertFalse("and deleted from disk", Files.exists(path));
             assertEquals("budget released", 0L, mgr.reservedBytesPerSegment()[0]);
             assertEquals(1L, mgr.counters().get("declined.NOT_MMAP").longValue());
+            assertEquals("a download that did not reach FULL is a failure", 1L, mgr.counters().get("failed").longValue());
         }
 
         // The slot was released: an mmap-served file now promotes.
