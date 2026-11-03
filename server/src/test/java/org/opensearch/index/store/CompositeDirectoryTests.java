@@ -74,6 +74,15 @@ public class CompositeDirectoryTests extends BaseRemoteSegmentStoreDirectoryTest
         assertArrayEquals(expectedFileNames, actualFileNames);
     }
 
+    public void testListAllHidesPartialDownloads() throws IOException {
+        // An in-flight whole-file download is this directory's own file, like a block: Lucene must not see it, or an
+        // IndexFileDeleter refresh or a store cleanup would delete it under the download.
+        addFilesToDirectory(new String[] { "_3.fdt.download" });
+        String[] actualFileNames = compositeDirectory.listAll();
+        String[] expectedFileNames = new String[] { "_0.cfe", "_0.cfs", "_0.si", "_1.cfe", "_2.cfe", "segments_1", "temp_file.tmp" };
+        assertArrayEquals(expectedFileNames, actualFileNames);
+    }
+
     public void testListAll_withLocalSegmentFiles() throws IOException {
         addFilesToDirectory(new String[] { LOCAL_SEGMENT_FILE });
         String[] actualFileNames = compositeDirectory.listAll();

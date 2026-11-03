@@ -147,8 +147,10 @@ public class CompositeDirectory extends FilterDirectory implements RemoteSyncLis
         Set<String> allFiles = Stream.concat(Arrays.stream(localFiles), Arrays.stream(remoteFiles))
             .map(s -> s.contains(BLOCK_FILE_IDENTIFIER) ? s.substring(0, s.indexOf(BLOCK_FILE_IDENTIFIER)) : s)
             .collect(Collectors.toSet());
+        // Block files and in-flight downloads are this directory's own, not Lucene's: a listed but unreferenced
+        // `.download` file would be deleted by IndexFileDeleter or a store cleanup under the running download.
         Set<String> nonBlockLuceneFiles = allFiles.stream()
-            .filter(file -> !FileTypeUtils.isBlockFile(file))
+            .filter(file -> FileTypeUtils.isBlockFile(file) == false && FileTypeUtils.isPartialDownloadFile(file) == false)
             .collect(Collectors.toUnmodifiableSet());
         String[] files = new String[nonBlockLuceneFiles.size()];
         nonBlockLuceneFiles.toArray(files);
