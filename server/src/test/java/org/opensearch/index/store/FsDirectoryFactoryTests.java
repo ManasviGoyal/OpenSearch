@@ -33,7 +33,10 @@ package org.opensearch.index.store;
 
 import org.apache.lucene.store.DataAccessHint;
 import org.apache.lucene.store.Directory;
+import org.apache.lucene.store.FSDirectory;
+import org.apache.lucene.store.FSLockFactory;
 import org.apache.lucene.store.IOContext;
+import org.apache.lucene.store.IndexInput;
 import org.apache.lucene.store.MMapDirectory;
 import org.apache.lucene.store.MergeInfo;
 import org.apache.lucene.store.NIOFSDirectory;
@@ -131,6 +134,36 @@ public class FsDirectoryFactoryTests extends OpenSearchTestCase {
             assertTrue(hybridDirectory.useDelegate("foo.dvd"));
             assertTrue(hybridDirectory.useDelegate("foo.cfs"));
             assertTrue(hybridDirectory.useDelegate("foo.doc"));
+        }
+    }
+
+    public void testIsMemoryMapped() throws IOException {
+        Settings hybrid = Settings.builder()
+            .put(IndexModule.INDEX_STORE_TYPE_SETTING.getKey(), IndexModule.Type.HYBRIDFS.name().toLowerCase(Locale.ROOT))
+            .build();
+        try (Directory directory = newDirectory(hybrid)) {
+            FSDirectory fsDirectory = (FSDirectory) directory;
+            // hybrid: the extension decides, by the same rule openInput applies
+            assertEquals(Boolean.FALSE, FsDirectoryFactory.isMemoryMapped(fsDirectory, "foo.fdt"));
+            assertEquals(Boolean.FALSE, FsDirectoryFactory.isMemoryMapped(fsDirectory, "foo.pos"));
+            assertEquals(Boolean.TRUE, FsDirectoryFactory.isMemoryMapped(fsDirectory, "foo.faiss"));
+            assertEquals(Boolean.TRUE, FsDirectoryFactory.isMemoryMapped(fsDirectory, "foo.nvd"));
+        }
+        Path tempDir = createTempDir();
+        try (MMapDirectory mmap = new MMapDirectory(tempDir)) {
+            assertEquals(Boolean.TRUE, FsDirectoryFactory.isMemoryMapped(mmap, "foo.fdt"));
+        }
+        try (NIOFSDirectory nio = new NIOFSDirectory(tempDir)) {
+            assertEquals(Boolean.FALSE, FsDirectoryFactory.isMemoryMapped(nio, "foo.faiss"));
+            // any other type: not known from the type alone
+            try (FSDirectory other = new FSDirectory(tempDir, FSLockFactory.getDefault()) {
+                @Override
+                public IndexInput openInput(String name, IOContext context) throws IOException {
+                    return nio.openInput(name, context);
+                }
+            }) {
+                assertNull(FsDirectoryFactory.isMemoryMapped(other, "foo.faiss"));
+            }
         }
     }
 

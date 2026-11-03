@@ -20,6 +20,7 @@ import org.opensearch.common.annotation.ExperimentalApi;
 import org.opensearch.common.lease.Releasable;
 import org.opensearch.common.metrics.CounterMetric;
 import org.opensearch.common.util.CancellableThreads;
+import org.opensearch.index.store.FsDirectoryFactory;
 import org.opensearch.index.store.remote.file.AbstractBlockIndexInput;
 import org.opensearch.index.store.remote.filecache.CachedFullFileIndexInput;
 import org.opensearch.index.store.remote.filecache.CachedIndexInput;
@@ -295,6 +296,13 @@ public class WarmFullFileManager {
                     abandonPromotion(DeclineReason.TOO_LARGE, "file of " + length + " bytes exceeds the mmap chunk size");
                     return;
                 }
+                // A file the local directory serves with NIO is declined here, before a slot, the budget or a download.
+                // Known from the directory type alone for MMapDirectory, hybrid and NIOFSDirectory; any other type is
+                // settled after the download, when the mapping is opened.
+                if (Boolean.FALSE.equals(FsDirectoryFactory.isMemoryMapped(st.localDirectory(), st.fileName()))) {
+                    declinePermanently(st, "the local directory serves it with NIO, not mmap");
+                    return;
+                }
 
                 // Admission: a free slot AND the per-segment whole-file budget.
                 if (slots.tryAcquire() == false) {
@@ -409,8 +417,8 @@ public class WarmFullFileManager {
                 // Open the family's OWN mapping with the RANDOM hint (do not reuse the cache entry's input).
                 mapping = localDirectory.openInput(st.fileName(), IOContext.DEFAULT.withHints(DataAccessHint.RANDOM));
                 // The master must be Lucene's mmap input. Views of an NIO master would go through
-                // BufferedIndexInput (a copy per read, no k-NN SIMD), which is not the feature. This happens only if the
-                // extension is on the local directory's NIO list (hybridfs), so it will not change for this family.
+                // BufferedIndexInput (a copy per read, no k-NN SIMD), which is not the feature. Known directory types
+                // were settled in start(); this catches any other type, and the answer will not change for this family.
                 if ((mapping instanceof MemorySegmentAccessInput) == false) {
                     String servedAs = mapping.getClass().getSimpleName();
                     // Drop the useless whole file so it is not charged against the cache until eviction, and so nothing
@@ -737,9 +745,11 @@ public class WarmFullFileManager {
         return extension != null && eligibleExtensions.contains(extension);
     }
 
-    /** The decline reasons that mean a download or publish was attempted and did not reach FULL (not admission). */
+    /**
+     * The decline reasons that mean a download or publish was attempted and did not reach FULL (not admission). NOT_MMAP
+     * is not one: it is decided at admission for every known directory type, so it is counted only under its own reason.
+     */
     private static final Set<DeclineReason> FAILURE_REASONS = EnumSet.of(
-        DeclineReason.NOT_MMAP,
         DeclineReason.DOWNLOAD_FAILED,
         DeclineReason.LENGTH_MISMATCH,
         DeclineReason.CHECKSUM_MISMATCH,

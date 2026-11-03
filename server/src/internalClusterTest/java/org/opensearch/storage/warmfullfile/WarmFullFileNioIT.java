@@ -28,9 +28,9 @@ import static org.opensearch.test.hamcrest.OpenSearchAssertions.assertHitCount;
 
 /**
  * Integration tests for warm-tier whole-file promotion of a file that the shard's local hybridfs directory serves
- * with NIO. The {@code .fdt} extension is on the default {@code index.store.hybrid.nio.extensions} list, so once the
- * whole file is downloaded the master input is not Lucene's mmap input: the promotion is declined for the lifetime
- * of the file family, the downloaded copy is dropped, and the node logs one WARN per extension.
+ * with NIO. The {@code .fdt} extension is on the default {@code index.store.hybrid.nio.extensions} list, which the
+ * manager reads off the directory at admission: the promotion is declined for the lifetime of the file family before
+ * any download, and the node logs one WARN per extension.
  */
 public class WarmFullFileNioIT extends WarmFullFileBaseIT {
 
@@ -39,8 +39,8 @@ public class WarmFullFileNioIT extends WarmFullFileBaseIT {
     private static final String MMAP_INDEX = "warm-mmap-idx";
     private static final String KNOWN_DOC_ID = docId(0);
     private static final String MANAGER_LOGGER = WarmFullFileManager.class.getName();
-    // The one-per-extension WARN logged when a downloaded whole file is served by NIO instead of mmap, up to the point
-    // where it names the first declined file.
+    // The one-per-extension WARN logged when the local directory serves a file with NIO instead of mmap, up to the
+    // point where it names the first declined file.
     private static final String FDT_DECLINED_WARN_PREFIX = "*whole-file promotion of ["
         + FDT_SUFFIX
         + "] files is permanently declined on this node:*not mmap";
@@ -63,10 +63,10 @@ public class WarmFullFileNioIT extends WarmFullFileBaseIT {
     }
 
     /**
-     * One NIO-served .fdt: the first search downloads the whole file once, the download is declined because the
-     * master is an NIO input, the copy is removed, and the family is never retried while it lives.
+     * One NIO-served .fdt: the first search requests a promotion, which is declined at admission without a download,
+     * and the family is never retried while it lives.
      */
-    public void testNioServedFileIsDownloadedOnceDeclinedAndNeverRetried() throws Exception {
+    public void testNioServedFileIsDeclinedWithoutDownloadAndNeverRetried() throws Exception {
         String warmNode = startCluster();
         createWarmIndex(NIO_INDEX);
         String knownBody = indexDocs(NIO_INDEX, 0, NUM_DOCS);
@@ -87,26 +87,22 @@ public class WarmFullFileNioIT extends WarmFullFileBaseIT {
             CountingEventExpectation declinedWarns = new CountingEventExpectation(MANAGER_LOGGER, Level.WARN, FDT_DECLINED_WARN, 1);
             appender.addExpectation(declinedWarns);
 
-            // The first search clones the stored-fields input and starts the download.
+            // The first search clones the stored-fields input and requests a promotion; admission declines it for good.
             assertBusy(() -> {
                 assertSearchCorrect(NIO_INDEX, knownBody);
-                assertEquals(1, downloadsSince(manager, startedBefore));
-            }, WAIT_TIMEOUT.seconds(), TimeUnit.SECONDS);
-            // The download completes and the family is declined for good.
-            assertBusy(() -> {
                 FullFileState state = requireFamilyState(nio, fdt);
                 assertEquals(Long.MAX_VALUE, state.retryAt());
                 assertEquals(FullFileState.State.BLOCK, state.state());
             }, WAIT_TIMEOUT.seconds(), TimeUnit.SECONDS);
 
-            // Later searches keep working from blocks and never start another download.
+            // Later searches keep working from blocks and never start a download.
             for (int i = 0; i < 100; i++) {
                 assertSearchCorrect(NIO_INDEX, knownBody);
             }
-            assertEquals("exactly one whole-file download", 1, downloadsSince(manager, startedBefore));
+            assertEquals("no whole-file download", 0, downloadsSince(manager, startedBefore));
 
-            // The downloaded copy is gone: no plain .fdt in the shard directory and no whole-file cache entry.
-            assertBusy(() -> assertNoWholeFile(nio, fdt), WAIT_TIMEOUT.seconds(), TimeUnit.SECONDS);
+            // Nothing was downloaded: no plain .fdt in the shard directory and no whole-file cache entry.
+            assertNoWholeFile(nio, fdt);
             assertTrue(
                 "blocks are served locally",
                 localFiles(nio).stream().anyMatch(f -> f.startsWith(fdt + FileTypeUtils.BLOCK_FILE_IDENTIFIER))
@@ -123,7 +119,7 @@ public class WarmFullFileNioIT extends WarmFullFileBaseIT {
     }
 
     /**
-     * Two warm indices, each with an NIO-served .fdt: each file is downloaded and declined, but only the first
+     * Two warm indices, each with an NIO-served .fdt: each file is declined without a download, but only the first
      * decline of the extension is a WARN; the second file's decline is not.
      */
     public void testOnlyOneWarnPerExtensionAcrossSegments() throws Exception {
@@ -164,39 +160,27 @@ public class WarmFullFileNioIT extends WarmFullFileBaseIT {
             );
             appender.addExpectation(new CountingEventExpectation(MANAGER_LOGGER, Level.WARN, FDT_DECLINED_WARN, 1));
 
-            // First index: download, decline, WARN.
+            // First index: decline, WARN.
             assertBusy(() -> {
                 assertSearchCorrect(NIO_INDEX, knownBody1);
-                assertEquals(1, downloadsSince(manager, startedBefore));
+                assertEquals(Long.MAX_VALUE, requireFamilyState(first, fdt1).retryAt());
             }, WAIT_TIMEOUT.seconds(), TimeUnit.SECONDS);
-            assertBusy(
-                () -> assertEquals(Long.MAX_VALUE, requireFamilyState(first, fdt1).retryAt()),
-                WAIT_TIMEOUT.seconds(),
-                TimeUnit.SECONDS
-            );
 
-            // Second index: download, decline, no WARN.
+            // Second index: decline, no WARN.
             assertBusy(() -> {
                 assertSearchCorrect(NIO_INDEX_2, knownBody2);
-                assertEquals(2, downloadsSince(manager, startedBefore));
+                assertEquals(Long.MAX_VALUE, requireFamilyState(second, fdt2).retryAt());
             }, WAIT_TIMEOUT.seconds(), TimeUnit.SECONDS);
-            assertBusy(
-                () -> assertEquals(Long.MAX_VALUE, requireFamilyState(second, fdt2).retryAt()),
-                WAIT_TIMEOUT.seconds(),
-                TimeUnit.SECONDS
-            );
 
             for (int i = 0; i < 20; i++) {
                 assertSearchCorrect(NIO_INDEX, knownBody1);
                 assertSearchCorrect(NIO_INDEX_2, knownBody2);
             }
-            assertEquals("one download per file", 2, downloadsSince(manager, startedBefore));
+            assertEquals("no whole-file download", 0, downloadsSince(manager, startedBefore));
             assertEquals(FullFileState.State.BLOCK, requireFamilyState(first, fdt1).state());
             assertEquals(FullFileState.State.BLOCK, requireFamilyState(second, fdt2).state());
-            assertBusy(() -> {
-                assertNoWholeFile(first, fdt1);
-                assertNoWholeFile(second, fdt2);
-            }, WAIT_TIMEOUT.seconds(), TimeUnit.SECONDS);
+            assertNoWholeFile(first, fdt1);
+            assertNoWholeFile(second, fdt2);
             appender.assertAllExpectationsMatched();
         }
 
@@ -244,22 +228,18 @@ public class WarmFullFileNioIT extends WarmFullFileBaseIT {
                 )
             );
 
-            // NIO-served index: downloaded once, declined for good.
+            // NIO-served index: declined for good, nothing downloaded.
             assertBusy(() -> {
                 assertSearchCorrect(NIO_INDEX, nioBody);
-                assertEquals(1, downloadsSince(manager, startedBefore));
+                assertEquals(Long.MAX_VALUE, requireFamilyState(nio, nioFdt).retryAt());
             }, WAIT_TIMEOUT.seconds(), TimeUnit.SECONDS);
-            assertBusy(
-                () -> assertEquals(Long.MAX_VALUE, requireFamilyState(nio, nioFdt).retryAt()),
-                WAIT_TIMEOUT.seconds(),
-                TimeUnit.SECONDS
-            );
             assertEquals(FullFileState.State.BLOCK, requireFamilyState(nio, nioFdt).state());
+            assertEquals("the declined family downloaded nothing", 0, downloadsSince(manager, startedBefore));
 
             // mmap-served index on the same node: downloaded once and promoted to FULL.
             assertBusy(() -> {
                 assertSearchCorrect(MMAP_INDEX, mmapBody);
-                assertEquals(2, downloadsSince(manager, startedBefore));
+                assertEquals(1, downloadsSince(manager, startedBefore));
             }, WAIT_TIMEOUT.seconds(), TimeUnit.SECONDS);
             assertBusy(
                 () -> assertEquals(FullFileState.State.FULL, requireFamilyState(mmap, mmapFdt).state()),
@@ -283,13 +263,13 @@ public class WarmFullFileNioIT extends WarmFullFileBaseIT {
                 assertSearchCorrect(NIO_INDEX, nioBody);
                 assertSearchCorrect(MMAP_INDEX, mmapBody);
             }
-            assertEquals("one download per file", 2, downloadsSince(manager, startedBefore));
+            assertEquals("only the mmap-served file downloaded", 1, downloadsSince(manager, startedBefore));
             FullFileState nioState = requireFamilyState(nio, nioFdt);
             assertEquals(FullFileState.State.BLOCK, nioState.state());
             assertEquals(Long.MAX_VALUE, nioState.retryAt());
             assertEquals(nioLength, nioState.fileLength());
             assertEquals(FullFileState.State.FULL, requireFamilyState(mmap, mmapFdt).state());
-            assertBusy(() -> assertNoWholeFile(nio, nioFdt), WAIT_TIMEOUT.seconds(), TimeUnit.SECONDS);
+            assertNoWholeFile(nio, nioFdt);
             appender.assertAllExpectationsMatched();
         }
 

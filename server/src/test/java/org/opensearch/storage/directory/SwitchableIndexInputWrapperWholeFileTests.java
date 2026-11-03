@@ -250,9 +250,9 @@ public class SwitchableIndexInputWrapperWholeFileTests extends TieredStorageBase
         handle.close();
     }
 
-    public void testNioServedFileDownloadsOnceAndIsNeverRetried() throws Exception {
+    public void testNioServedFileIsDeclinedWithoutDownloadAndIsNeverRetried() throws Exception {
         // End to end through the trigger: the local directory serves the file with NIO, so promotion is declined for
-        // good. Later searches must not trigger again (no slot taken, nothing read, no second download).
+        // good at admission, with nothing read. Later searches must not trigger again.
         SwitchableIndexInput in = remoteModeInput();
         AtomicInteger reads = new AtomicInteger();
         TransferManager countingTm = new TransferManager((name, position, length) -> {
@@ -268,14 +268,13 @@ public class SwitchableIndexInputWrapperWholeFileTests extends TieredStorageBase
             IndexInput first = handle.clone(); // triggers the one and only attempt
             assertBusy(() -> assertEquals(Long.MAX_VALUE, st.retryAt()), 30, TimeUnit.SECONDS);
             assertEquals(FullFileState.State.BLOCK, st.state());
-            int afterFirst = reads.get();
-            assertTrue("downloaded once", afterFirst > 0);
+            assertEquals("nothing downloaded", 0, reads.get());
 
             clock.set(TimeUnit.DAYS.toMillis(365)); // far past any 60 s retry window
             IndexInput again = handle.clone();
             assertTrue("still served by blocks", again instanceof SwitchableIndexInputWrapper);
             assertEquals("never retried", FullFileState.State.BLOCK, st.state());
-            assertEquals("no second download", afterFirst, reads.get());
+            assertEquals("still nothing downloaded", 0, reads.get());
             assertNull(fileCache.get(getFilePath(localDirectory, FILE_NAME)));
             IOUtils.close(first, again, handle);
         }

@@ -13,6 +13,7 @@ import org.apache.logging.log4j.Level;
 import org.apache.logging.log4j.LogManager;
 import org.apache.lucene.codecs.CodecUtil;
 import org.apache.lucene.store.FSDirectory;
+import org.apache.lucene.store.FSLockFactory;
 import org.apache.lucene.store.IOContext;
 import org.apache.lucene.store.IndexInput;
 import org.apache.lucene.store.IndexOutput;
@@ -583,8 +584,9 @@ public class WarmFullFileManagerTests extends OpenSearchTestCase {
         }, 30, TimeUnit.SECONDS);
     }
 
-    public void testNioMasterIsDeclinedPermanentlyAndCleanedUp() throws Exception {
-        // A local directory that serves the file with NIO (as hybridfs does for extensions on its NIO list).
+    public void testNioDirectoryIsDeclinedPermanentlyBeforeAnyDownload() throws Exception {
+        // A local directory known to serve the file with NIO (as hybridfs does for extensions on its NIO list) is
+        // declined at admission: no download, no slot, no budget, nothing on disk or in the cache.
         String name = "_nio.faiss";
         Path path = dir.resolve(name);
         FileCache fileCache = newFileCache();
@@ -600,11 +602,48 @@ public class WarmFullFileManagerTests extends OpenSearchTestCase {
             assertBusy(() -> assertEquals(Long.MAX_VALUE, st.retryAt()), 10, TimeUnit.SECONDS);
             assertEquals(FullFileState.State.BLOCK, st.state());
             assertNull("nothing published", st.localMaster());
-            assertEquals("downloaded once (4 parts)", 4, reader.readCount());
+            assertEquals("nothing downloaded", 0, reader.readCount());
             assertTrue("the trigger never fires again", mgr.relativeTimeInMillis() < st.retryAt());
+            assertNull("no whole-file cache entry", fileCache.get(path));
+            assertFalse("nothing on disk", Files.exists(path));
+            assertEquals("no budget taken", 0L, mgr.reservedBytesPerSegment()[0]);
+            assertEquals("never started", 0L, mgr.counters().get("started").longValue());
+            assertEquals(1L, mgr.counters().get("declined.NOT_MMAP").longValue());
+        }
+
+        // The slot was never taken: an mmap-served file promotes.
+        FullFileState ok = newState(tm, fileCache, "_ok.faiss", FILE_LENGTH);
+        startPromotion(mgr, ok);
+        awaitState(ok, FullFileState.State.FULL);
+    }
+
+    public void testUnrecognizedDirectoryIsDeclinedPermanentlyAfterTheDownloadWhenNotMmap() throws Exception {
+        // A directory type the admission check does not know is given the benefit of the doubt: the file is
+        // downloaded, the mapping is opened, and an NIO input is declined permanently and cleaned up there.
+        String name = "_custom.faiss";
+        Path path = dir.resolve(name);
+        FileCache fileCache = newFileCache();
+        PositionDependentStreamReader reader = new PositionDependentStreamReader();
+        TransferManager tm = new TransferManager(reader, fileCache, threadPool);
+        WarmFullFileManager mgr = newManager(fileCache, 1, 0.5);
+
+        try (NIOFSDirectory nio = new NIOFSDirectory(dir); FSDirectory custom = new FSDirectory(dir, FSLockFactory.getDefault()) {
+            @Override
+            public IndexInput openInput(String fileName, IOContext context) throws IOException {
+                return nio.openInput(fileName, context);
+            }
+        }) {
+            FullFileState st = new FullFileState(tm, custom, fileCache, name, FILE_LENGTH, path);
+            startPromotion(mgr, st);
+
+            assertBusy(() -> assertEquals(Long.MAX_VALUE, st.retryAt()), 10, TimeUnit.SECONDS);
+            assertEquals(FullFileState.State.BLOCK, st.state());
+            assertNull("nothing published", st.localMaster());
+            assertEquals("downloaded once (4 parts)", 4, reader.readCount());
             assertNull("useless whole file removed from the cache", fileCache.get(path));
             assertFalse("and deleted from disk", Files.exists(path));
             assertEquals("budget released", 0L, mgr.reservedBytesPerSegment()[0]);
+            assertEquals(1L, mgr.counters().get("declined.NOT_MMAP").longValue());
         }
 
         // The slot was released: an mmap-served file now promotes.
@@ -1859,7 +1898,7 @@ public class WarmFullFileManagerTests extends OpenSearchTestCase {
         startPromotion(mgr, huge);
         assertEquals(FullFileState.State.BLOCK, huge.state());
 
-        // Not mmap: an NIO-served directory, declined permanently after the download.
+        // Not mmap: an NIO directory, declined permanently at admission, before any download.
         try (NIOFSDirectory nio = new NIOFSDirectory(dir)) {
             FullFileState onNio = new FullFileState(tm, nio, fileCache, "_nio.faiss", FILE_LENGTH, dir.resolve("_nio.faiss"));
             startPromotion(mgr, onNio);
@@ -1879,9 +1918,9 @@ public class WarmFullFileManagerTests extends OpenSearchTestCase {
         assertEquals(0L, stats.get("declined.NO_SLOT").longValue());
         assertEquals(3L, stats.get("declined").longValue());
         assertEquals("three promote() calls", 3L, stats.get("requested").longValue());
-        assertEquals("the too-large file never started a download", 2L, stats.get("started").longValue());
-        assertEquals("NIO and the failed part both started and did not reach FULL", 2L, stats.get("failed").longValue());
-        assertEquals("only the NIO download completed", FILE_LENGTH, stats.get("downloadedBytes").longValue());
+        assertEquals("only the failing download started", 1L, stats.get("started").longValue());
+        assertEquals("the failed part started and did not reach FULL", 1L, stats.get("failed").longValue());
+        assertEquals("no download completed", 0L, stats.get("downloadedBytes").longValue());
         assertEquals("nothing promoted", 0L, stats.get("promoted").longValue());
         assertEquals("every decline released its bytes", 0L, stats.get("reservedBytes").longValue());
         assertEquals("every decline released its slot", 0, stats.get("activeDownloads").longValue());
