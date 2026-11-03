@@ -420,8 +420,14 @@ public final class FullFileState {
             try {
                 executor.execute(this::runCleanup);
             } catch (RuntimeException e) {
-                // Only expected on node shutdown. Never run inline: this may be the FileCache listener thread.
-                logger.warn("could not schedule whole-file cleanup for {}; mapping kept until shutdown", fullFilePath, e);
+                // Nothing was queued, so a later decHandles(), demote() or closeFamily() may schedule it again. Never run
+                // inline: this may be the FileCache listener thread.
+                cleanupScheduled.set(false);
+                logger.warn(
+                    "could not schedule whole-file cleanup for {}; will retry on the next handle release or close",
+                    fullFilePath,
+                    e
+                );
             }
         }
     }

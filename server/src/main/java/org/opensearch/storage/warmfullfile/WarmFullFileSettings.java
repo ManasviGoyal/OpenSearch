@@ -24,9 +24,9 @@ import java.util.stream.Collectors;
  *
  * When a warm-tier search derives a clone or slice from a file whose extension is listed in
  * {@link #EXTENSIONS}, the node may download the whole file in the background and serve subsequent
- * reads from a single local memory mapping instead of 8 MiB blocks. The feature is off by default
- * (empty extension list) and is gated behind the writable-warm feature flag at the point where it
- * is constructed.
+ * reads from a single local memory mapping instead of 8 MiB blocks. The list defaults to the k-NN graph and
+ * code files; an empty list disables the feature. The feature is gated behind the writable-warm feature flag
+ * at the point where it is constructed.
  *
  * <p>Removing an extension is not an emergency lever. It stops new promotions and sends new reads of the already
  * promoted files back to blocks, but it frees nothing on its own: each file's mapping, its whole file in the cache and
