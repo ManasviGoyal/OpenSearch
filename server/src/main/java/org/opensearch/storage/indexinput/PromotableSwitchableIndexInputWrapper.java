@@ -12,10 +12,8 @@ import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.apache.lucene.store.AlreadyClosedException;
 import org.apache.lucene.store.IndexInput;
-import org.opensearch.index.engine.OpenSearchConcurrentMergeScheduler;
 import org.opensearch.storage.warmfullfile.FullFileState;
 import org.opensearch.storage.warmfullfile.WarmFullFileManager;
-import org.opensearch.storage.warmfullfile.WarmFullFileSettings;
 
 import java.io.IOException;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -25,15 +23,14 @@ import java.util.concurrent.atomic.AtomicBoolean;
  *
  * <p>Only handles that passed the open-time eligibility rules are wrapped by this class. When the family is
  * {@link FullFileState.State#FULL}, {@link #clone()} and {@link #slice(String, long, long)} return a view of the
- * family's local whole-file mapping instead of a block input. Otherwise, the first clone/slice triggers a background
- * promotion and a block input is returned. An input that already exists is never switched.
+ * family's local whole-file mapping instead of a block input. Otherwise, the clone/slice asks the manager for a
+ * promotion ({@link WarmFullFileManager#requestPromotion}) and a block input is returned. An input that already exists
+ * is never switched.
  */
 public class PromotableSwitchableIndexInputWrapper extends SwitchableIndexInputWrapper {
 
     private final String fullCloneDescription;
     private final FullFileState fullFileState;
-    // The file's extension, checked against the setting at trigger time; null when the name has none.
-    private final String extension;
     private final WarmFullFileManager manager;
     // Non-null only for handles opened by openInput: true while this handle holds its one count on the family state.
     private final AtomicBoolean handleCounted;
@@ -67,7 +64,6 @@ public class PromotableSwitchableIndexInputWrapper extends SwitchableIndexInputW
         super(resourceDescription, in);
         this.fullCloneDescription = "Full clone " + resourceDescription;
         this.fullFileState = fullFileState;
-        this.extension = WarmFullFileSettings.extensionOf(fullFileState.fileName());
         this.manager = manager;
         if (countsHandle) {
             fullFileState.incHandles();
@@ -90,7 +86,7 @@ public class PromotableSwitchableIndexInputWrapper extends SwitchableIndexInputW
         if (view != null) {
             return view;
         }
-        maybeTrigger();
+        requestPromotion();
         // Derived wrappers share the family state but do not hold a handle count.
         return new PromotableSwitchableIndexInputWrapper(
             "Cloned " + resourceDescription,
@@ -113,7 +109,7 @@ public class PromotableSwitchableIndexInputWrapper extends SwitchableIndexInputW
         if (view != null) {
             return view;
         }
-        maybeTrigger();
+        requestPromotion();
         return new PromotableSwitchableIndexInputWrapper(
             "Sliced " + resourceDescription,
             switchableIndexInput.slice(sliceDescription, offset, length),
@@ -166,45 +162,10 @@ public class PromotableSwitchableIndexInputWrapper extends SwitchableIndexInputW
         }
     }
 
-    /**
-     * Requests promotion at most once per BLOCK period: only when the file is in remote (block) mode, only while the
-     * setting still lists the extension, never on a Lucene merge thread, and only for the thread whose
-     * {@link FullFileState#onAccess} moves the family to PROMOTING (which also enforces BLOCK, the retry time and a
-     * pending release). The trigger does that transition and an executor submit and nothing else; promote() never runs
-     * on the search thread.
-     */
-    private void maybeTrigger() {
-        FullFileState st = fullFileState;
-        if (manager == null) {
-            return;
-        }
-        // Checked at trigger time, not at open: a handle opened before the upload becomes promotable once the family
-        // is in remote mode (see FullFileState.markRemoteMode for when that is).
-        if (st.isRemoteMode() == false) {
-            return;
-        }
-        // Read the setting now, not only when the family was created: an extension removed since then must not promote,
-        // and one listed again must.
-        if (manager.isExtensionEligible(extension) == false) {
-            return;
-        }
-        // A merge reads a source segment once and then deletes it, so promoting for it only spends a slot, budget and
-        // a download on a file with minutes to live. Merges usually read through the searcher's already-open reader,
-        // whose handles passed the open-time context check, so the merge is recognised here by the thread Lucene runs
-        // it on instead.
-        if (OpenSearchConcurrentMergeScheduler.isMergeThread(Thread.currentThread())) {
-            return;
-        }
-        if (st.onAccess(manager.relativeTimeInMillis())) {
-            // Once per promotion attempt, not per clone or slice. The thread name shows what started it.
-            logger.debug("whole-file promotion requested for {} on thread [{}]", resourceDescription, Thread.currentThread().getName());
-            try {
-                manager.executor().execute(() -> manager.promote(st));
-            } catch (RuntimeException e) {
-                // e.g. executor rejected: back to BLOCK with the retry time unchanged, so a later search can retry.
-                st.abandonPromotion(st.retryAt());
-                logger.debug("whole-file promotion submit rejected for {}", resourceDescription, e);
-            }
+    /** The manager decides whether this access starts a promotion; without a manager the feature is off. */
+    private void requestPromotion() {
+        if (manager != null) {
+            manager.requestPromotion(fullFileState);
         }
     }
 

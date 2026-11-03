@@ -20,6 +20,7 @@ import org.opensearch.common.annotation.ExperimentalApi;
 import org.opensearch.common.lease.Releasable;
 import org.opensearch.common.metrics.CounterMetric;
 import org.opensearch.common.util.CancellableThreads;
+import org.opensearch.index.engine.OpenSearchConcurrentMergeScheduler;
 import org.opensearch.index.store.FsDirectoryFactory;
 import org.opensearch.index.store.remote.file.AbstractBlockIndexInput;
 import org.opensearch.index.store.remote.filecache.CachedFullFileIndexInput;
@@ -238,14 +239,54 @@ public class WarmFullFileManager {
         this.beforeDownloadHook = hook == null ? () -> {} : hook;
     }
 
-    /** @return the current monotonic time in millis (for the wrapper's retryAt comparison) */
+    /** @return the current monotonic time in millis, the clock {@link #requestPromotion} compares retryAt against */
     public long relativeTimeInMillis() {
         return clock.getAsLong();
     }
 
     /**
-     * Attempts to promote the family whose state is given (already CAS'd to PROMOTING by the trigger). Runs on the
-     * background executor. On decline or failure, returns the state to BLOCK and sets retryAt.
+     * Called by a promotable handle on each clone or slice served from blocks. Requests a promotion at most once per
+     * BLOCK period: only when the file is in remote (block) mode, only while the setting still lists its extension,
+     * never on a Lucene merge thread, and only for the thread whose {@link FullFileState#onAccess} moves the family to
+     * PROMOTING (which also enforces BLOCK, the retry time and a pending release). Does that transition and an executor
+     * submit and nothing else; {@link #promote} never runs on the caller's thread.
+     *
+     * @param st the family's whole-file promotion state
+     */
+    public void requestPromotion(FullFileState st) {
+        // Checked on every access, not at open: a handle opened before the upload becomes promotable once the family
+        // is in remote mode (see FullFileState.markRemoteMode for when that is).
+        if (st.isRemoteMode() == false) {
+            return;
+        }
+        // Read the setting now, not only when the family was created: an extension removed since then must not promote,
+        // and one listed again must.
+        if (isExtensionEligible(WarmFullFileSettings.extensionOf(st.fileName())) == false) {
+            return;
+        }
+        // A merge reads a source segment once and then deletes it, so promoting for it only spends a slot, budget and
+        // a download on a file with minutes to live. Merges usually read through the searcher's already-open reader,
+        // whose handles passed the open-time context check, so the merge is recognised here by the thread Lucene runs
+        // it on instead.
+        if (OpenSearchConcurrentMergeScheduler.isMergeThread(Thread.currentThread())) {
+            return;
+        }
+        if (st.onAccess(clock.getAsLong())) {
+            // Once per promotion attempt, not per clone or slice. The thread name shows what started it.
+            logger.debug("whole-file promotion requested for {} on thread [{}]", st.fullFilePath(), Thread.currentThread().getName());
+            try {
+                executor.execute(() -> promote(st));
+            } catch (RuntimeException e) {
+                // e.g. executor rejected: back to BLOCK with the retry time unchanged, so a later search can retry.
+                st.abandonPromotion(st.retryAt());
+                logger.debug("whole-file promotion submit rejected for {}", st.fullFilePath(), e);
+            }
+        }
+    }
+
+    /**
+     * Attempts to promote the family whose state is given (already moved to PROMOTING by {@link #requestPromotion}).
+     * Runs on the background executor. On decline or failure, returns the state to BLOCK and sets retryAt.
      */
     public void promote(FullFileState st) {
         requested.inc();

@@ -157,7 +157,7 @@ public final class FullFileState {
     }
 
     /** @return the remote store's checksum for the file (a decimal string), or null when it is not known */
-    public String expectedChecksum() {
+    String expectedChecksum() {
         return expectedChecksum;
     }
 
@@ -187,7 +187,7 @@ public final class FullFileState {
      * @param nowMillis the current monotonic time
      * @return true if this call moved the family to PROMOTING; the caller then promotes it or abandons the promotion
      */
-    public boolean onAccess(long nowMillis) {
+    boolean onAccess(long nowMillis) {
         if (state.get() != State.BLOCK || nowMillis < retryAt) {
             return false;
         }
@@ -208,7 +208,7 @@ public final class FullFileState {
      * @param retryAt the earliest monotonic time a new promotion may be attempted
      * @return true if the family went back to BLOCK; false if it was in any other state
      */
-    public boolean abandonPromotion(long retryAt) {
+    boolean abandonPromotion(long retryAt) {
         synchronized (releaseLock) {
             this.retryAt = retryAt;
             return state.compareAndSet(State.PROMOTING, State.BLOCK);
@@ -221,8 +221,7 @@ public final class FullFileState {
     }
 
     /** How {@link #completePromotion} ended. */
-    @ExperimentalApi
-    public enum Completion {
+    enum Completion {
         /** The mapping is published and the family is FULL. */
         FULL,
         /** Another completion handler for this family published its mapping first; that handler owns the state. */
@@ -245,7 +244,7 @@ public final class FullFileState {
      * @param onCleanupDone           called once the deferred unmap + decRef has run
      * @return {@link Completion#FULL}, or why nothing was installed
      */
-    public Completion completePromotion(
+    Completion completePromotion(
         IndexInput mapping,
         Executor cleanupExecutor,
         Runnable budgetRelease,
@@ -273,7 +272,7 @@ public final class FullFileState {
     }
 
     /** @return the earliest time (monotonic millis) a new promotion may be attempted */
-    public long retryAt() {
+    long retryAt() {
         return retryAt;
     }
 
@@ -299,7 +298,7 @@ public final class FullFileState {
     }
 
     /** @return the current live handle count */
-    public int handleCount() {
+    int handleCount() {
         return handleCount.get();
     }
 
@@ -309,7 +308,7 @@ public final class FullFileState {
      *
      * @return the family's download cancellation handle
      */
-    public CancellableThreads downloadCancellation() {
+    CancellableThreads downloadCancellation() {
         return downloadCancellation.updateAndGet(current -> current != null ? current : new CancellableThreads());
     }
 
@@ -356,7 +355,7 @@ public final class FullFileState {
      *
      * @return true if the family was FULL and is now BLOCK; false if it was in any other state
      */
-    public boolean demote() {
+    boolean demote() {
         synchronized (releaseLock) {
             // The release is owed before BLOCK becomes visible: a trigger that sees BLOCK must also see the pending
             // release, or it would start a promotion that maps the file a second time and then finds this mapping.
@@ -379,7 +378,7 @@ public final class FullFileState {
      *
      * @return true if the family is FULL again
      */
-    public boolean restore() {
+    boolean restore() {
         synchronized (releaseLock) {
             if (mappingReleaseOwed == false || cleanupScheduled.get() || localMaster.get() == null) {
                 return false;
@@ -396,7 +395,7 @@ public final class FullFileState {
      * @return true while a demoted family still holds its previous mapping, i.e. between {@link #demote()} and the
      *         deferred release or a {@link #restore()}; a promotion in that window would map the file a second time
      */
-    public boolean isMappingReleasePending() {
+    boolean isMappingReleasePending() {
         return mappingReleaseOwed && cleanupDone == false && state.get() != State.CLOSED;
     }
 
@@ -465,7 +464,7 @@ public final class FullFileState {
     }
 
     /** @return true once the deferred unmap + decRef has run */
-    public boolean cleanupDone() {
+    boolean cleanupDone() {
         return cleanupDone;
     }
 
@@ -482,12 +481,12 @@ public final class FullFileState {
     }
 
     /** @return the plain file name */
-    public String fileName() {
+    String fileName() {
         return fileName;
     }
 
     /** @return the whole-file length in bytes */
-    public long fileLength() {
+    long fileLength() {
         return fileLength;
     }
 

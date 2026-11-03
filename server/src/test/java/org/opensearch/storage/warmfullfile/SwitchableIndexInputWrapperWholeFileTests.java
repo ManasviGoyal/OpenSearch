@@ -5,7 +5,7 @@
  * this file be licensed under the Apache-2.0 license or a
  * compatible open source license.
  */
-package org.opensearch.storage.directory;
+package org.opensearch.storage.warmfullfile;
 
 import com.carrotsearch.randomizedtesting.annotations.ThreadLeakFilters;
 
@@ -37,14 +37,12 @@ import org.opensearch.index.store.remote.file.CleanerDaemonThreadLeakFilter;
 import org.opensearch.index.store.remote.filecache.FileCache;
 import org.opensearch.index.store.remote.filecache.FileCacheFactory;
 import org.opensearch.index.store.remote.utils.TransferManager;
+import org.opensearch.storage.directory.TieredStorageBaseTestCase;
 import org.opensearch.storage.indexinput.PromotableCachedSwitchableIndexInput;
 import org.opensearch.storage.indexinput.PromotableSwitchableIndexInputWrapper;
 import org.opensearch.storage.indexinput.SwitchableIndexInput;
 import org.opensearch.storage.indexinput.SwitchableIndexInputWrapper;
 import org.opensearch.storage.prefetch.TieredStoragePrefetchSettings;
-import org.opensearch.storage.warmfullfile.FullFileState;
-import org.opensearch.storage.warmfullfile.WarmFullFileManager;
-import org.opensearch.storage.warmfullfile.WarmFullFileSettings;
 import org.opensearch.test.MockLogAppender;
 import org.opensearch.test.junit.annotations.TestLogging;
 import org.opensearch.threadpool.ThreadPool;
@@ -345,19 +343,21 @@ public class SwitchableIndexInputWrapperWholeFileTests extends TieredStorageBase
         IOUtils.close(localClone, localSlice, switchedClone, remoteClone, handle);
     }
 
-    @TestLogging(value = "org.opensearch.storage.indexinput.PromotableSwitchableIndexInputWrapper:DEBUG", reason = "request line is DEBUG")
+    @TestLogging(value = "org.opensearch.storage.warmfullfile.WarmFullFileManager:DEBUG", reason = "request line is DEBUG")
     public void testTriggerLogsOneRequestWithTheThreadName() throws Exception {
         syncLocalAndRemoteForFile(localDirectory, FILE_NAME);
         SwitchableIndexInput in = newInput(true, transferManager);
         FullFileState st = stateFor(in);
         RecordingExecutor exec = new RecordingExecutor();
         SwitchableIndexInputWrapper handle = new PromotableSwitchableIndexInputWrapper("h", in, st, manager(exec, new AtomicLong()));
-        String loggerName = PromotableSwitchableIndexInputWrapper.class.getName();
-        String expected = "whole-file promotion requested for h on thread [" + Thread.currentThread().getName() + "]";
+        String loggerName = WarmFullFileManager.class.getName();
+        String expected = "whole-file promotion requested for "
+            + getFilePath(localDirectory, FILE_NAME)
+            + " on thread ["
+            + Thread.currentThread().getName()
+            + "]";
         AtomicInteger seen = new AtomicInteger();
-        try (
-            MockLogAppender appender = MockLogAppender.createForLoggers(LogManager.getLogger(PromotableSwitchableIndexInputWrapper.class))
-        ) {
+        try (MockLogAppender appender = MockLogAppender.createForLoggers(LogManager.getLogger(WarmFullFileManager.class))) {
             appender.addExpectation(new MockLogAppender.LoggingExpectation() {
                 @Override
                 public void match(LogEvent event) {
