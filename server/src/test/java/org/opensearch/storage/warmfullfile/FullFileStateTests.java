@@ -238,6 +238,29 @@ public class FullFileStateTests extends OpenSearchTestCase {
         assertEquals("budget released with the reference", 1, f.budgetReleases.get());
     }
 
+    public void testCloseOfADemotedFamilyWithOpenHandlesReportsAndReleasesOnLastClose() throws Exception {
+        // Demoted with a handle open: the mapping, the reference and the budget are still held, so a close reports the
+        // live handle like a FULL close does, and the last handle close releases everything.
+        Fixture f = new Fixture();
+        f.goFull();
+        f.st.incHandles();
+        assertTrue(f.st.demote());
+        assertTrue(f.executor.tasks.isEmpty());
+
+        f.st.closeFamily();
+        assertEquals(FullFileState.State.CLOSED, f.st.state());
+        assertEquals("reported: closed with live handles", 1, f.stuckReports.get());
+        assertTrue("no cleanup while the handle is open", f.executor.tasks.isEmpty());
+        assertEquals(0, f.budgetReleases.get());
+
+        f.st.decHandles();
+        f.runCleanupOnce();
+        verify(f.master).close();
+        assertEquals(Integer.valueOf(0), f.fileCache.getRef(f.path));
+        assertEquals(1, f.budgetReleases.get());
+        assertEquals(1, f.cleanupsDone.get());
+    }
+
     public void testCloseWhileBlockOrPromotingOwesNoCleanup() throws Exception {
         // BLOCK
         Fixture blocked = new Fixture();

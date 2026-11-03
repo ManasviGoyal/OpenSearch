@@ -316,13 +316,15 @@ public final class FullFileState {
      * The family-close routine. Called from {@code PromotableCachedSwitchableIndexInput.close()}, which runs
      * inside the FileCache removal listener under a segment lock, so this must not touch the FileCache inline.
      *
-     * <p>Marks the state CLOSED and cancels a download in flight. If it was FULL: schedules the unmap, the decRef and
-     * the budget release for when the handle count reaches zero (immediately on the cleanup executor if it already is),
-     * so the bytes count against the segment for as long as the whole file is held in it. If it was PROMOTING, the
-     * cancelled download fails and the manager's completion handler unwinds; if BLOCK, there is nothing to release.
+     * <p>Marks the state CLOSED and cancels a download in flight. If it was FULL, or demoted with its release still
+     * owed: schedules the unmap, the decRef and the budget release for when the handle count reaches zero (immediately
+     * on the cleanup executor if it already is), so the bytes count against the segment for as long as the whole file is
+     * held in it, and reports the family if handles are still open. If it was PROMOTING, the cancelled download fails
+     * and the manager's completion handler unwinds; if BLOCK with nothing owed, there is nothing to release.
      */
     public void closeFamily() {
         State prev;
+        boolean owesRelease;
         synchronized (releaseLock) {
             // Held with restore(): a restore that has just put the family back to FULL must not clear the release this
             // close owes, or the mapping and the cache reference would never be given back.
@@ -330,12 +332,14 @@ public final class FullFileState {
             if (prev == State.FULL) {
                 mappingReleaseOwed = true;
             }
+            // A demoted family still holds its mapping, reference and budget until its handles close, like a FULL one.
+            owesRelease = mappingReleaseOwed && cleanupDone == false;
         }
         CancellableThreads download = downloadCancellation.getAndSet(CANCELLED);
         if (download != null) {
             download.cancel("family closed"); // a download in flight fails within a part; its completion handler unwinds
         }
-        if (prev != State.FULL) {
+        if (owesRelease == false) {
             return;
         }
         if (handleCount.get() > 0) {
