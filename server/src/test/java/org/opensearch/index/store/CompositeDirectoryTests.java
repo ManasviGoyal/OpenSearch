@@ -26,6 +26,7 @@ import org.opensearch.index.store.remote.utils.FileTypeUtils;
 import org.junit.Before;
 
 import java.io.IOException;
+import java.nio.file.Files;
 import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
 import java.util.Arrays;
@@ -105,6 +106,20 @@ public class CompositeDirectoryTests extends BaseRemoteSegmentStoreDirectoryTest
             exception = e;
         }
         assertNull(exception);
+    }
+
+    public void testFileLengthFallsBackToRemoteWhenTheEntryOutlivesTheLocalFile() throws IOException {
+        // A file with a cache entry whose local copy was deleted on the local directory directly (not through the
+        // cache): the length comes from the remote store instead of failing the caller.
+        addFilesToDirectory(new String[] { FILE_PRESENT_IN_REMOTE_ONLY });
+        Path key = getFilePath(FILE_PRESENT_IN_REMOTE_ONLY);
+        Files.delete(key);
+        assertNotNull(fileCache.get(key));
+        fileCache.decRef(key);
+        assertEquals(
+            remoteSegmentStoreDirectory.fileLength(FILE_PRESENT_IN_REMOTE_ONLY),
+            compositeDirectory.fileLength(FILE_PRESENT_IN_REMOTE_ONLY)
+        );
     }
 
     public void testFileLength() throws IOException {

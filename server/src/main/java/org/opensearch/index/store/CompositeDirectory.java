@@ -208,30 +208,28 @@ public class CompositeDirectory extends FilterDirectory implements RemoteSyncLis
     public long fileLength(String name) throws IOException {
         ensureOpen();
         logger.trace("Composite Directory[{}]: fileLength() called {}", this::toString, () -> name);
-        long fileLength;
         Path key = getFilePath(name);
         if (FileTypeUtils.isTempFile(name) || fileCache.get(key) != null) {
             try {
-                fileLength = localDirectory.fileLength(name);
+                final long localLength = localDirectory.fileLength(name);
                 logger.trace(
                     "Composite Directory[{}]: fileLength of {} fetched from Local - {}",
                     this::toString,
                     () -> name,
-                    () -> fileLength
+                    () -> localLength
                 );
+                return localLength;
+            } catch (NoSuchFileException e) {
+                // The cache entry outlived its file: it was deleted on the local directory directly, not through the
+                // cache. The remote store still has the file, so answer from there rather than fail the caller.
+                logger.debug("Composite Directory[{}]: {} has a cache entry but no local file; using the remote length", this, name);
             } finally {
                 fileCache.decRef(key);
             }
-        } else {
-            fileLength = remoteDirectory.fileLength(name);
-            logger.trace(
-                "Composite Directory[{}]: fileLength of {} fetched from Remote - {}",
-                this::toString,
-                () -> name,
-                () -> fileLength
-            );
         }
-        return fileLength;
+        final long remoteLength = remoteDirectory.fileLength(name);
+        logger.trace("Composite Directory[{}]: fileLength of {} fetched from Remote - {}", this::toString, () -> name, () -> remoteLength);
+        return remoteLength;
     }
 
     /**

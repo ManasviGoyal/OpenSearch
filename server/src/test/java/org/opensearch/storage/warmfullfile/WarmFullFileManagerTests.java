@@ -1728,6 +1728,46 @@ public class WarmFullFileManagerTests extends OpenSearchTestCase {
         assertEquals(content.length, mgr.reservedBytesPerSegment()[0]);
     }
 
+    public void testCompletedEntryWhoseFileWasDeletedBehindTheCacheIsDroppedAndRedownloaded() throws Exception {
+        // The whole-file entry of a closed family stays in the cache, and the file is then deleted on the local
+        // directory directly (not through the cache), as a recovery cleanup does. A new family for the same file is
+        // handed that entry by the fetch; the attempt finds no file, drops the entry and declines, and the next attempt
+        // downloads the file again and ends FULL on a file that exists.
+        String name = "_stale.faiss";
+        Path path = dir.resolve(name);
+        byte[] content = footeredContent(FILE_LENGTH);
+        FixedContentStreamReader reader = new FixedContentStreamReader(content);
+        FileCache fileCache = newFileCache();
+        TransferManager tm = new TransferManager(reader, fileCache, threadPool);
+        AtomicLong clock = new AtomicLong(1_000);
+        WarmFullFileManager mgr = newManager(fileCache, clock::get, 4, 0.5);
+        FullFileState first = promoteToFull(mgr, fileCache, name, content, tm);
+        int parts = partsFor(name, content.length);
+        assertEquals(parts, reader.readCount());
+
+        first.closeFamily();
+        assertBusy(() -> assertTrue(first.cleanupDone()), 30, TimeUnit.SECONDS);
+        Files.delete(path);
+        assertNotNull("the entry outlives the file", fileCache.get(path));
+        fileCache.decRef(path);
+
+        FullFileState second = newStateWithChecksum(tm, fileCache, name, content.length, footerChecksum(content));
+        startPromotion(mgr, second);
+        awaitState(second, FullFileState.State.BLOCK);
+        assertEquals("no remote read for the joined entry", parts, reader.readCount());
+        assertNull("the stale entry is gone", fileCache.get(path));
+        assertEquals(1L, mgr.counters().get("declined.LENGTH_MISMATCH").longValue());
+        assertEquals("one file's worth of budget: the closed family's is back", 0L, mgr.reservedBytesPerSegment()[0]);
+
+        clock.addAndGet(WarmFullFileManager.RETRY_DELAY_MILLIS);
+        startPromotion(mgr, second);
+        awaitState(second, FullFileState.State.FULL);
+        assertEquals("the file was downloaded again", 2 * parts, reader.readCount());
+        assertTrue(Files.exists(path));
+        assertServedWithOneReference(second, fileCache, path, content);
+        assertEquals(2L, mgr.counters().get("promoted").longValue());
+    }
+
     public void testTruncatedLeftoverIsDeletedAndRedownloaded() throws Exception {
         // The file under a restore placeholder is shorter than the family's length (a write that did not finish): it
         // fails the length check, the placeholder and the file are removed, and the whole file is downloaded again.

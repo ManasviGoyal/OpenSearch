@@ -30,8 +30,10 @@ import org.opensearch.index.store.remote.utils.BlobFetchRequest;
 import org.opensearch.index.store.remote.utils.TransferManager;
 import org.opensearch.storage.indexinput.CachedSwitchableIndexInput;
 
+import java.io.FileNotFoundException;
 import java.io.IOException;
 import java.nio.file.Files;
+import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -443,9 +445,11 @@ public class WarmFullFileManager {
                 }
                 holdsReference = true;
                 FSDirectory localDirectory = st.localDirectory();
-                if (localDirectory.fileLength(st.fileName()) != length) {
+                if (lengthOnDisk(localDirectory, st.fileName()) != length) {
                     // Remove the entry (closes it and deletes the truncated file). Without this, the completed
-                    // DelayedCreation entry stays live and the next retry reuses the same truncated file and fails again.
+                    // DelayedCreation entry stays live and the next retry reuses the same truncated file and fails
+                    // again. The same for an entry whose file is gone: a completed entry joined by this attempt whose
+                    // file was deleted on the local directory directly, as a recovery cleanup does.
                     close();
                     dropEntry();
                     abandonPromotion(DeclineReason.LENGTH_MISMATCH, "downloaded length mismatch");
@@ -936,6 +940,15 @@ public class WarmFullFileManager {
             return Math.min(mmap.getMaxChunkSize(), MAX_WHOLE_FILE_BYTES);
         }
         return MAX_WHOLE_FILE_BYTES;
+    }
+
+    /** The file's length in the local directory, or -1 if there is no such file. */
+    private static long lengthOnDisk(FSDirectory localDirectory, String fileName) throws IOException {
+        try {
+            return localDirectory.fileLength(fileName);
+        } catch (NoSuchFileException | FileNotFoundException e) {
+            return -1;
+        }
     }
 
     /**
