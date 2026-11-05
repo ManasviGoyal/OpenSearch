@@ -586,6 +586,38 @@ public class TieredDirectoryTests extends TieredStorageBaseTestCase {
         IOUtils.close(slice, clone, recreated);
     }
 
+    public void testAnExtensionListedBeforeKeepsCreatingPromotableFamiliesWhileClear() throws Exception {
+        // Listing an extension and clearing it again: a file of that extension opened while the list is clear still gets
+        // the promotable entry, because the extension has been listed on this node, so listing it again applies to that
+        // family without a reopen. The family stays BLOCK and submits nothing while the list is clear. A file whose
+        // extension was never listed still gets the existing entry.
+        populateData();
+        ClusterSettings clusterSettings = newClusterSettings();
+        WarmFullFileSettings settings = new WarmFullFileSettings(clusterSettings);
+        RecordingExecutor executor = new RecordingExecutor();
+        WarmFullFileManager manager = recordingManager(executor);
+        settings.addListener(manager::onExtensionsChanged);
+        TieredDirectory dir = directoryWith(manager);
+        setExtensions(clusterSettings, "si");
+        setExtensions(clusterSettings);
+        assertFalse(manager.isExtensionEligible("si"));
+        assertTrue(manager.hasBeenEligible("si"));
+        assertFalse(manager.hasBeenEligible("cfe"));
+
+        IndexInput handle = dir.openInput(FILE_PRESENT_IN_REMOTE_ONLY, IOContext.DEFAULT);
+        assertEquals(PromotableCachedSwitchableIndexInput.class, entryClassOf(FILE_PRESENT_IN_REMOTE_ONLY));
+        assertEquals(FullFileState.State.BLOCK, familyStateOf(FILE_PRESENT_IN_REMOTE_ONLY).state());
+        IndexInput clone = handle.clone();
+        assertEquals("no promotion submitted while the list is clear", 0, executor.submitted.get());
+        assertEquals(FullFileState.State.BLOCK, familyStateOf(FILE_PRESENT_IN_REMOTE_ONLY).state());
+        IOUtils.close(clone, handle);
+
+        String neverListed = "_3.cfe";
+        dir.createOutput(neverListed, IOContext.DEFAULT).close();
+        assertEquals(CachedSwitchableIndexInput.class, entryClassOf(neverListed));
+        assertNull("the existing entry carries no family", familyStateOf(neverListed));
+    }
+
     public void testFeatureOffNeverPromotesEvenWithManager() throws Exception {
         // A live manager with no listed extensions: every file this directory creates gets the existing entry, which
         // carries no family, and the existing wrapper, whose clones and slices are existing wrappers too; nothing is

@@ -151,6 +151,10 @@ public class WarmFullFileManager {
     private final Set<FullFileState> awaitingHandleClose = ConcurrentHashMap.newKeySet();
     // The extensions the setting currently allows; the trigger re-checks this so a change applies to open handles too.
     private volatile Set<String> eligibleExtensions = Set.of();
+    // Every extension the setting has listed since this manager was created. A file of such an extension gets the
+    // promotable entry even while the extension is off the list, so listing it again applies to families created in
+    // between without a reopen; whether a promotion starts is always the current list, checked by the trigger.
+    private final Set<String> everEligibleExtensions = ConcurrentHashMap.newKeySet();
     private final CounterMetric promoted = new CounterMetric();
     private final CounterMetric promotedBytes = new CounterMetric();
     private final CounterMetric downloadMillis = new CounterMetric();
@@ -761,6 +765,7 @@ public class WarmFullFileManager {
      * @param extensions the eligible extensions, normalized as {@link WarmFullFileSettings#getExtensions()} returns them
      */
     public void onExtensionsChanged(Set<String> extensions) {
+        everEligibleExtensions.addAll(extensions);
         eligibleExtensions = extensions;
         for (FullFileState st : fullFamilies) {
             if (st.state() == FullFileState.State.CLOSED) {
@@ -822,6 +827,15 @@ public class WarmFullFileManager {
      */
     public boolean isExtensionEligible(String extension) {
         return extension != null && eligibleExtensions.contains(extension);
+    }
+
+    /**
+     * @param extension a file extension without the leading dot
+     * @return whether the setting has listed it at any time since this manager was created, whether or not it is
+     *         listed now; the directory creates the promotable entry for such files
+     */
+    public boolean hasBeenEligible(String extension) {
+        return extension != null && everEligibleExtensions.contains(extension);
     }
 
     /**

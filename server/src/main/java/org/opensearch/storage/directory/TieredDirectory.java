@@ -325,9 +325,11 @@ public class TieredDirectory extends CompositeDirectory {
     }
 
     /**
-     * A file whose extension the setting lists gets the promotable entry, which owns the family's promotion state. Every
-     * other file, and every file when there is no manager, gets the existing entry. The setting is read when the entry
-     * is created, so a change to it applies to families created afterwards.
+     * A file whose extension the setting lists, or has listed since the node started, gets the promotable entry, which
+     * owns the family's promotion state; whether it promotes is decided by the current list at trigger time. Every
+     * other file, and every file when there is no manager, gets the existing entry. Listing an extension for the first
+     * time therefore applies to families created afterwards, while clearing and listing it again applies to every
+     * family, including those created while it was clear.
      */
     private CachedSwitchableIndexInput newSwitchableEntry(String fileName, boolean cacheFromRemote) throws IOException {
         FSDirectory fsDirectory = DirectoryUtils.unwrapFSDirectory(localDirectory);
@@ -355,8 +357,8 @@ public class TieredDirectory extends CompositeDirectory {
         );
     }
 
-    /** Whether the file's extension is listed in the promotion setting; never without a manager. */
+    /** Whether the file's extension is or has been listed in the promotion setting; never without a manager. */
     private boolean isCandidate(String fileName) {
-        return warmFullFileManager != null && warmFullFileManager.isExtensionEligible(WarmFullFileSettings.extensionOf(fileName));
+        return warmFullFileManager != null && warmFullFileManager.hasBeenEligible(WarmFullFileSettings.extensionOf(fileName));
     }
 }

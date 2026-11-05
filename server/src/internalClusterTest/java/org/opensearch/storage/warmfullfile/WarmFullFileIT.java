@@ -387,7 +387,11 @@ public class WarmFullFileIT extends WarmFullFileBaseIT {
         for (int i = 0; i < 20; i++) {
             searchWithSource(SECOND_INDEX_NAME);
             assertFalse("second index promoted with the feature off", isPromoted(second, secondFdt));
-            assertNull("created with the feature off, so its entry carries no family", stateOf(second, secondFdt));
+            assertEquals(
+                "fdt was listed before, so its family exists and stays BLOCK",
+                FullFileState.State.BLOCK,
+                stateOf(second, secondFdt)
+            );
         }
         assertTrue(wholeSegmentFiles(localFiles(second)).isEmpty());
 
@@ -418,6 +422,36 @@ public class WarmFullFileIT extends WarmFullFileBaseIT {
 
         deleteIndex(INDEX_NAME);
         deleteIndex(SECOND_INDEX_NAME);
+    }
+
+    /**
+     * The setting is cleared, the index is closed and reopened while it is clear, and the extension is listed again:
+     * the next searches promote the file with no further reopen. The family created by the reopen is promotable because
+     * the extension had been listed on the node before; the family that was demoted by the clear is gone with the reopen,
+     * so this is a fresh promotion, not a restore.
+     */
+    public void testListingExtensionAgainAfterReopenWhileClearPromotesWithoutAnotherReopen() throws Exception {
+        String warmNode = startCluster();
+        WarmShard first = prepareEligibleIndex(INDEX_NAME, warmNode);
+        String fdt = eligibleFdt(first);
+        searchUntilPromoted(INDEX_NAME, first, fdt);
+        List<String> fingerprint = queryFingerprint(INDEX_NAME);
+
+        clearFullFileExtensions();
+        reopenIndex(INDEX_NAME);
+        WarmShard reopened = warmShard(INDEX_NAME, warmNode);
+        for (int i = 0; i < 5; i++) {
+            searchWithSource(INDEX_NAME);
+            assertEquals("the reopened family exists and stays BLOCK", FullFileState.State.BLOCK, stateOf(reopened, fdt));
+            assertFalse("promoted with the feature off", isPromoted(reopened, fdt));
+        }
+
+        setFullFileExtensions(FDT_EXTENSION);
+        searchUntilPromoted(INDEX_NAME, reopened, fdt);
+        assertEquals(0L, reopened.manager.counters().get("restored").longValue());
+        assertEquals(fingerprint, queryFingerprint(INDEX_NAME));
+
+        deleteIndex(INDEX_NAME);
     }
 
     public void testWritesAndMergeAfterPromotionCloseTheOldFamilyAndPromoteTheMergedSegment() throws Exception {
