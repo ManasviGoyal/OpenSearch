@@ -47,6 +47,7 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executor;
 import java.util.concurrent.Semaphore;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.LongSupplier;
 
 /**
@@ -139,7 +140,13 @@ public class WarmFullFileManager {
     private final CounterMetric reused = new CounterMetric();
     private final CounterMetric demoted = new CounterMetric();
     private final CounterMetric restored = new CounterMetric();
+    // Bytes read from the remote store by this node's downloads: a part copied from a local block, or a promotion
+    // handed a download another one completed, adds nothing.
     private final CounterMetric downloadedBytes = new CounterMetric();
+    // Parts of whole files copied from blocks the file cache already held, and their bytes, instead of being read
+    // from the remote store.
+    private final CounterMetric partsFromLocalBlocks = new CounterMetric();
+    private final CounterMetric bytesFromLocalBlocks = new CounterMetric();
     // NOT_MMAP declines that came after a completed download (a directory type not known at admission).
     private final CounterMetric notMmapAfterDownload = new CounterMetric();
     // The families currently FULL on this node, so a settings change can find the ones to demote.
@@ -321,6 +328,11 @@ public class WarmFullFileManager {
         private boolean published;
         private boolean reusedLocalFile;
         private long startedAt;
+        // Told by the download loop, on its thread; read after the future completes. A promotion handed an entry
+        // another download completed, or is completing, is told nothing: it fetched nothing.
+        private final AtomicLong remoteBytes = new AtomicLong();
+        private final AtomicLong reusedParts = new AtomicLong();
+        private final AtomicLong reusedBytes = new AtomicLong();
 
         PromotionAttempt(FullFileState st) {
             this.st = st;
@@ -391,7 +403,7 @@ public class WarmFullFileManager {
                     }
                 }
 
-                BlobFetchRequest request = buildRequest(st, length);
+                BlobFetchRequest request = buildRequest(st, length, this::partWritten);
                 beforeDownloadHook.run();
                 startedAt = clock.getAsLong();
                 reusedLocalFile = reuse;
@@ -435,7 +447,9 @@ public class WarmFullFileManager {
                     return;
                 }
                 if (reusedLocalFile == false) {
-                    downloadedBytes.inc(length);
+                    downloadedBytes.inc(remoteBytes.get());
+                    partsFromLocalBlocks.inc(reusedParts.get());
+                    bytesFromLocalBlocks.inc(reusedBytes.get());
                 }
                 // fetchBlobAsync releases its own reference on success; take the family's reference now.
                 if (fileCache.get(path) == null) {
@@ -457,9 +471,19 @@ public class WarmFullFileManager {
                 }
                 // A reused local file was validated before the entry was created; a fresh download is checked against
                 // the remote store's checksum here.
-                if (reusedLocalFile == false && matchesRemoteChecksum(st) == false) {
+                if (reusedLocalFile == false && matchesRemoteChecksum(st, reusedParts.get() > 0) == false) {
                     close();
                     dropEntry();
+                    if (reusedParts.get() > 0) {
+                        // One of the local blocks copied in is corrupt and nothing says which: the next attempt reads
+                        // every part from the remote store. The blocks themselves are left to the cache.
+                        st.markLocalBlocksSuspect();
+                        logger.warn(
+                            "whole file {} assembled with {} local block(s) failed its checksum; its next download reads every part remotely",
+                            path,
+                            reusedParts.get()
+                        );
+                    }
                     abandonPromotion(DeclineReason.CHECKSUM_MISMATCH, "downloaded checksum mismatch");
                     return;
                 }
@@ -497,12 +521,13 @@ public class WarmFullFileManager {
                 } else {
                     downloadMillis.inc(elapsedMillis);
                     logger.info(
-                        "promoted [{}] to a whole file: {} bytes in {} ms ({} parts of {} bytes, cache segment {})",
+                        "promoted [{}] to a whole file: {} bytes in {} ms ({} parts of {} bytes, {} from local blocks, cache segment {})",
                         path,
                         length,
                         elapsedMillis,
                         partCount(length),
                         partSize,
+                        reusedParts.get(),
                         segment
                     );
                 }
@@ -562,6 +587,16 @@ public class WarmFullFileManager {
                     published = true;
                     return true;
                 }
+            }
+        }
+
+        /** Called by the download loop for every part it writes. */
+        private void partWritten(long bytes, boolean fromLocalBlock) {
+            if (fromLocalBlock) {
+                reusedParts.incrementAndGet();
+                reusedBytes.addAndGet(bytes);
+            } else {
+                remoteBytes.addAndGet(bytes);
             }
         }
 
@@ -662,6 +697,16 @@ public class WarmFullFileManager {
      * passes, there being nothing to compare to; an unreadable or footerless file fails.
      */
     private boolean matchesRemoteChecksum(FullFileState st) {
+        return matchesRemoteChecksum(st, false);
+    }
+
+    /**
+     * As {@link #matchesRemoteChecksum(FullFileState)}; with {@code entireFile}, every byte of the file is checked
+     * against its footer as well, which a file assembled partly from local blocks needs, since blocks are not
+     * checksummed and the footer alone would not show a corrupt one. A fresh download's bytes are covered by the
+     * transport, so it is checked by its footer only.
+     */
+    private boolean matchesRemoteChecksum(FullFileState st, boolean entireFile) {
         final String expected = st.expectedChecksum();
         if (expected == null) {
             return true;
@@ -669,7 +714,7 @@ public class WarmFullFileManager {
         final Path path = st.fullFilePath();
         try (IndexInput in = st.localDirectory().openInput(st.fileName(), IOContext.READONCE)) {
             final long expectedChecksum = Long.parseLong(expected);
-            long footer = CodecUtil.retrieveChecksum(in);
+            long footer = entireFile ? CodecUtil.checksumEntireFile(in) : CodecUtil.retrieveChecksum(in);
             if (footer != expectedChecksum) {
                 logger.debug(
                     "whole file at {} fails validation: footer checksum {} differs from the remote store's {}",
@@ -858,8 +903,9 @@ public class WarmFullFileManager {
 
     /**
      * This node's promotion counters, by name. Cumulative counters ({@code requested}, {@code started}, {@code reused},
-     * {@code promoted}, {@code demoted}, {@code restored}, {@code downloadedBytes}, {@code promotedBytes},
-     * {@code downloadMillis}, {@code declined.<reason>} with the totals {@code declined} and {@code failed}) never
+     * {@code promoted}, {@code demoted}, {@code restored}, {@code downloadedBytes}, {@code partsFromLocalBlocks},
+     * {@code bytesFromLocalBlocks}, {@code promotedBytes}, {@code downloadMillis}, {@code declined.<reason>} with the
+     * totals {@code declined} and {@code failed}) never
      * decrease for the life of the node; {@code reservedBytes}, {@code activeDownloads},
      * {@code familiesAwaitingHandleClose} and {@code bytesAwaitingHandleClose} describe the current moment. Read by
      * tests and node-local code; it has no wire format and is not part of any API.
@@ -875,6 +921,8 @@ public class WarmFullFileManager {
         counters.put("demoted", demoted.count());
         counters.put("restored", restored.count());
         counters.put("downloadedBytes", downloadedBytes.count());
+        counters.put("partsFromLocalBlocks", partsFromLocalBlocks.count());
+        counters.put("bytesFromLocalBlocks", bytesFromLocalBlocks.count());
         counters.put("promotedBytes", promotedBytes.count());
         counters.put("downloadMillis", downloadMillis.count());
         long declined = 0;
@@ -918,9 +966,22 @@ public class WarmFullFileManager {
     }
 
     /** Builds the download request by hand: ceil(length / partSize) parts at absolute offsets, last clipped, no zero tail. */
-    private BlobFetchRequest buildRequest(FullFileState st, long length) {
+    /**
+     * The whole-file download: block-sized, block-aligned parts written atomically, each copied from the block the
+     * file cache already holds for it when there is one, unless such a copy has failed this family's checksum before.
+     */
+    private BlobFetchRequest buildRequest(FullFileState st, long length, BlobFetchRequest.PartListener partListener) {
         List<BlobFetchRequest.BlobPart> parts = buildParts(st.fileName(), length, partSize);
-        return BlobFetchRequest.builder().directory(st.localDirectory()).fileName(st.fileName()).blobParts(parts).atomicWrite(true).build();
+        BlobFetchRequest.Builder request = BlobFetchRequest.builder()
+            .directory(st.localDirectory())
+            .fileName(st.fileName())
+            .blobParts(parts)
+            .atomicWrite(true)
+            .partListener(partListener);
+        if (st.localBlocksSuspect() == false) {
+            request.reuseLocalBlocks(partSize);
+        }
+        return request.build();
     }
 
     static List<BlobFetchRequest.BlobPart> buildParts(String name, long length, long partSize) {
