@@ -33,6 +33,16 @@ public class BlobFetchRequest {
 
     private final boolean atomicWrite;
 
+    private final long localBlockSize;
+
+    private final PartListener partListener;
+
+    /** Told of every part written to the target, and where its bytes came from. */
+    @FunctionalInterface
+    public interface PartListener {
+        void onPart(long bytes, boolean fromLocalBlock);
+    }
+
     private BlobFetchRequest(Builder builder) {
         this.fileName = builder.fileName;
         this.filePath = builder.directory.getDirectory().resolve(fileName);
@@ -40,6 +50,8 @@ public class BlobFetchRequest {
         this.blobParts = builder.blobParts;
         this.blobLength = builder.blobParts.stream().mapToLong(o -> o.getLength()).sum();
         this.atomicWrite = builder.atomicWrite;
+        this.localBlockSize = builder.localBlockSize;
+        this.partListener = builder.partListener;
     }
 
     public Path getFilePath() {
@@ -78,6 +90,21 @@ public class BlobFetchRequest {
         return filePath.resolveSibling(fileName + FileTypeUtils.PARTIAL_DOWNLOAD_SUFFIX);
     }
 
+    /**
+     * The size of the blocks of this file the file cache may hold, when a part that is exactly one such block may be
+     * copied from it instead of read from the remote store; 0 when every part is read from the remote store.
+     */
+    public long getLocalBlockSize() {
+        return localBlockSize;
+    }
+
+    /** Reports a part written to the target: its length and whether it was copied from a local block or read remotely. */
+    public void onPartWritten(long bytes, boolean fromLocalBlock) {
+        if (partListener != null) {
+            partListener.onPart(bytes, fromLocalBlock);
+        }
+    }
+
     public static Builder builder() {
         return new Builder();
     }
@@ -97,6 +124,8 @@ public class BlobFetchRequest {
             + '\''
             + ", atomicWrite="
             + atomicWrite
+            + ", localBlockSize="
+            + localBlockSize
             + '}';
     }
 
@@ -138,6 +167,8 @@ public class BlobFetchRequest {
         private FSDirectory directory;
         private String fileName;
         private boolean atomicWrite;
+        private long localBlockSize;
+        private PartListener partListener;
 
         private Builder() {}
 
@@ -159,6 +190,24 @@ public class BlobFetchRequest {
         /** See {@link BlobFetchRequest#isAtomicWrite()}. */
         public Builder atomicWrite(boolean atomicWrite) {
             this.atomicWrite = atomicWrite;
+            return this;
+        }
+
+        /**
+         * Lets a part that is exactly one block of {@code blockSize} bytes be copied from the block the file cache
+         * holds for it, if any, instead of read from the remote store. Correct only when the parts are block-sized
+         * and block-aligned, as the whole-file promotion builds them.
+         *
+         * @param blockSize the block size the file cache uses for this file
+         */
+        public Builder reuseLocalBlocks(long blockSize) {
+            this.localBlockSize = blockSize;
+            return this;
+        }
+
+        /** Told of every part the download writes, with its length and whether it came from a local block. */
+        public Builder partListener(PartListener partListener) {
+            this.partListener = partListener;
             return this;
         }
 

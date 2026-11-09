@@ -86,6 +86,9 @@ public final class FullFileState {
         CANCELLED.cancel("family closed");
     }
     private volatile long retryAt;
+    // Set when a whole file assembled partly from this family's local blocks failed its checksum: the next download
+    // reads every part from the remote store, since one of those blocks is corrupt and nothing says which.
+    private volatile boolean localBlocksSuspect;
     private final AtomicInteger handleCount = new AtomicInteger(0);
 
     // Teardown wiring, set by completePromotion together with the mapping.
@@ -213,6 +216,16 @@ public final class FullFileState {
             this.retryAt = retryAt;
             return state.compareAndSet(State.PROMOTING, State.BLOCK);
         }
+    }
+
+    /** Records that a whole file assembled from this family's local blocks failed its checksum. */
+    void markLocalBlocksSuspect() {
+        localBlocksSuspect = true;
+    }
+
+    /** @return true once a whole file assembled from this family's local blocks failed its checksum */
+    boolean localBlocksSuspect() {
+        return localBlocksSuspect;
     }
 
     /** @return the local whole-file mapping, or null before promotion publishes it */

@@ -53,6 +53,7 @@ import static org.opensearch.test.hamcrest.OpenSearchAssertions.assertHitCount;
 import static org.opensearch.test.hamcrest.OpenSearchAssertions.assertNoFailures;
 import static org.hamcrest.Matchers.greaterThan;
 import static org.hamcrest.Matchers.greaterThanOrEqualTo;
+import static org.hamcrest.Matchers.lessThan;
 import static org.hamcrest.Matchers.lessThanOrEqualTo;
 
 /**
@@ -198,8 +199,8 @@ public class WarmFullFileIT extends WarmFullFileBaseIT {
         Map<String, Long> stats = reopened.manager.counters();
         assertEquals(2L, stats.get("promoted").longValue());
         assertEquals(
-            "the second promotion is handed the finished download; the bytes are counted once more but not fetched",
-            downloadedBefore * 2,
+            "the second promotion is handed the finished download and fetches nothing",
+            downloadedBefore,
             stats.get("downloadedBytes").longValue()
         );
         assertEquals(fingerprint, queryFingerprint(INDEX_NAME));
@@ -454,6 +455,42 @@ public class WarmFullFileIT extends WarmFullFileBaseIT {
         deleteIndex(INDEX_NAME);
     }
 
+    /**
+     * Searches before the extension is listed pull blocks of the stored-fields file into the cache. The promotion that
+     * follows copies those parts from the blocks and reads only the rest from the remote store.
+     */
+    public void testBlocksAlreadyLocalAreCopiedIntoTheWholeFileInsteadOfDownloaded() throws Exception {
+        String warmNode = startCluster();
+        createWarmIndex(INDEX_NAME);
+        populateAndMergeToBlocks(INDEX_NAME, warmShard(INDEX_NAME, warmNode));
+        for (int i = 0; i < 5; i++) {
+            searchWithSource(INDEX_NAME); // stored-fields reads fetch blocks; .fdt is not listed yet, so no promotion
+        }
+        List<String> fingerprint = queryFingerprint(INDEX_NAME);
+        setFullFileExtensions(FDT_EXTENSION);
+        reopenIndex(INDEX_NAME);
+        WarmShard warmShard = warmShard(INDEX_NAME, warmNode);
+        waitForBlockMode(warmShard);
+        String fdt = eligibleFdt(warmShard);
+        long length = warmShard.directory.fileLength(fdt);
+        assertFalse("blocks of the file survive the reopen", wholeSegmentFiles(localFiles(warmShard)).contains(fdt));
+        assertTrue(localFiles(warmShard).stream().anyMatch(f -> f.startsWith(fdt + "_block_")));
+
+        searchUntilPromoted(INDEX_NAME, warmShard, fdt);
+
+        Map<String, Long> stats = warmShard.manager.counters();
+        assertThat("at least one part came from a local block", stats.get("partsFromLocalBlocks"), greaterThanOrEqualTo(1L));
+        assertEquals(
+            "every byte came from a block or the remote store",
+            length,
+            stats.get("bytesFromLocalBlocks") + stats.get("downloadedBytes")
+        );
+        assertThat(stats.get("downloadedBytes"), lessThan(length));
+        assertEquals(fingerprint, queryFingerprint(INDEX_NAME));
+
+        deleteIndex(INDEX_NAME);
+    }
+
     public void testWritesAndMergeAfterPromotionCloseTheOldFamilyAndPromoteTheMergedSegment() throws Exception {
         String warmNode = startCluster();
         WarmShard warmShard = prepareEligibleIndex(INDEX_NAME, warmNode);
@@ -461,7 +498,9 @@ public class WarmFullFileIT extends WarmFullFileBaseIT {
         searchUntilPromoted(INDEX_NAME, warmShard, promotedFdt);
         FullFileState promotedFamily = requireFamilyState(warmShard, promotedFdt);
         Path promotedWholeFile = warmShard.directory.getFilePath(promotedFdt);
-        long promotedBefore = warmShard.manager.counters().get("promoted").longValue();
+        // The counter follows the state change to FULL, so poll for it.
+        assertBusy(() -> assertEquals(1L, warmShard.manager.counters().get("promoted").longValue()));
+        long promotedBefore = 1L;
         assertThat(warmShard.manager.counters().get("reservedBytes").longValue(), greaterThan(0L));
 
         // Writes and a flush while the segment is served whole: a second segment appears and the promoted one keeps serving.

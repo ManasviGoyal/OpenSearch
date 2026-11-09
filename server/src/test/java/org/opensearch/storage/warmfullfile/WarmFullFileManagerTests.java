@@ -1696,7 +1696,8 @@ public class WarmFullFileManagerTests extends OpenSearchTestCase {
     public void testCompletedEntryOfAnEarlierFamilyIsJoinedAfterItsClose() throws Exception {
         // The family of a promoted file closes (the index is closed) and its whole-file entry stays in the cache,
         // open and unreferenced. A new family for the same file (the index reopened) is handed that entry's finished
-        // download by the fetch: no remote read, FULL, exactly one reference; counted as a download, not a reuse.
+        // download by the fetch: no remote read, FULL, exactly one reference; a started promotion, not a local-copy
+        // reuse, and no bytes downloaded.
         String name = "_reopen.faiss";
         Path path = dir.resolve(name);
         byte[] content = footeredContent(FILE_LENGTH);
@@ -1725,6 +1726,7 @@ public class WarmFullFileManagerTests extends OpenSearchTestCase {
         assertEquals("joining a complete download is not a local-copy reuse", 0L, stats.get("reused").longValue());
         assertEquals(2L, stats.get("started").longValue());
         assertEquals(2L, stats.get("promoted").longValue());
+        assertEquals("nothing was fetched for the join", (long) content.length, stats.get("downloadedBytes").longValue());
         assertEquals(content.length, mgr.reservedBytesPerSegment()[0]);
     }
 
@@ -1958,6 +1960,109 @@ public class WarmFullFileManagerTests extends OpenSearchTestCase {
         assertEquals(4 * callers, laterReader.readCount());
     }
 
+    // ---------- parts copied from local blocks ----------
+
+    /** Registers an idle, open entry of {@code bytes} at the file's block {@code blockId}, with or without the block file. */
+    private Path putLocalBlock(FileCache fileCache, String name, int blockId, byte[] bytes, boolean withFile) throws IOException {
+        Path blockPath = dir.resolve(name + "_block_" + blockId);
+        if (withFile) {
+            Files.write(blockPath, bytes);
+        }
+        fileCache.put(blockPath, new CachedFullFileIndexInput(fileCache, blockPath, new ByteArrayIndexInput(blockPath.toString(), bytes)));
+        fileCache.decRef(blockPath); // idle, as a block nobody reads
+        return blockPath;
+    }
+
+    private static byte[] slice(byte[] content, int from, int to) {
+        return java.util.Arrays.copyOfRange(content, from, to);
+    }
+
+    public void testPartsHeldAsLocalBlocksAreCopiedInsteadOfRead() throws Exception {
+        // Parts 0, 2 and the short last part 4 are in the cache as blocks; parts 1 and 3 are not. The download copies
+        // the three from disk and reads only the two from the remote store, and the file is the same bytes.
+        String name = "_blocks.faiss";
+        byte[] content = footeredContent(FILE_LENGTH); // 4 full parts and a short one
+        FixedContentStreamReader reader = new FixedContentStreamReader(content);
+        FileCache fileCache = newFileCache();
+        TransferManager tm = new TransferManager(reader, fileCache, threadPool);
+        WarmFullFileManager mgr = newManager(fileCache, 4, 0.5);
+        int part = (int) PART_SIZE;
+        Path block0 = putLocalBlock(fileCache, name, 0, slice(content, 0, part), true);
+        Path block2 = putLocalBlock(fileCache, name, 2, slice(content, 2 * part, 3 * part), true);
+        Path block4 = putLocalBlock(fileCache, name, 4, slice(content, 4 * part, content.length), true);
+
+        FullFileState st = newStateWithChecksum(tm, fileCache, name, content.length, footerChecksum(content));
+        startPromotion(mgr, st);
+        awaitState(st, FullFileState.State.FULL);
+
+        assertEquals("only the two parts without a block are read", 2, reader.readCount());
+        assertServedWithOneReference(st, fileCache, dir.resolve(name), content);
+        Map<String, Long> stats = mgr.counters();
+        assertEquals(3L, stats.get("partsFromLocalBlocks").longValue());
+        long copied = 2L * part + (content.length - 4L * part);
+        assertEquals(copied, stats.get("bytesFromLocalBlocks").longValue());
+        assertEquals("only the read bytes count as downloaded", content.length - copied, stats.get("downloadedBytes").longValue());
+        for (Path block : List.of(block0, block2, block4)) {
+            assertEquals("the block's reference was given back", Integer.valueOf(0), fileCache.getRef(block));
+            assertTrue("the block is left in place", Files.exists(block));
+        }
+    }
+
+    public void testABlockOfTheWrongLengthOrWithoutItsFileIsReadRemotely() throws Exception {
+        String name = "_badblocks.faiss";
+        byte[] content = footeredContent(FILE_LENGTH);
+        FixedContentStreamReader reader = new FixedContentStreamReader(content);
+        FileCache fileCache = newFileCache();
+        TransferManager tm = new TransferManager(reader, fileCache, threadPool);
+        WarmFullFileManager mgr = newManager(fileCache, 4, 0.5);
+        int part = (int) PART_SIZE;
+        // Block 1: an entry whose length is not the part's. Block 3: an entry with no file behind it.
+        Path block1 = putLocalBlock(fileCache, name, 1, slice(content, part, part + 500), true);
+        Path block3 = putLocalBlock(fileCache, name, 3, slice(content, 3 * part, 4 * part), false);
+
+        FullFileState st = newStateWithChecksum(tm, fileCache, name, content.length, footerChecksum(content));
+        startPromotion(mgr, st);
+        awaitState(st, FullFileState.State.FULL);
+
+        assertEquals("every part read", partsFor(name, content.length), reader.readCount());
+        assertEquals(0L, mgr.counters().get("partsFromLocalBlocks").longValue());
+        assertEquals((long) content.length, mgr.counters().get("downloadedBytes").longValue());
+        assertServedWithOneReference(st, fileCache, dir.resolve(name), content);
+        assertEquals(Integer.valueOf(0), fileCache.getRef(block1));
+        assertEquals(Integer.valueOf(0), fileCache.getRef(block3));
+    }
+
+    public void testACorruptLocalBlockFailsTheChecksumAndTheRetryReadsEveryPartRemotely() throws Exception {
+        // Block 0 holds the wrong bytes. The assembled file fails the footer checksum, the family remembers that its
+        // local blocks are suspect, and the retry reads every part from the remote store and reaches FULL.
+        String name = "_corrupt.faiss";
+        byte[] content = footeredContent(FILE_LENGTH);
+        FixedContentStreamReader reader = new FixedContentStreamReader(content);
+        FileCache fileCache = newFileCache();
+        TransferManager tm = new TransferManager(reader, fileCache, threadPool);
+        AtomicLong clock = new AtomicLong(1_000);
+        WarmFullFileManager mgr = newManager(fileCache, clock::get, 4, 0.5);
+        int part = (int) PART_SIZE;
+        Path block0 = putLocalBlock(fileCache, name, 0, wrongBytes(part), true);
+        int parts = partsFor(name, content.length);
+
+        FullFileState st = newStateWithChecksum(tm, fileCache, name, content.length, footerChecksum(content));
+        startPromotion(mgr, st);
+        awaitState(st, FullFileState.State.BLOCK);
+        assertEquals(1L, mgr.counters().get("declined.CHECKSUM_MISMATCH").longValue());
+        assertEquals("the other parts were read", parts - 1, reader.readCount());
+        assertTrue(st.localBlocksSuspect());
+        assertNull("the bad whole file is gone", fileCache.get(dir.resolve(name)));
+        assertFalse(Files.exists(dir.resolve(name)));
+
+        clock.addAndGet(WarmFullFileManager.RETRY_DELAY_MILLIS + 1);
+        startPromotion(mgr, st);
+        awaitState(st, FullFileState.State.FULL);
+        assertEquals("the retry reads every part", 2 * parts - 1, reader.readCount());
+        assertServedWithOneReference(st, fileCache, dir.resolve(name), content);
+        assertEquals("the corrupt block is left to the cache", Integer.valueOf(0), fileCache.getRef(block0));
+    }
+
     // ---------- stats() and the promotion INFO line ----------
 
     public void testStatsCountPromotionAndMeasureDownloadTimeAndLogAtInfo() throws Exception {
@@ -1987,7 +2092,9 @@ public class WarmFullFileManagerTests extends OpenSearchTestCase {
                     "INFO line with bytes, time and parts",
                     loggerName,
                     Level.INFO,
-                    "promoted [*" + name + "] to a whole file: 4096 bytes in 250 ms (4 parts of 1024 bytes, cache segment 0)"
+                    "promoted [*"
+                        + name
+                        + "] to a whole file: 4096 bytes in 250 ms (4 parts of 1024 bytes, 0 from local blocks, cache segment 0)"
                 )
             );
             FullFileState st = newState(tm, fileCache, name, FILE_LENGTH);

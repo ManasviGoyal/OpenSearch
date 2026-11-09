@@ -7,8 +7,11 @@
  */
 package org.opensearch.storage.warmfullfile;
 
+import com.carrotsearch.randomizedtesting.annotations.ThreadLeakFilters;
+
 import org.apache.lucene.store.FSDirectory;
 import org.apache.lucene.store.IndexInput;
+import org.opensearch.index.store.remote.file.CleanerDaemonThreadLeakFilter;
 import org.opensearch.index.store.remote.filecache.CachedIndexInput;
 import org.opensearch.index.store.remote.filecache.FileCache;
 import org.opensearch.index.store.remote.filecache.FileCacheFactory;
@@ -31,6 +34,7 @@ import java.util.concurrent.atomic.AtomicLong;
  * The per-segment whole-file budget against a real multi-segment {@link FileCache}: whole files are admitted up to half
  * of the segment they hash to, and block fetches into the same segment keep working beside them.
  */
+@ThreadLeakFilters(filters = CleanerDaemonThreadLeakFilter.class)
 public class WarmFullFilePerSegmentBudgetTests extends OpenSearchTestCase {
 
     private static final int SEGMENTS = 4;

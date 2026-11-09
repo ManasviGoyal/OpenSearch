@@ -16,6 +16,7 @@ import org.apache.lucene.store.IndexInput;
 import org.opensearch.common.annotation.ExperimentalApi;
 import org.opensearch.common.util.CancellableThreads;
 import org.opensearch.common.util.io.IOUtils;
+import org.opensearch.index.store.remote.file.AbstractBlockIndexInput;
 import org.opensearch.index.store.remote.filecache.CachedIndexInput;
 import org.opensearch.index.store.remote.filecache.FileCache;
 import org.opensearch.index.store.remote.filecache.FileCachedIndexInput;
@@ -187,7 +188,7 @@ public class TransferManager {
                 if (request.isAtomicWrite()) {
                     downloadAtomically(fileCache, streamReader, request, cancellableThreads);
                 } else {
-                    download(streamReader, request, request.getFilePath(), cancellableThreads);
+                    download(fileCache, streamReader, request, request.getFilePath(), cancellableThreads);
                 }
             }
             final IndexInput luceneIndexInput = request.getDirectory().openInput(request.getFileName(), IOContext.DEFAULT);
@@ -213,7 +214,7 @@ public class TransferManager {
         fileCache.remove(temp); // closes and deletes a leftover a restart has registered; a no-op for an unknown key
         Files.deleteIfExists(temp);
         try {
-            download(streamReader, request, temp, cancellableThreads);
+            download(fileCache, streamReader, request, temp, cancellableThreads);
             IOUtils.fsync(temp, false);
             Files.move(temp, request.getFilePath(), StandardCopyOption.ATOMIC_MOVE);
             IOUtils.fsync(request.getFilePath().getParent(), true);
@@ -227,20 +228,28 @@ public class TransferManager {
         }
     }
 
-    private static void download(StreamReader streamReader, BlobFetchRequest request, Path target, CancellableThreads cancellableThreads)
-        throws IOException {
+    private static void download(
+        FileCache fileCache,
+        StreamReader streamReader,
+        BlobFetchRequest request,
+        Path target,
+        CancellableThreads cancellableThreads
+    ) throws IOException {
         if (cancellableThreads == null) {
-            downloadParts(streamReader, request, target, null);
+            downloadParts(fileCache, streamReader, request, target, null);
         } else {
-            cancellableThreads.executeIO(() -> downloadParts(streamReader, request, target, cancellableThreads));
+            cancellableThreads.executeIO(() -> downloadParts(fileCache, streamReader, request, target, cancellableThreads));
         }
     }
 
     /**
-     * Writes the request's parts to {@code target} in order. With a cancellation handle, stops before the next part
-     * once the handle is cancelled; the interrupt the cancel sends fails the write in progress on its own.
+     * Writes the request's parts to {@code target} in order, each copied from the block the file cache already holds
+     * for its range when the request allows that, else read from the remote store. With a cancellation handle, stops
+     * before the next part once the handle is cancelled; the interrupt the cancel sends fails the write in progress on
+     * its own.
      */
     private static void downloadParts(
+        FileCache fileCache,
         StreamReader streamReader,
         BlobFetchRequest request,
         Path target,
@@ -254,6 +263,9 @@ public class TransferManager {
                 if (cancellableThreads != null) {
                     cancellableThreads.checkForCancel();
                 }
+                if (request.getLocalBlockSize() > 0 && copyFromLocalBlock(fileCache, request, blobPart, localFileOutputStream)) {
+                    continue;
+                }
                 try (
                     InputStream snapshotFileInputStream = streamReader.read(
                         blobPart.getBlobName(),
@@ -263,7 +275,58 @@ public class TransferManager {
                 ) {
                     snapshotFileInputStream.transferTo(localFileOutputStream);
                 }
+                request.onPartWritten(blobPart.getLength(), false);
             }
+        }
+    }
+
+    /**
+     * Copies the part from the block the file cache holds for the same range, if there is one. The block file is read
+     * whole under a reference on its entry, so the entry cannot be evicted meanwhile, and written only when its length
+     * is the part's. A part that is not exactly one block, a missing block, a block still downloading, or a block that
+     * cannot be read leaves the part to the remote read.
+     *
+     * @return true if the part was written from the local block
+     */
+    private static boolean copyFromLocalBlock(
+        FileCache fileCache,
+        BlobFetchRequest request,
+        BlobFetchRequest.BlobPart part,
+        OutputStream out
+    ) throws IOException {
+        final long blockSize = request.getLocalBlockSize();
+        if (part.getPosition() % blockSize != 0 || part.getLength() > blockSize) {
+            return false;
+        }
+        final int blockId = Math.toIntExact(part.getPosition() / blockSize);
+        final Path blockPath = request.getFilePath()
+            .resolveSibling(AbstractBlockIndexInput.getBlockFileName(request.getFileName(), blockId));
+        final CachedIndexInput entry = fileCache.get(blockPath);
+        if (entry == null) {
+            return false;
+        }
+        try {
+            if (entry.isClosed() || entry.length() != part.getLength()) {
+                return false;
+            }
+            if (entry instanceof DelayedCreationCachedIndexInput delayed && delayed.result.isDone() == false) {
+                return false; // still downloading: its file is not complete yet
+            }
+            final byte[] bytes;
+            try {
+                bytes = Files.readAllBytes(blockPath);
+            } catch (IOException e) {
+                logger.debug("local block {} could not be read; its part is read from the remote store", blockPath, e);
+                return false;
+            }
+            if (bytes.length != part.getLength()) {
+                return false;
+            }
+            out.write(bytes);
+            request.onPartWritten(bytes.length, true);
+            return true;
+        } finally {
+            fileCache.decRef(blockPath);
         }
     }
 
