@@ -161,6 +161,8 @@ public class WarmFullFileManager {
     private volatile long evictionMinIdleMillis = WarmFullFileSettings.EVICTION_MIN_IDLE.getDefault(Settings.EMPTY).millis();
     private final CounterMetric evicted = new CounterMetric();
     private final CounterMetric evictedBytes = new CounterMetric();
+    // Blocks of promoted files removed from the cache by the sweep, once nothing referenced them any more.
+    private final CounterMetric blocksRemoved = new CounterMetric();
     /**
      * FULL families that closed while a reader still held handles. Each keeps its mapping, its whole file and its cache
      * reference until the last handle closes; one that never leaves is a leaked IndexInput somewhere above.
@@ -550,6 +552,7 @@ public class WarmFullFileManager {
                 // The setting may have dropped the extension while the download ran; such a family was not FULL when
                 // the change was applied, so it is demoted here instead.
                 demoteIfNoLongerEligible(st);
+                sweepIdleBlocks();
             } catch (Exception e) {
                 if (published) {
                     // The family is FULL and serving; its reference, budget and slot are already settled.
@@ -848,8 +851,37 @@ public class WarmFullFileManager {
             if (st.releaseAfterEviction() == false) {
                 logger.debug("evicted [{}] needs no release: restored, released or closed meanwhile", st.fullFilePath());
             }
+            executor.execute(this::sweepIdleBlocks); // may run on the search thread that ended the last phase
         });
         return true;
+    }
+
+    /**
+     * Removes the blocks of this node's promoted files that nothing references any more. After a promotion no new
+     * read touches the file's blocks, but each stays referenced until the clone that read it is garbage collected,
+     * and the reader's own handle keeps its current block for its life, so a sweep right after the promotion frees
+     * little and later sweeps free the rest. Run after every promotion and every eviction on the node, on the
+     * background pool, instead of on a timer: a quiet node leaves its blocks to the cache's own eviction. A block in
+     * use is never removed.
+     */
+    private void sweepIdleBlocks() {
+        long removed = 0;
+        for (FullFileState st : fullFamilies) {
+            if (st.state() != FullFileState.State.FULL) {
+                continue;
+            }
+            long parts = partCount(st.fileLength());
+            for (int block = 0; block < parts; block++) {
+                Path blockPath = st.fullFilePath().resolveSibling(AbstractBlockIndexInput.getBlockFileName(st.fileName(), block));
+                if (fileCache.removeIfEvictable(blockPath)) {
+                    removed++;
+                }
+            }
+        }
+        if (removed > 0) {
+            blocksRemoved.inc(removed);
+            logger.debug("removed {} idle block(s) of promoted whole files", removed);
+        }
     }
 
     /**
@@ -1000,6 +1032,7 @@ public class WarmFullFileManager {
         counters.put("restored", restored.count());
         counters.put("evicted", evicted.count());
         counters.put("evictedBytes", evictedBytes.count());
+        counters.put("blocksRemoved", blocksRemoved.count());
         counters.put("downloadedBytes", downloadedBytes.count());
         counters.put("partsFromLocalBlocks", partsFromLocalBlocks.count());
         counters.put("bytesFromLocalBlocks", bytesFromLocalBlocks.count());

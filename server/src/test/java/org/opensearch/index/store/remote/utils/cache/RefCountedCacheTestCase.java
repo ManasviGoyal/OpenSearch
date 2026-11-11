@@ -150,6 +150,22 @@ abstract class RefCountedCacheTestCase extends OpenSearchTestCase {
         assertEquals(10L, (long) refCountedCache.get("3"));
     }
 
+    public void testRemoveIfEvictableRemovesOnlyAnIdleUnpinnedEntry() {
+        assertFalse("no such key", refCountedCache.removeIfEvictable("1"));
+        refCountedCache.put("1", 10L);
+        assertFalse("referenced", refCountedCache.removeIfEvictable("1"));
+        assertEquals(10L, (long) refCountedCache.get("1"));
+        refCountedCache.decRef("1");
+        refCountedCache.decRef("1");
+        refCountedCache.pin("1");
+        assertFalse("pinned", refCountedCache.removeIfEvictable("1"));
+        refCountedCache.unpin("1");
+        assertTrue("idle and unpinned", refCountedCache.removeIfEvictable("1"));
+        assertNull(refCountedCache.get("1"));
+        assertEquals(0L, refCountedCache.usage());
+        assertFalse("already gone", refCountedCache.removeIfEvictable("1"));
+    }
+
     public void testPruneWithPredicate() {
         refCountedCache.put("1", 10L);
         refCountedCache.decRef("1");

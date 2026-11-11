@@ -2003,8 +2003,8 @@ public class WarmFullFileManagerTests extends OpenSearchTestCase {
         assertEquals(copied, stats.get("bytesFromLocalBlocks").longValue());
         assertEquals("only the read bytes count as downloaded", content.length - copied, stats.get("downloadedBytes").longValue());
         for (Path block : List.of(block0, block2, block4)) {
-            assertEquals("the block's reference was given back", Integer.valueOf(0), fileCache.getRef(block));
-            assertTrue("the block is left in place", Files.exists(block));
+            assertNull("copied, then removed by the sweep that follows the promotion, as idle", fileCache.get(block));
+            assertFalse(Files.exists(block));
         }
     }
 
@@ -2028,8 +2028,8 @@ public class WarmFullFileManagerTests extends OpenSearchTestCase {
         assertEquals(0L, mgr.counters().get("partsFromLocalBlocks").longValue());
         assertEquals((long) content.length, mgr.counters().get("downloadedBytes").longValue());
         assertServedWithOneReference(st, fileCache, dir.resolve(name), content);
-        assertEquals(Integer.valueOf(0), fileCache.getRef(block1));
-        assertEquals(Integer.valueOf(0), fileCache.getRef(block3));
+        assertNull("idle, so removed by the sweep that follows the promotion", fileCache.get(block1));
+        assertNull("idle, so removed by the sweep that follows the promotion", fileCache.get(block3));
     }
 
     public void testACorruptLocalBlockFailsTheChecksumAndTheRetryReadsEveryPartRemotely() throws Exception {
@@ -2060,7 +2060,50 @@ public class WarmFullFileManagerTests extends OpenSearchTestCase {
         awaitState(st, FullFileState.State.FULL);
         assertEquals("the retry reads every part", 2 * parts - 1, reader.readCount());
         assertServedWithOneReference(st, fileCache, dir.resolve(name), content);
-        assertEquals("the corrupt block is left to the cache", Integer.valueOf(0), fileCache.getRef(block0));
+        assertNull("the corrupt block, idle, is removed by the sweep that follows the promotion", fileCache.get(block0));
+        assertFalse(Files.exists(block0));
+    }
+
+    // ---------- idle blocks of promoted files ----------
+
+    public void testIdleBlocksOfAPromotedFileAreRemovedByTheSweepAndHeldOnesAreKept() throws Exception {
+        // Blocks 0 and 2 are idle, block 1 is held by a reader (a pre-FULL clone still in flight). The sweep that
+        // follows the promotion removes the idle ones with their files and leaves the held one, which goes on the
+        // next sweep once released; blocks of another file are untouched.
+        String name = "_sweep.faiss";
+        byte[] content = footeredContent(FILE_LENGTH);
+        FileCache fileCache = newFileCache();
+        TransferManager tm = new TransferManager(new FixedContentStreamReader(content), fileCache, threadPool);
+        WarmFullFileManager mgr = newManager(fileCache, 4, 0.5);
+        int part = (int) PART_SIZE;
+        Path block0 = putLocalBlock(fileCache, name, 0, slice(content, 0, part), true);
+        Path block1 = putLocalBlock(fileCache, name, 1, slice(content, part, 2 * part), true);
+        Path block2 = putLocalBlock(fileCache, name, 2, slice(content, 2 * part, 3 * part), true);
+        Path otherBlock = putLocalBlock(fileCache, "_other.faiss", 0, slice(content, 0, part), true);
+        fileCache.incRef(block1); // held
+
+        FullFileState st = newStateFor(tm, fileCache, name, content);
+        startPromotion(mgr, st);
+        awaitState(st, FullFileState.State.FULL);
+
+        assertNull("idle block removed", fileCache.get(block0));
+        assertNull("idle block removed", fileCache.get(block2));
+        assertFalse(Files.exists(block0));
+        assertFalse(Files.exists(block2));
+        assertNotNull("held block kept", fileCache.get(block1));
+        fileCache.decRef(block1);
+        assertNotNull("another file's block kept", fileCache.get(otherBlock));
+        fileCache.decRef(otherBlock);
+        assertEquals(2L, mgr.counters().get("blocksRemoved").longValue());
+
+        // Released, the held block goes on the next sweep, here the one after another file's promotion.
+        fileCache.decRef(block1);
+        FullFileState other = newStateFor(tm, fileCache, "_other.faiss", content);
+        startPromotion(mgr, other);
+        awaitState(other, FullFileState.State.FULL);
+        assertNull("the released block is gone", fileCache.get(block1));
+        assertFalse(Files.exists(block1));
+        assertEquals("block 1 and the other file's own block 0", 4L, mgr.counters().get("blocksRemoved").longValue());
     }
 
     // ---------- eviction under budget pressure ----------
