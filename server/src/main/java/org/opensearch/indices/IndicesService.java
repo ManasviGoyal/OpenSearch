@@ -189,6 +189,7 @@ import org.opensearch.search.query.QuerySearchResult;
 import org.opensearch.storage.prefetch.StoredFieldsPrefetch;
 import org.opensearch.storage.prefetch.TieredStoragePrefetchSettings;
 import org.opensearch.storage.slowlogs.TieredStorageSearchSlowLog;
+import org.opensearch.storage.warmfullfile.WarmFullFileManager;
 import org.opensearch.threadpool.ThreadPool;
 import org.opensearch.transport.client.Client;
 import org.opensearch.transport.client.ParentTaskAssigningClient;
@@ -491,6 +492,9 @@ public class IndicesService extends AbstractLifecycleComponent
     private volatile List<SearchStatsContributor> searchStatsContributors = Collections.emptyList();
     private final ClusterMergeSchedulerConfig clusterMergeSchedulerConfig;
     private final DataFormatRegistry dataFormatRegistry;
+    // The node-level whole-file promotion manager, whose search phase tracker every warm index reports to; null when
+    // the feature is off on this node.
+    private final WarmFullFileManager warmFullFileManager;
     private final Map<String, org.opensearch.index.store.DataFormatAwareStoreDirectoryFactory> dataFormatAwareStoreDirectoryFactories;
 
     @Override
@@ -538,7 +542,8 @@ public class IndicesService extends AbstractLifecycleComponent
         CompositeIndexSettings compositeIndexSettings,
         Consumer<IndexShard> replicator,
         Function<ShardId, ReplicationStats> segmentReplicationStatsProvider,
-        DataFormatRegistry dataFormatRegistry
+        DataFormatRegistry dataFormatRegistry,
+        @Nullable WarmFullFileManager warmFullFileManager
     ) {
         this.settings = settings;
         this.threadPool = threadPool;
@@ -694,6 +699,7 @@ public class IndicesService extends AbstractLifecycleComponent
                 this::onClusterLevelForceMergeMBPerSecUpdate
             );
         this.dataFormatRegistry = dataFormatRegistry;
+        this.warmFullFileManager = warmFullFileManager;
     }
 
     @InternalApi
@@ -766,7 +772,8 @@ public class IndicesService extends AbstractLifecycleComponent
             null,
             null,
             null,
-            new DataFormatRegistry(pluginsService)
+            new DataFormatRegistry(pluginsService),
+            null
         );
     }
 
@@ -1209,6 +1216,10 @@ public class IndicesService extends AbstractLifecycleComponent
         if (FeatureFlags.isEnabled(FeatureFlags.WRITABLE_WARM_INDEX_EXPERIMENTAL_FLAG)) {
             indexModule.addSearchOperationListener(new TieredStorageSearchSlowLog(idxSettings));
             indexModule.addSearchOperationListener(new StoredFieldsPrefetch(tieredStoragePrefetchSettingsSupplier));
+            if (warmFullFileManager != null && idxSettings.isWarmIndex()) {
+                // The phases of a warm shard's searches, so a promoted whole file can be released under its open reader.
+                indexModule.addSearchOperationListener(warmFullFileManager.searchPhases());
+            }
         }
         for (IndexEventListener listener : builtInListeners) {
             indexModule.addIndexEventListener(listener);

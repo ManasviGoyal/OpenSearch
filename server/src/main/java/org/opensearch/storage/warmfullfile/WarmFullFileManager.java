@@ -19,6 +19,7 @@ import org.apache.lucene.store.MemorySegmentAccessInput;
 import org.opensearch.common.annotation.ExperimentalApi;
 import org.opensearch.common.lease.Releasable;
 import org.opensearch.common.metrics.CounterMetric;
+import org.opensearch.common.settings.Settings;
 import org.opensearch.common.util.CancellableThreads;
 import org.opensearch.index.engine.OpenSearchConcurrentMergeScheduler;
 import org.opensearch.index.store.FsDirectoryFactory;
@@ -153,6 +154,13 @@ public class WarmFullFileManager {
     private final Set<FullFileState> fullFamilies = ConcurrentHashMap.newKeySet();
     // Demoted families still holding their mapping, so a settings change can restore the ones whose extension returns.
     private final Set<FullFileState> demotedFamilies = ConcurrentHashMap.newKeySet();
+    // The search phases running on this node's warm shards: an evictable family hands views only inside one, and an
+    // evicted family's mapping is released once the phases running at its demotion have ended.
+    private final SearchPhaseTracker searchPhases = new SearchPhaseTracker();
+    // A FULL family is evicted only once no view of it has been cut for this long (WarmFullFileSettings.EVICTION_MIN_IDLE).
+    private volatile long evictionMinIdleMillis = WarmFullFileSettings.EVICTION_MIN_IDLE.getDefault(Settings.EMPTY).millis();
+    private final CounterMetric evicted = new CounterMetric();
+    private final CounterMetric evictedBytes = new CounterMetric();
     /**
      * FULL families that closed while a reader still held handles. Each keeps its mapping, its whole file and its cache
      * reference until the last handle closes; one that never leaves is a leaked IndexInput somewhere above.
@@ -367,7 +375,15 @@ public class WarmFullFileManager {
                 bytes = budget.reserve(segment, length);
                 if (bytes == null) {
                     close();
-                    abandonPromotion(DeclineReason.BUDGET_EXCEEDED, "per-segment whole-file budget exceeded");
+                    if (evictColdest(segment)) {
+                        abandonPromotion(
+                            DeclineReason.BUDGET_EXCEEDED,
+                            "per-segment whole-file budget exceeded; a cold whole file is being evicted",
+                            clock.getAsLong() + NO_SLOT_RETRY_DELAY_MILLIS
+                        );
+                    } else {
+                        abandonPromotion(DeclineReason.BUDGET_EXCEEDED, "per-segment whole-file budget exceeded");
+                    }
                     return;
                 }
 
@@ -585,6 +601,7 @@ public class WarmFullFileManager {
                     holdsReference = false;
                     mapping = null;
                     published = true;
+                    st.touch(clock.getAsLong()); // counts as an access, so a fresh promotion is not evicted as idle
                     return true;
                 }
             }
@@ -774,6 +791,67 @@ public class WarmFullFileManager {
         return false;
     }
 
+    /** @return the tracker of the search phases running on this node's warm shards, registered with every warm index */
+    public SearchPhaseTracker searchPhases() {
+        return searchPhases;
+    }
+
+    /** Applies a new minimum idle time for eviction ({@link WarmFullFileSettings#EVICTION_MIN_IDLE}), in milliseconds. */
+    public void onEvictionMinIdleChanged(long millis) {
+        this.evictionMinIdleMillis = millis;
+    }
+
+    /**
+     * The eviction policy, run when a promotion is declined for budget. Of the evictable FULL families in the cache
+     * segment, the one idle longest is demoted, if it has been idle for at least the minimum: new clones of it read
+     * blocks at once, and its mapping, whole file and budget are released once the search phases running at that
+     * moment have ended, under its open reader. The family is promoted again by its next access after the release. A
+     * family searched within the minimum is kept, and the declined promotion stays declined.
+     *
+     * @return true if a family is being evicted, so the declined promotion may retry soon
+     */
+    private boolean evictColdest(int segment) {
+        final long now = clock.getAsLong();
+        FullFileState coldest = null;
+        for (FullFileState st : fullFamilies) {
+            if (st.evictable() == false || st.state() != FullFileState.State.FULL) {
+                continue;
+            }
+            if (fileCache.segmentIndexFor(st.fullFilePath()) != segment || now - st.lastAccessMillis() < evictionMinIdleMillis) {
+                continue;
+            }
+            if (coldest == null || st.lastAccessMillis() < coldest.lastAccessMillis()) {
+                coldest = st;
+            }
+        }
+        if (coldest == null) {
+            return false;
+        }
+        final FullFileState st = coldest;
+        final long idleMillis = now - st.lastAccessMillis();
+        if (st.demote() == false) {
+            return false;
+        }
+        fullFamilies.remove(st);
+        evicted.inc();
+        evictedBytes.inc(st.fileLength());
+        final long generation = searchPhases.nextGeneration();
+        logger.info(
+            "evicting [{}] from its whole file: cache segment {} is over its whole-file budget and the file has been idle for {} ms;"
+                + " its mapping is released once the {} search phase(s) running now end",
+            st.fullFilePath(),
+            segment,
+            idleMillis,
+            searchPhases.inFlight()
+        );
+        searchPhases.whenQuiesced(generation, () -> {
+            if (st.releaseAfterEviction() == false) {
+                logger.debug("evicted [{}] needs no release: restored, released or closed meanwhile", st.fullFilePath());
+            }
+        });
+        return true;
+    }
+
     /**
      * Applies a new download cap from {@link WarmFullFileSettings#MAX_CONCURRENT_DOWNLOADS}. Raising it admits more
      * downloads at once; lowering it lets the ones in flight finish and admits no new one until the count is under
@@ -920,6 +998,8 @@ public class WarmFullFileManager {
         counters.put("promoted", promoted.count());
         counters.put("demoted", demoted.count());
         counters.put("restored", restored.count());
+        counters.put("evicted", evicted.count());
+        counters.put("evictedBytes", evictedBytes.count());
         counters.put("downloadedBytes", downloadedBytes.count());
         counters.put("partsFromLocalBlocks", partsFromLocalBlocks.count());
         counters.put("bytesFromLocalBlocks", bytesFromLocalBlocks.count());

@@ -114,6 +114,12 @@ public final class FullFileState {
     private final String fileName;
     private final long fileLength;
     private final Path fullFilePath;
+    // Whether the file may be evicted under budget pressure while its reader is open, which is safe only for files
+    // whose readers clone or slice the handle per query (WarmFullFileSettings.EVICTABLE_EXTENSIONS). Such a family
+    // hands views only to search phases, so its mapping can be released once the phases running at its demotion end.
+    private final boolean evictable;
+    // The last time a whole-file view was cut (monotonic millis), for the eviction policy's idle check.
+    private volatile long lastAccessMillis;
 
     /**
      * @param transferManager used to download the whole file in parts
@@ -137,6 +143,25 @@ public final class FullFileState {
         this.fileName = fileName;
         this.fileLength = fileLength;
         this.fullFilePath = fullFilePath;
+        this.evictable = WarmFullFileSettings.EVICTABLE_EXTENSIONS.contains(WarmFullFileSettings.extensionOf(fileName));
+    }
+
+    /**
+     * @return whether the file may be evicted under budget pressure while its reader is open; such a family hands
+     *         views only to search phases
+     */
+    public boolean evictable() {
+        return evictable;
+    }
+
+    /** Records that a whole-file view was cut now (monotonic millis). */
+    public void touch(long nowMillis) {
+        lastAccessMillis = nowMillis;
+    }
+
+    /** @return the last time a whole-file view was cut (monotonic millis), or 0 if none has been */
+    long lastAccessMillis() {
+        return lastAccessMillis;
     }
 
     /**
@@ -405,6 +430,38 @@ public final class FullFileState {
             }
             mappingReleaseOwed = false;
             return true;
+        }
+    }
+
+    /**
+     * Releases a demoted family's mapping now, without waiting for its handles to close: called once no search that
+     * could still hold a view of the mapping is running (see {@link SearchPhaseTracker#whenQuiesced}). The reader's
+     * handles stay open and keep reading blocks. A no-op if nothing is owed, if the release is already scheduled, or
+     * if a {@link #restore()} has put the family back to FULL in the meantime.
+     *
+     * @return true if the release was scheduled by this call
+     */
+    boolean releaseAfterEviction() {
+        synchronized (releaseLock) {
+            if (mappingReleaseOwed == false || state.get() == State.FULL) {
+                return false;
+            }
+            Executor executor = cleanupExecutor;
+            if (executor == null || cleanupScheduled.compareAndSet(false, true) == false) {
+                return false;
+            }
+            try {
+                executor.execute(this::runCleanup);
+                return true;
+            } catch (RuntimeException e) {
+                cleanupScheduled.set(false);
+                logger.warn(
+                    "could not schedule whole-file release for {} after its eviction; will retry on its next handle release or close",
+                    fullFilePath,
+                    e
+                );
+                return false;
+            }
         }
     }
 

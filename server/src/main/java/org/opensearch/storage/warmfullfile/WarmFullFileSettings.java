@@ -10,6 +10,7 @@ package org.opensearch.storage.warmfullfile;
 import org.opensearch.common.annotation.ExperimentalApi;
 import org.opensearch.common.settings.ClusterSettings;
 import org.opensearch.common.settings.Setting;
+import org.opensearch.common.unit.TimeValue;
 import org.opensearch.common.util.concurrent.OpenSearchExecutors;
 
 import java.util.List;
@@ -19,6 +20,7 @@ import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.function.Consumer;
 import java.util.function.Function;
 import java.util.function.IntConsumer;
+import java.util.function.LongConsumer;
 import java.util.stream.Collectors;
 
 /**
@@ -71,10 +73,37 @@ public class WarmFullFileSettings {
         Setting.Property.NodeScope
     );
 
+    /**
+     * The extensions whose promoted whole files may be evicted under budget pressure while their segment reader
+     * stays open (see {@link #EVICTION_MIN_IDLE}). Fixed in code rather than a setting, because it is a property of
+     * the readers, not a tuning choice: eviction releases a mapping under an open reader, which is safe only for
+     * files whose readers take a fresh clone or slice of the handle for every query, and would make a later search
+     * read a released mapping for files whose readers keep a clone per thread for the reader's life, such as stored
+     * fields and term vectors. The k-NN graph and code files and Lucene's doc values files qualify.
+     */
+    public static final Set<String> EVICTABLE_EXTENSIONS = Set.of("faiss", "veq", "dvd");
+
+    /**
+     * Node-level, dynamic setting: a promoted whole file of an {@link #EVICTABLE_EXTENSIONS evictable extension} is
+     * evicted under budget pressure only once no whole-file view of it has been cut for this long, so a file searched
+     * recently is kept and the promotion is declined instead. When a promotion in a file cache segment is declined
+     * for budget, the FULL file in that segment idle longest is demoted, and its mapping, whole file and budget are
+     * released once the searches running at that moment have ended, under its open reader.
+     */
+    public static final Setting<TimeValue> EVICTION_MIN_IDLE = Setting.timeSetting(
+        "tiering.service.full_file.eviction.min_idle",
+        TimeValue.timeValueMinutes(5),
+        TimeValue.ZERO,
+        Setting.Property.Dynamic,
+        Setting.Property.NodeScope
+    );
+
     private volatile Set<String> extensions;
     private final List<Consumer<Set<String>>> listeners = new CopyOnWriteArrayList<>();
     private volatile int maxConcurrentDownloads;
     private final List<IntConsumer> maxConcurrentDownloadsListeners = new CopyOnWriteArrayList<>();
+    private volatile long evictionMinIdleMillis;
+    private final List<LongConsumer> evictionMinIdleListeners = new CopyOnWriteArrayList<>();
 
     /**
      * Creates a new WarmFullFileSettings instance and registers the dynamic update consumers.
@@ -85,6 +114,8 @@ public class WarmFullFileSettings {
         clusterSettings.addSettingsUpdateConsumer(EXTENSIONS, this::setExtensions);
         setMaxConcurrentDownloads(clusterSettings.get(MAX_CONCURRENT_DOWNLOADS));
         clusterSettings.addSettingsUpdateConsumer(MAX_CONCURRENT_DOWNLOADS, this::setMaxConcurrentDownloads);
+        setEvictionMinIdle(clusterSettings.get(EVICTION_MIN_IDLE));
+        clusterSettings.addSettingsUpdateConsumer(EVICTION_MIN_IDLE, this::setEvictionMinIdle);
     }
 
     /**
@@ -92,12 +123,7 @@ public class WarmFullFileSettings {
      * @param values the configured extension list
      */
     public void setExtensions(List<String> values) {
-        this.extensions = values.stream()
-            .filter(v -> v != null && v.isBlank() == false)
-            .map(v -> v.strip().toLowerCase(Locale.ROOT))
-            .map(v -> v.startsWith(".") ? v.substring(1) : v)
-            .filter(v -> v.isEmpty() == false)
-            .collect(Collectors.toUnmodifiableSet());
+        this.extensions = normalize(values);
         for (Consumer<Set<String>> listener : listeners) {
             listener.accept(extensions);
         }
@@ -108,6 +134,16 @@ public class WarmFullFileSettings {
      * update, with the normalized set.
      * @param listener receives the eligible extensions
      */
+    /** Lower-cases, strips and drops blanks and leading dots, as {@link #getExtensions()} documents. */
+    private static Set<String> normalize(List<String> values) {
+        return values.stream()
+            .filter(v -> v != null && v.isBlank() == false)
+            .map(v -> v.strip().toLowerCase(Locale.ROOT))
+            .map(v -> v.startsWith(".") ? v.substring(1) : v)
+            .filter(v -> v.isEmpty() == false)
+            .collect(Collectors.toUnmodifiableSet());
+    }
+
     public void addListener(Consumer<Set<String>> listener) {
         listeners.add(listener);
         listener.accept(extensions);
@@ -138,6 +174,24 @@ public class WarmFullFileSettings {
      */
     public int getMaxConcurrentDownloads() {
         return maxConcurrentDownloads;
+    }
+
+    /** Applies a new minimum idle time for eviction and tells the listeners, in milliseconds. */
+    public void setEvictionMinIdle(TimeValue value) {
+        this.evictionMinIdleMillis = value.millis();
+        for (LongConsumer listener : evictionMinIdleListeners) {
+            listener.accept(evictionMinIdleMillis);
+        }
+    }
+
+    /** Registers a listener for the eviction minimum idle time and calls it with the current value, in milliseconds. */
+    public void addEvictionMinIdleListener(LongConsumer listener) {
+        evictionMinIdleListeners.add(listener);
+        listener.accept(evictionMinIdleMillis);
+    }
+
+    public long getEvictionMinIdleMillis() {
+        return evictionMinIdleMillis;
     }
 
     /**
