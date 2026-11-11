@@ -2085,6 +2085,8 @@ public class WarmFullFileManagerTests extends OpenSearchTestCase {
         FullFileState st = newStateFor(tm, fileCache, name, content);
         startPromotion(mgr, st);
         awaitState(st, FullFileState.State.FULL);
+        // The sweep follows the publish on the download thread, so poll for it.
+        assertBusy(() -> assertEquals(2L, mgr.counters().get("blocksRemoved").longValue()), 10, TimeUnit.SECONDS);
 
         assertNull("idle block removed", fileCache.get(block0));
         assertNull("idle block removed", fileCache.get(block2));
@@ -2094,16 +2096,19 @@ public class WarmFullFileManagerTests extends OpenSearchTestCase {
         fileCache.decRef(block1);
         assertNotNull("another file's block kept", fileCache.get(otherBlock));
         fileCache.decRef(otherBlock);
-        assertEquals(2L, mgr.counters().get("blocksRemoved").longValue());
 
         // Released, the held block goes on the next sweep, here the one after another file's promotion.
         fileCache.decRef(block1);
         FullFileState other = newStateFor(tm, fileCache, "_other.faiss", content);
         startPromotion(mgr, other);
         awaitState(other, FullFileState.State.FULL);
+        assertBusy(
+            () -> assertEquals("block 1 and the other file's own block 0", 4L, mgr.counters().get("blocksRemoved").longValue()),
+            10,
+            TimeUnit.SECONDS
+        );
         assertNull("the released block is gone", fileCache.get(block1));
         assertFalse(Files.exists(block1));
-        assertEquals("block 1 and the other file's own block 0", 4L, mgr.counters().get("blocksRemoved").longValue());
     }
 
     // ---------- eviction under budget pressure ----------
