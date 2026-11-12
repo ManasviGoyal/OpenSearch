@@ -36,6 +36,7 @@ import org.apache.logging.log4j.Logger;
 import org.apache.lucene.index.ConcurrentMergeScheduler;
 import org.apache.lucene.index.MergePolicy;
 import org.apache.lucene.index.MergeScheduler;
+import org.opensearch.common.annotation.InternalApi;
 import org.opensearch.common.logging.Loggers;
 import org.opensearch.common.unit.TimeValue;
 import org.opensearch.common.util.concurrent.ConcurrentCollections;
@@ -60,7 +61,8 @@ import java.util.Set;
  *
  * @opensearch.internal
  */
-class OpenSearchConcurrentMergeScheduler extends ConcurrentMergeScheduler {
+@InternalApi
+public class OpenSearchConcurrentMergeScheduler extends ConcurrentMergeScheduler {
 
     protected final Logger logger;
     private final IndexSettings indexSettings;
@@ -177,6 +179,17 @@ class OpenSearchConcurrentMergeScheduler extends ConcurrentMergeScheduler {
     protected boolean maybeStall(MergeSource mergeSource) {
         // Don't stall here, because we do our own index throttling (in InternalEngine.IndexThrottle) when merges can't keep up
         return true;
+    }
+
+    /**
+     * Whether {@code thread} is one Lucene's scheduler runs merges on. {@code MergeThread} is a protected member type
+     * of {@link ConcurrentMergeScheduler}, so only a scheduler subclass can tell, and this is the one OpenSearch has.
+     *
+     * @param thread the thread to check
+     * @return true if it is a Lucene merge thread
+     */
+    public static boolean isMergeThread(Thread thread) {
+        return thread instanceof MergeThread;
     }
 
     @Override

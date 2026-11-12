@@ -150,6 +150,28 @@ public class FsDirectoryFactory implements IndexStorePlugin.DirectoryFactory {
     }
 
     /**
+     * Whether {@code directory} opens {@code name} as a memory-mapped input, when that follows from the directory's type:
+     * {@link MMapDirectory} maps every file, a hybrid directory maps all but its NIO extensions, and any other
+     * {@link NIOFSDirectory} maps nothing. {@code null} for a directory type whose inputs are not known in advance.
+     *
+     * @param directory the directory the file would be opened from
+     * @param name      the file name
+     * @return TRUE, FALSE, or null if not known from the type alone
+     */
+    public static Boolean isMemoryMapped(FSDirectory directory, String name) {
+        if (directory instanceof HybridDirectory hybrid) {
+            return hybrid.useDelegate(name);
+        }
+        if (directory instanceof MMapDirectory) {
+            return Boolean.TRUE;
+        }
+        if (directory instanceof NIOFSDirectory) {
+            return Boolean.FALSE;
+        }
+        return null;
+    }
+
+    /**
      * A hybrid directory implementation
      *
      * @opensearch.internal

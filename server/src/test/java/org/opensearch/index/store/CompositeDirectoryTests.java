@@ -26,6 +26,7 @@ import org.opensearch.index.store.remote.utils.FileTypeUtils;
 import org.junit.Before;
 
 import java.io.IOException;
+import java.nio.file.Files;
 import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
 import java.util.Arrays;
@@ -74,6 +75,15 @@ public class CompositeDirectoryTests extends BaseRemoteSegmentStoreDirectoryTest
         assertArrayEquals(expectedFileNames, actualFileNames);
     }
 
+    public void testListAllHidesPartialDownloads() throws IOException {
+        // An in-flight whole-file download is this directory's own file, like a block: Lucene must not see it, or an
+        // IndexFileDeleter refresh or a store cleanup would delete it under the download.
+        addFilesToDirectory(new String[] { "_3.fdt.download" });
+        String[] actualFileNames = compositeDirectory.listAll();
+        String[] expectedFileNames = new String[] { "_0.cfe", "_0.cfs", "_0.si", "_1.cfe", "_2.cfe", "segments_1", "temp_file.tmp" };
+        assertArrayEquals(expectedFileNames, actualFileNames);
+    }
+
     public void testListAll_withLocalSegmentFiles() throws IOException {
         addFilesToDirectory(new String[] { LOCAL_SEGMENT_FILE });
         String[] actualFileNames = compositeDirectory.listAll();
@@ -96,6 +106,20 @@ public class CompositeDirectoryTests extends BaseRemoteSegmentStoreDirectoryTest
             exception = e;
         }
         assertNull(exception);
+    }
+
+    public void testFileLengthFallsBackToRemoteWhenTheEntryOutlivesTheLocalFile() throws IOException {
+        // A file with a cache entry whose local copy was deleted on the local directory directly (not through the
+        // cache): the length comes from the remote store instead of failing the caller.
+        addFilesToDirectory(new String[] { FILE_PRESENT_IN_REMOTE_ONLY });
+        Path key = getFilePath(FILE_PRESENT_IN_REMOTE_ONLY);
+        Files.delete(key);
+        assertNotNull(fileCache.get(key));
+        fileCache.decRef(key);
+        assertEquals(
+            remoteSegmentStoreDirectory.fileLength(FILE_PRESENT_IN_REMOTE_ONLY),
+            compositeDirectory.fileLength(FILE_PRESENT_IN_REMOTE_ONLY)
+        );
     }
 
     public void testFileLength() throws IOException {
