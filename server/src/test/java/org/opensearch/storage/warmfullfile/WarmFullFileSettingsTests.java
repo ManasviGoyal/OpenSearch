@@ -11,6 +11,7 @@ import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.common.settings.ClusterSettings;
 import org.opensearch.common.settings.Setting;
 import org.opensearch.common.settings.Settings;
+import org.opensearch.common.unit.TimeValue;
 import org.opensearch.common.util.concurrent.OpenSearchExecutors;
 import org.opensearch.test.ClusterServiceUtils;
 import org.opensearch.test.OpenSearchTestCase;
@@ -46,11 +47,11 @@ public class WarmFullFileSettingsTests extends OpenSearchTestCase {
         super.tearDown();
     }
 
-    public void testOffByDefault() {
+    public void testGraphAndCodeFilesByDefault() {
         WarmFullFileSettings settings = new WarmFullFileSettings(clusterService.getClusterSettings());
-        assertEquals("no extension is listed until the setting is set", Set.of(), settings.getExtensions());
-        assertFalse(settings.isExtensionEligible("faiss"));
-        assertFalse(settings.isExtensionEligible("veq"));
+        assertEquals("on by default for the k-NN graph and code files", Set.of("faiss", "veq"), settings.getExtensions());
+        assertTrue(settings.isExtensionEligible("faiss"));
+        assertTrue(settings.isExtensionEligible("veq"));
         assertFalse("rescoring vectors stay on blocks", settings.isExtensionEligible("vec"));
     }
 
@@ -101,35 +102,63 @@ public class WarmFullFileSettingsTests extends OpenSearchTestCase {
 
     public void testDynamicUpdateApplies() {
         WarmFullFileSettings settings = new WarmFullFileSettings(clusterService.getClusterSettings());
-        assertEquals(Set.of(), settings.getExtensions());
-
-        Settings on = Settings.builder().putList(WarmFullFileSettings.EXTENSIONS.getKey(), List.of("faiss", "veq")).build();
-        clusterService.getClusterSettings().applySettings(on);
         assertEquals(Set.of("faiss", "veq"), settings.getExtensions());
-        assertTrue(settings.isExtensionEligible("faiss"));
-        assertTrue(settings.isExtensionEligible("veq"));
 
         Settings off = Settings.builder().putList(WarmFullFileSettings.EXTENSIONS.getKey(), List.of()).build();
         clusterService.getClusterSettings().applySettings(off);
         assertEquals(Set.of(), settings.getExtensions());
         assertFalse(settings.isExtensionEligible("faiss"));
         assertFalse(settings.isExtensionEligible("veq"));
+
+        Settings on = Settings.builder().putList(WarmFullFileSettings.EXTENSIONS.getKey(), List.of("faiss", "veq")).build();
+        clusterService.getClusterSettings().applySettings(on);
+        assertEquals(Set.of("faiss", "veq"), settings.getExtensions());
+        assertTrue(settings.isExtensionEligible("faiss"));
+        assertTrue(settings.isExtensionEligible("veq"));
     }
 
     public void testListenerSeesTheCurrentSetAndEveryUpdate() {
         WarmFullFileSettings settings = new WarmFullFileSettings(clusterService.getClusterSettings());
         List<Set<String>> seen = new ArrayList<>();
         settings.addListener(seen::add);
-        assertEquals("called once on registration with the current set", List.of(Set.of()), seen);
+        assertEquals("called once on registration with the current set", List.of(Set.of("faiss", "veq")), seen);
 
+        clusterService.getClusterSettings()
+            .applySettings(Settings.builder().putList(WarmFullFileSettings.EXTENSIONS.getKey(), List.of()).build());
         clusterService.getClusterSettings()
             .applySettings(Settings.builder().putList(WarmFullFileSettings.EXTENSIONS.getKey(), List.of("faiss", ".VEQ")).build());
-        clusterService.getClusterSettings()
-            .applySettings(Settings.builder().putList(WarmFullFileSettings.EXTENSIONS.getKey(), List.of("faiss")).build());
-        assertEquals(List.of(Set.of(), Set.of("faiss", "veq"), Set.of("faiss")), seen);
+        assertEquals(List.of(Set.of("faiss", "veq"), Set.of(), Set.of("faiss", "veq")), seen);
 
         clusterService.getClusterSettings().applySettings(Settings.builder().putNull(WarmFullFileSettings.EXTENSIONS.getKey()).build());
-        assertEquals("clearing the setting reverts to the default set", Set.of(), seen.get(seen.size() - 1));
+        assertEquals("clearing the setting reverts to the default set", Set.of("faiss", "veq"), seen.get(seen.size() - 1));
+    }
+
+    public void testEvictionMinIdleDefaultsToFiveMinutesAndIsRegistered() {
+        WarmFullFileSettings settings = new WarmFullFileSettings(clusterService.getClusterSettings());
+        assertEquals(TimeValue.timeValueMinutes(5).millis(), settings.getEvictionMinIdleMillis());
+        assertTrue(BUILT_IN_CLUSTER_SETTINGS.contains(WarmFullFileSettings.EVICTION_MIN_IDLE));
+        assertTrue(WarmFullFileSettings.EVICTION_MIN_IDLE.isDynamic());
+        assertEquals("only files whose readers clone per query", Set.of("faiss", "veq", "dvd"), WarmFullFileSettings.EVICTABLE_EXTENSIONS);
+    }
+
+    public void testEvictionMinIdleListenerSeesTheCurrentValueAndEveryUpdate() {
+        WarmFullFileSettings settings = new WarmFullFileSettings(clusterService.getClusterSettings());
+        List<Long> seen = new ArrayList<>();
+        settings.addEvictionMinIdleListener(seen::add);
+        assertEquals(List.of(TimeValue.timeValueMinutes(5).millis()), seen);
+
+        clusterService.getClusterSettings()
+            .applySettings(Settings.builder().put(WarmFullFileSettings.EVICTION_MIN_IDLE.getKey(), "1s").build());
+        assertEquals(List.of(TimeValue.timeValueMinutes(5).millis(), 1_000L), seen);
+        assertEquals(1_000L, settings.getEvictionMinIdleMillis());
+
+        clusterService.getClusterSettings()
+            .applySettings(Settings.builder().putNull(WarmFullFileSettings.EVICTION_MIN_IDLE.getKey()).build());
+        assertEquals(
+            "clearing the setting reverts to the default",
+            TimeValue.timeValueMinutes(5).millis(),
+            settings.getEvictionMinIdleMillis()
+        );
     }
 
     public void testExtensionsAreNormalized() {

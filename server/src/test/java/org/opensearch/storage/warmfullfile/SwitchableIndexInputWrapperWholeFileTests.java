@@ -923,6 +923,76 @@ public class SwitchableIndexInputWrapperWholeFileTests extends TieredStorageBase
         assertBusy(() -> assertTrue(st.cleanupDone()), 30, TimeUnit.SECONDS);
     }
 
+    public void testAnEvictableFamilyHandsViewsOnlyInsideASearchPhaseAndStampsItsLastAccess() throws Exception {
+        // A family of an evictable extension hands views only to search phases: a clone outside one reads blocks, one
+        // inside is a view and records the access time the eviction policy reads. A family of any other extension
+        // hands views out freely, as the other tests of this class show.
+        String name = "_gate.faiss";
+        byte[] content = footeredContent();
+        try (IndexOutput out = localDirectory.createOutput(name, IOContext.DEFAULT)) {
+            out.writeBytes(content, content.length);
+        }
+        Path fullPath = getFilePath(localDirectory, name);
+        fileCache.put(fullPath, new FileCache.RestoredCachedIndexInput(content.length)); // the family's reference
+        FullFileState st = new FullFileState(null, localDirectory, fileCache, name, content.length, fullPath);
+        assertTrue(st.evictable());
+        AtomicLong clock = new AtomicLong(1_000);
+        WarmFullFileManager realManager = new WarmFullFileManager(
+            fileCache,
+            threadPool.executor(ThreadPool.Names.REMOTE_RECOVERY),
+            clock::get,
+            1
+        );
+        assertTrue(st.onAccess(0));
+        IndexInput mapping = localDirectory.openInput(name, IOContext.DEFAULT);
+        // The cleanup runs inline on the test thread when the family closes below.
+        assertEquals(FullFileState.Completion.FULL, st.completePromotion(mapping, Runnable::run, () -> {}, () -> {}, () -> {}));
+        st.touch(clock.get());
+
+        // The handle's block side is the fixture's switchable input; its length is the content's.
+        Path switchKey = getFilePathSwitchable(localDirectory, FILE_NAME);
+        PromotableCachedSwitchableIndexInput entry = new PromotableCachedSwitchableIndexInput(
+            fileCache,
+            FILE_NAME,
+            localDirectory,
+            remoteSegmentStoreDirectory,
+            downloadTransferManager(content),
+            true,
+            threadPool,
+            PREFETCH
+        );
+        fileCache.put(switchKey, entry);
+        fileCache.decRef(switchKey);
+        SwitchableIndexInputWrapper handle = new PromotableSwitchableIndexInputWrapper(
+            "h",
+            (SwitchableIndexInput) entry.getIndexInput().clone(),
+            st,
+            realManager
+        );
+
+        clock.set(5_000);
+        IndexInput outside = handle.clone();
+        assertTrue("outside a search phase: blocks", outside instanceof SwitchableIndexInputWrapper);
+        assertEquals("not an access", 1_000L, st.lastAccessMillis());
+
+        realManager.searchPhases().enter();
+        IndexInput inside;
+        try {
+            inside = handle.clone();
+        } finally {
+            realManager.searchPhases().exit();
+        }
+        assertTrue("inside a search phase: a view", inside instanceof MemorySegmentAccessInput);
+        assertEquals(5_000L, st.lastAccessMillis());
+        assertEquals("the view reads the file", content[0], inside.readByte());
+
+        IOUtils.close(inside, outside, handle);
+        st.closeFamily();
+        assertTrue("state " + st.state() + ", handles " + st.handleCount(), st.cleanupDone());
+        assertNull(st.localMaster());
+        fileCache.remove(switchKey);
+    }
+
     public void testReEnablingWhileTheHandleIsOpenServesViewsAgainWithoutADownload() throws Exception {
         // The setting drops the extension and lists it again while the reader's handle stays open throughout: the
         // family is demoted, then restored from the mapping it still holds, and the next clone is a view again with

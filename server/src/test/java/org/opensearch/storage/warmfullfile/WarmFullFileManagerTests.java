@@ -2003,8 +2003,8 @@ public class WarmFullFileManagerTests extends OpenSearchTestCase {
         assertEquals(copied, stats.get("bytesFromLocalBlocks").longValue());
         assertEquals("only the read bytes count as downloaded", content.length - copied, stats.get("downloadedBytes").longValue());
         for (Path block : List.of(block0, block2, block4)) {
-            assertEquals("the block's reference was given back", Integer.valueOf(0), fileCache.getRef(block));
-            assertTrue("the block is left in place", Files.exists(block));
+            assertNull("copied, then removed by the sweep that follows the promotion, as idle", fileCache.get(block));
+            assertFalse(Files.exists(block));
         }
     }
 
@@ -2028,8 +2028,8 @@ public class WarmFullFileManagerTests extends OpenSearchTestCase {
         assertEquals(0L, mgr.counters().get("partsFromLocalBlocks").longValue());
         assertEquals((long) content.length, mgr.counters().get("downloadedBytes").longValue());
         assertServedWithOneReference(st, fileCache, dir.resolve(name), content);
-        assertEquals(Integer.valueOf(0), fileCache.getRef(block1));
-        assertEquals(Integer.valueOf(0), fileCache.getRef(block3));
+        assertNull("idle, so removed by the sweep that follows the promotion", fileCache.get(block1));
+        assertNull("idle, so removed by the sweep that follows the promotion", fileCache.get(block3));
     }
 
     public void testACorruptLocalBlockFailsTheChecksumAndTheRetryReadsEveryPartRemotely() throws Exception {
@@ -2060,7 +2060,224 @@ public class WarmFullFileManagerTests extends OpenSearchTestCase {
         awaitState(st, FullFileState.State.FULL);
         assertEquals("the retry reads every part", 2 * parts - 1, reader.readCount());
         assertServedWithOneReference(st, fileCache, dir.resolve(name), content);
-        assertEquals("the corrupt block is left to the cache", Integer.valueOf(0), fileCache.getRef(block0));
+        assertNull("the corrupt block, idle, is removed by the sweep that follows the promotion", fileCache.get(block0));
+        assertFalse(Files.exists(block0));
+    }
+
+    // ---------- idle blocks of promoted files ----------
+
+    public void testIdleBlocksOfAPromotedFileAreRemovedByTheSweepAndHeldOnesAreKept() throws Exception {
+        // Blocks 0 and 2 are idle, block 1 is held by a reader (a pre-FULL clone still in flight). The sweep that
+        // follows the promotion removes the idle ones with their files and leaves the held one, which goes on the
+        // next sweep once released; blocks of another file are untouched.
+        String name = "_sweep.faiss";
+        byte[] content = footeredContent(FILE_LENGTH);
+        FileCache fileCache = newFileCache();
+        TransferManager tm = new TransferManager(new FixedContentStreamReader(content), fileCache, threadPool);
+        WarmFullFileManager mgr = newManager(fileCache, 4, 0.5);
+        int part = (int) PART_SIZE;
+        Path block0 = putLocalBlock(fileCache, name, 0, slice(content, 0, part), true);
+        Path block1 = putLocalBlock(fileCache, name, 1, slice(content, part, 2 * part), true);
+        Path block2 = putLocalBlock(fileCache, name, 2, slice(content, 2 * part, 3 * part), true);
+        Path otherBlock = putLocalBlock(fileCache, "_other.faiss", 0, slice(content, 0, part), true);
+        fileCache.incRef(block1); // held
+
+        FullFileState st = newStateFor(tm, fileCache, name, content);
+        startPromotion(mgr, st);
+        awaitState(st, FullFileState.State.FULL);
+        // The sweep follows the publish on the download thread, so poll for it.
+        assertBusy(() -> assertEquals(2L, mgr.counters().get("blocksRemoved").longValue()), 10, TimeUnit.SECONDS);
+
+        assertNull("idle block removed", fileCache.get(block0));
+        assertNull("idle block removed", fileCache.get(block2));
+        assertFalse(Files.exists(block0));
+        assertFalse(Files.exists(block2));
+        assertNotNull("held block kept", fileCache.get(block1));
+        fileCache.decRef(block1);
+        assertNotNull("another file's block kept", fileCache.get(otherBlock));
+        fileCache.decRef(otherBlock);
+
+        // Released, the held block goes on the next sweep, here the one after another file's promotion.
+        fileCache.decRef(block1);
+        FullFileState other = newStateFor(tm, fileCache, "_other.faiss", content);
+        startPromotion(mgr, other);
+        awaitState(other, FullFileState.State.FULL);
+        assertBusy(
+            () -> assertEquals("block 1 and the other file's own block 0", 4L, mgr.counters().get("blocksRemoved").longValue()),
+            10,
+            TimeUnit.SECONDS
+        );
+        assertNull("the released block is gone", fileCache.get(block1));
+        assertFalse(Files.exists(block1));
+    }
+
+    // ---------- eviction under budget pressure ----------
+
+    /** A family with the file's remote checksum known; evictable when its extension is (faiss is, si is not). */
+    private FullFileState newStateFor(TransferManager tm, FileCache fileCache, String name, byte[] content) throws IOException {
+        FullFileState st = newState(tm, fileCache, name, content.length);
+        st.markRemoteMode(footerChecksum(content));
+        return st;
+    }
+
+    /** A one-segment manager with room for one footered {@link #FILE_LENGTH} whole file and not two. */
+    private WarmFullFileManager newEvictingManager(FileCache fileCache, LongSupplier clock, long minIdleMillis) {
+        WarmFullFileManager mgr = newManager(fileCache, clock, 4, 0.0005);
+        mgr.onEvictionMinIdleChanged(minIdleMillis);
+        return mgr;
+    }
+
+    public void testBudgetPressureEvictsTheColdestEvictableFamilyAndTheDeclinedOnePromotesAfterItsRelease() throws Exception {
+        byte[] content = footeredContent(FILE_LENGTH);
+        FixedContentStreamReader reader = new FixedContentStreamReader(content);
+        FileCache fileCache = newFileCache();
+        TransferManager tm = new TransferManager(reader, fileCache, threadPool);
+        AtomicLong clock = new AtomicLong(1_000);
+        WarmFullFileManager mgr = newEvictingManager(fileCache, clock::get, 1_000);
+        Path pathA = dir.resolve("_a.faiss");
+        FullFileState a = newStateFor(tm, fileCache, "_a.faiss", content);
+        startPromotion(mgr, a);
+        awaitState(a, FullFileState.State.FULL);
+        a.incHandles(); // the reader's handle stays open throughout
+        int parts = partsFor("_a.faiss", content.length);
+        clock.addAndGet(2_000); // idle past the minimum
+
+        FullFileState b = newStateFor(tm, fileCache, "_b.faiss", content);
+        startPromotion(mgr, b);
+        awaitState(b, FullFileState.State.BLOCK);
+        Map<String, Long> stats = mgr.counters();
+        assertEquals(1L, stats.get("declined.BUDGET_EXCEEDED").longValue());
+        assertEquals("the declined family retries soon", 3_000 + WarmFullFileManager.NO_SLOT_RETRY_DELAY_MILLIS, b.retryAt());
+        assertEquals(1L, stats.get("evicted").longValue());
+        assertEquals((long) content.length, stats.get("evictedBytes").longValue());
+        // No search phase runs on the shard, so the eviction released the mapping at once, under the open handle.
+        assertEquals(FullFileState.State.BLOCK, a.state());
+        assertTrue(a.cleanupDone());
+        assertNull(a.localMaster());
+        assertNull("whole file dropped from the cache", fileCache.get(pathA));
+        assertFalse(Files.exists(pathA));
+        assertEquals("budget back", 0L, mgr.reservedBytesPerSegment()[0]);
+        assertEquals("the handle is still open", 1, a.handleCount());
+        assertFalse(a.isMappingReleasePending());
+
+        clock.addAndGet(WarmFullFileManager.NO_SLOT_RETRY_DELAY_MILLIS + 1);
+        startPromotion(mgr, b);
+        awaitState(b, FullFileState.State.FULL);
+        assertEquals(content.length, mgr.reservedBytesPerSegment()[0]);
+        assertServedWithOneReference(b, fileCache, dir.resolve("_b.faiss"), content);
+        assertEquals("one download each", 2 * parts, reader.readCount());
+        a.decHandles();
+    }
+
+    public void testBudgetPressureKeepsAFamilyAccessedWithinTheMinimumIdle() throws Exception {
+        byte[] content = footeredContent(FILE_LENGTH);
+        FileCache fileCache = newFileCache();
+        TransferManager tm = new TransferManager(new FixedContentStreamReader(content), fileCache, threadPool);
+        AtomicLong clock = new AtomicLong(1_000);
+        WarmFullFileManager mgr = newEvictingManager(fileCache, clock::get, 60_000);
+        FullFileState a = newStateFor(tm, fileCache, "_a.faiss", content);
+        startPromotion(mgr, a);
+        awaitState(a, FullFileState.State.FULL);
+        clock.addAndGet(1_000);
+
+        FullFileState b = newStateFor(tm, fileCache, "_b.faiss", content);
+        startPromotion(mgr, b);
+        awaitState(b, FullFileState.State.BLOCK);
+        assertEquals(0L, mgr.counters().get("evicted").longValue());
+        assertEquals(1L, mgr.counters().get("declined.BUDGET_EXCEEDED").longValue());
+        assertEquals("an ordinary decline", 2_000 + WarmFullFileManager.RETRY_DELAY_MILLIS, b.retryAt());
+        assertEquals(FullFileState.State.FULL, a.state());
+        assertEquals(content.length, mgr.reservedBytesPerSegment()[0]);
+    }
+
+    public void testBudgetPressureSkipsAFileWhoseExtensionIsNotEvictable() throws Exception {
+        // A .si family: its reader is not known to clone per query, so it hands out views freely and is never evicted
+        // under its open reader.
+        byte[] content = footeredContent(FILE_LENGTH);
+        FileCache fileCache = newFileCache();
+        TransferManager tm = new TransferManager(new FixedContentStreamReader(content), fileCache, threadPool);
+        AtomicLong clock = new AtomicLong(1_000);
+        WarmFullFileManager mgr = newEvictingManager(fileCache, clock::get, 0);
+        mgr.onExtensionsChanged(Set.of("faiss", "si")); // both promotable; only faiss is evictable
+        FullFileState a = newStateFor(tm, fileCache, "_a.si", content);
+        assertFalse(a.evictable());
+        startPromotion(mgr, a);
+        awaitState(a, FullFileState.State.FULL);
+        clock.addAndGet(1_000);
+
+        FullFileState b = newStateFor(tm, fileCache, "_b.faiss", content);
+        assertTrue(b.evictable());
+        startPromotion(mgr, b);
+        awaitState(b, FullFileState.State.BLOCK);
+        assertEquals(0L, mgr.counters().get("evicted").longValue());
+        assertEquals(1L, mgr.counters().get("declined.BUDGET_EXCEEDED").longValue());
+        assertEquals(FullFileState.State.FULL, a.state());
+    }
+
+    public void testEvictionReleasesOnlyAfterTheSearchPhasesRunningAtDemotionEnd() throws Exception {
+        byte[] content = footeredContent(FILE_LENGTH);
+        FileCache fileCache = newFileCache();
+        TransferManager tm = new TransferManager(new FixedContentStreamReader(content), fileCache, threadPool);
+        AtomicLong clock = new AtomicLong(1_000);
+        WarmFullFileManager mgr = newEvictingManager(fileCache, clock::get, 1_000);
+        SearchPhaseTracker tracker = mgr.searchPhases();
+        FullFileState a = newStateFor(tm, fileCache, "_a.faiss", content);
+        startPromotion(mgr, a);
+        awaitState(a, FullFileState.State.FULL);
+        a.incHandles();
+        clock.addAndGet(2_000);
+
+        // A search phase runs on the shard when the eviction happens: it may hold a view of the mapping.
+        CountDownLatch earlyEntered = new CountDownLatch(1);
+        CountDownLatch earlyMayExit = new CountDownLatch(1);
+        Thread early = new Thread(() -> {
+            tracker.enter();
+            earlyEntered.countDown();
+            try {
+                earlyMayExit.await();
+            } catch (InterruptedException e) {
+                throw new AssertionError(e);
+            }
+            tracker.exit();
+        }, "early-search");
+        early.start();
+        earlyEntered.await();
+
+        FullFileState b = newStateFor(tm, fileCache, "_b.faiss", content);
+        startPromotion(mgr, b);
+        awaitState(b, FullFileState.State.BLOCK);
+        assertEquals(1L, mgr.counters().get("evicted").longValue());
+        assertEquals("demoted at once: new clones read blocks", FullFileState.State.BLOCK, a.state());
+        assertFalse("the mapping waits for the running phase", a.cleanupDone());
+        assertNotNull(a.localMaster());
+        assertEquals("the budget is held with the mapping", content.length, mgr.reservedBytesPerSegment()[0]);
+
+        // A phase that starts after the eviction was handed blocks, so it is not waited for.
+        CountDownLatch lateEntered = new CountDownLatch(1);
+        CountDownLatch lateMayExit = new CountDownLatch(1);
+        Thread late = new Thread(() -> {
+            tracker.enter();
+            lateEntered.countDown();
+            try {
+                lateMayExit.await();
+            } catch (InterruptedException e) {
+                throw new AssertionError(e);
+            }
+            tracker.exit();
+        }, "late-search");
+        late.start();
+        lateEntered.await();
+
+        earlyMayExit.countDown();
+        early.join();
+        assertTrue("released when the early phase ended", a.cleanupDone());
+        assertNull(a.localMaster());
+        assertEquals(0L, mgr.reservedBytesPerSegment()[0]);
+        assertEquals(1, a.handleCount());
+
+        lateMayExit.countDown();
+        late.join();
+        a.decHandles();
     }
 
     // ---------- stats() and the promotion INFO line ----------

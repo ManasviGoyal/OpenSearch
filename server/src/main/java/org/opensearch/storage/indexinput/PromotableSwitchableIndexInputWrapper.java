@@ -129,16 +129,26 @@ public class PromotableSwitchableIndexInputWrapper extends SwitchableIndexInputW
 
     /**
      * A view of the family's whole-file mapping, or null when the handle must keep reading blocks: the family is not
-     * FULL, the mapping is not published, or the mapping was closed under this read. Blocks are always valid, so every
-     * fallback is silent except an unexpected I/O error, which is logged at DEBUG.
+     * FULL, the mapping is not published, the mapping was closed under this read, or the family is evictable and this
+     * thread is not inside a search phase. Blocks are always valid, so every fallback is silent except an
+     * unexpected I/O error, which is logged at DEBUG.
      */
     private IndexInput viewOrNull(String what, ViewCutter cutter) {
         IndexInput master = fullFileState.localMaster(); // read the volatile once
         if (fullFileState.state() != FullFileState.State.FULL || master == null) {
             return null;
         }
+        // An evictable family hands views only to search phases, so that once the phases running at its demotion
+        // have ended no view of its mapping can be read and the mapping can be released under the open reader.
+        if (fullFileState.evictable() && (manager == null || manager.searchPhases().inPhase() == false)) {
+            return null;
+        }
         try {
-            return cutter.cut(master);
+            IndexInput view = cutter.cut(master);
+            if (manager != null) {
+                fullFileState.touch(manager.relativeTimeInMillis()); // for the eviction policy's idle check
+            }
+            return view;
         } catch (AlreadyClosedException e) {
             return null;
         } catch (IOException e) {

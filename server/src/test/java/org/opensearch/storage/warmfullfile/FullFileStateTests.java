@@ -453,6 +453,50 @@ public class FullFileStateTests extends OpenSearchTestCase {
         assertEquals("iterations whose mapping release was never scheduled", 0, lost);
     }
 
+    public void testReleaseAfterEvictionReleasesADemotedFamilyUnderItsOpenHandle() throws Exception {
+        // The eviction policy demotes a family whose reader still holds a handle, and releases its mapping once the
+        // searches running at the demotion have ended, without waiting for the handle.
+        Fixture f = new Fixture();
+        f.goFull();
+        f.st.incHandles();
+        assertTrue(f.st.demote());
+        assertEquals("the open handle holds the release", 0, f.executor.tasks.size());
+
+        assertTrue(f.st.releaseAfterEviction());
+        assertFalse("scheduled once", f.st.releaseAfterEviction());
+        f.runCleanupOnce();
+        assertTrue(f.st.cleanupDone());
+        assertNull(f.st.localMaster());
+        assertEquals(1, f.budgetReleases.get());
+        assertFalse(f.st.isMappingReleasePending());
+        assertEquals("the handle is still open", 1, f.st.handleCount());
+
+        f.st.decHandles();
+        assertEquals("the handle's close owes nothing more", 0, f.executor.tasks.size());
+    }
+
+    public void testReleaseAfterEvictionIsANoOpUnlessAReleaseIsOwedAndNotScheduled() throws Exception {
+        Fixture f = new Fixture();
+        assertFalse("never FULL: nothing owed", f.st.releaseAfterEviction());
+        f.goFull();
+        assertFalse("FULL: not demoted", f.st.releaseAfterEviction());
+
+        f.st.incHandles();
+        assertTrue(f.st.demote());
+        assertTrue("restored before the release", f.st.restore());
+        assertFalse("restored: nothing owed", f.st.releaseAfterEviction());
+        assertEquals(FullFileState.State.FULL, f.st.state());
+        assertEquals(0, f.executor.tasks.size());
+
+        // A demotion with no handle open schedules its own release; the eviction finds it scheduled.
+        f.st.decHandles();
+        assertTrue(f.st.demote());
+        assertEquals(1, f.executor.tasks.size());
+        assertFalse(f.st.releaseAfterEviction());
+        f.runCleanupOnce();
+        assertTrue(f.st.cleanupDone());
+    }
+
     private static void await(CyclicBarrier barrier) {
         try {
             barrier.await();

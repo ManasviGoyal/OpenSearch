@@ -1004,6 +1004,7 @@ public class Node implements Closeable {
                 if (warmFullFileManager != null) {
                     warmFullFileSettings.addListener(warmFullFileManager::onExtensionsChanged);
                     warmFullFileSettings.addMaxConcurrentDownloadsListener(warmFullFileManager::onMaxConcurrentDownloadsChanged);
+                    warmFullFileSettings.addEvictionMinIdleListener(warmFullFileManager::onEvictionMinIdleChanged);
                 }
             } else {
                 tieredStoragePrefetchSettings = null;
@@ -1160,7 +1161,8 @@ public class Node implements Closeable {
                 compositeIndexSettings,
                 segmentReplicator::startReplication,
                 segmentReplicator::getSegmentReplicationStats,
-                dataFormatRegistry
+                dataFormatRegistry,
+                warmFullFileManager
             );
 
             final IngestService ingestService = new IngestService(

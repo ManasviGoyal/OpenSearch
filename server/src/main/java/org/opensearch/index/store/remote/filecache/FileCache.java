@@ -133,6 +133,11 @@ public class FileCache implements RefCountedCache<Path, CachedIndexInput> {
     }
 
     @Override
+    public boolean removeIfEvictable(final Path filePath) {
+        return theCache.removeIfEvictable(filePath);
+    }
+
+    @Override
     public void clear() {
         theCache.clear();
     }

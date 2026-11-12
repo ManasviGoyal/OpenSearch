@@ -124,6 +124,12 @@ public class SegmentedCache<K, V> implements RefCountedCache<K, V> {
     }
 
     @Override
+    public boolean removeIfEvictable(K key) {
+        if (key == null) throw new NullPointerException();
+        return segmentFor(key).removeIfEvictable(key);
+    }
+
+    @Override
     public void clear() {
         for (RefCountedCache<K, V> cache : table) {
             cache.clear();
