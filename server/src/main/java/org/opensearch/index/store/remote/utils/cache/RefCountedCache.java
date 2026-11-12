@@ -57,6 +57,15 @@ public interface RefCountedCache<K, V> {
     void remove(K key);
 
     /**
+     * Discards the cached value for key {@code key} only if nothing references or pins it, checked and removed under
+     * the same lock, so that a reference taken meanwhile keeps the value. Unlike {@link #remove}, which closes the
+     * value under its readers, this never affects an entry in use.
+     *
+     * @return true if the value was discarded; false if there was none or it is referenced or pinned
+     */
+    boolean removeIfEvictable(K key);
+
+    /**
      * Discards all entries in the cache, regardless of reference count.
      */
     void clear();

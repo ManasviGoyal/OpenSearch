@@ -184,6 +184,22 @@ class LRUCache<K, V> implements RefCountedCache<K, V> {
         }
     }
 
+    @Override
+    public boolean removeIfEvictable(K key) {
+        Objects.requireNonNull(key);
+        lock.lock();
+        try {
+            Node<K, V> node = data.get(key);
+            if (node == null || node.evictable() == false) {
+                return false;
+            }
+            removeNode(key);
+            return true;
+        } finally {
+            lock.unlock();
+        }
+    }
+
     // To be used only in testing framework.
     public void closeIndexInputReferences() {
         lock.lock();
