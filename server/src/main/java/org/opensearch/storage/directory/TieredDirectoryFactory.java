@@ -16,6 +16,7 @@ import org.opensearch.index.shard.ShardPath;
 import org.opensearch.index.store.remote.filecache.FileCache;
 import org.opensearch.plugins.IndexStorePlugin;
 import org.opensearch.storage.prefetch.TieredStoragePrefetchSettings;
+import org.opensearch.storage.warmfullfile.WarmFullFileManager;
 import org.opensearch.threadpool.ThreadPool;
 
 import java.io.IOException;
@@ -32,13 +33,19 @@ public class TieredDirectoryFactory implements IndexStorePlugin.CompositeDirecto
     private static final Logger logger = LogManager.getLogger(TieredDirectoryFactory.class);
 
     private final Supplier<TieredStoragePrefetchSettings> tieredStoragePrefetchSettingsSupplier;
+    private final WarmFullFileManager warmFullFileManager;
 
     /**
      * Creates a new TieredDirectoryFactory.
      * @param tieredStoragePrefetchSettingsSupplier supplier for prefetch settings
+     * @param warmFullFileManager the node-level whole-file promotion manager (null when disabled)
      */
-    public TieredDirectoryFactory(Supplier<TieredStoragePrefetchSettings> tieredStoragePrefetchSettingsSupplier) {
+    public TieredDirectoryFactory(
+        Supplier<TieredStoragePrefetchSettings> tieredStoragePrefetchSettingsSupplier,
+        WarmFullFileManager warmFullFileManager
+    ) {
         this.tieredStoragePrefetchSettingsSupplier = tieredStoragePrefetchSettingsSupplier;
+        this.warmFullFileManager = warmFullFileManager;
     }
 
     @Override
@@ -52,6 +59,13 @@ public class TieredDirectoryFactory implements IndexStorePlugin.CompositeDirecto
     ) throws IOException {
         logger.trace("Creating composite directory from TieredDirectoryFactory");
         Directory localDirectory = localDirectoryFactory.newDirectory(indexSettings, shardPath);
-        return new TieredDirectory(localDirectory, remoteDirectory, fileCache, threadPool, tieredStoragePrefetchSettingsSupplier);
+        return new TieredDirectory(
+            localDirectory,
+            remoteDirectory,
+            fileCache,
+            threadPool,
+            tieredStoragePrefetchSettingsSupplier,
+            warmFullFileManager
+        );
     }
 }

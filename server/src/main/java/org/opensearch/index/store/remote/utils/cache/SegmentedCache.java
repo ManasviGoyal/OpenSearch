@@ -71,12 +71,28 @@ public class SegmentedCache<K, V> implements RefCountedCache<K, V> {
     }
 
     RefCountedCache<K, V> segmentFor(K key) {
+        return table[segmentIndexFor(key)];
+    }
+
+    /**
+     * The index of the segment that holds {@code key}: two keys share a segment, and so its capacity, exactly when they
+     * get the same index.
+     *
+     * @param key the cache key
+     * @return the segment index in {@code [0, segmentCount())}
+     */
+    public int segmentIndexFor(K key) {
         int h = key.hashCode();
         // Based on this answer https://stackoverflow.com/a/12996028
         h = ((h >>> 16) ^ h) * 0x45d9f3b;
         h = ((h >>> 16) ^ h) * 0x45d9f3b;
         h = (h >>> 16) ^ h;
-        return table[h & HASH_BITS & segmentMask];
+        return h & HASH_BITS & segmentMask;
+    }
+
+    /** @return the number of segments the cache is split into (a power of two); each has {@code capacity() / segmentCount()} bytes */
+    public int segmentCount() {
+        return table.length;
     }
 
     public long capacity() {

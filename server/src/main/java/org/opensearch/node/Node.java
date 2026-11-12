@@ -293,6 +293,8 @@ import org.opensearch.storage.metrics.TierActionMetrics;
 import org.opensearch.storage.prefetch.TieredStoragePrefetchSettings;
 import org.opensearch.storage.tiering.HotToWarmTieringService;
 import org.opensearch.storage.tiering.WarmToHotTieringService;
+import org.opensearch.storage.warmfullfile.WarmFullFileManager;
+import org.opensearch.storage.warmfullfile.WarmFullFileSettings;
 import org.opensearch.task.commons.clients.TaskManagerClient;
 import org.opensearch.tasks.Task;
 import org.opensearch.tasks.TaskCancellationMonitoringService;
@@ -977,12 +979,31 @@ public class Node implements Closeable {
             // Initialize tiered storage prefetch settings
             final TieredStoragePrefetchSettings tieredStoragePrefetchSettings;
             final Supplier<TieredStoragePrefetchSettings> tieredStoragePrefetchSettingsSupplier;
+            final WarmFullFileManager warmFullFileManager;
             if (FeatureFlags.isEnabled(FeatureFlags.WRITABLE_WARM_INDEX_EXPERIMENTAL_FLAG)) {
                 tieredStoragePrefetchSettings = new TieredStoragePrefetchSettings(clusterService.getClusterSettings());
                 tieredStoragePrefetchSettingsSupplier = () -> tieredStoragePrefetchSettings;
+                final WarmFullFileSettings warmFullFileSettings = new WarmFullFileSettings(clusterService.getClusterSettings());
+                // Only warm nodes have a FileCache (fileCache() is null otherwise, e.g. cluster-manager-only or data-only
+                // nodes). Without one there is nothing to promote into; TieredDirectory and the wrapper treat a null
+                // manager as "feature off".
+                final FileCache nodeFileCache = fileCache();
+                warmFullFileManager = nodeFileCache == null
+                    ? null
+                    : new WarmFullFileManager(
+                        nodeFileCache,
+                        threadPool.executor(ThreadPool.Names.GENERIC),
+                        threadPool::relativeTimeInMillis,
+                        warmFullFileSettings.getMaxConcurrentDownloads()
+                    );
+                if (warmFullFileManager != null) {
+                    warmFullFileSettings.addListener(warmFullFileManager::onExtensionsChanged);
+                    warmFullFileSettings.addMaxConcurrentDownloadsListener(warmFullFileManager::onMaxConcurrentDownloadsChanged);
+                }
             } else {
                 tieredStoragePrefetchSettings = null;
                 tieredStoragePrefetchSettingsSupplier = () -> null;
+                warmFullFileManager = null;
             }
 
             final Map<String, IndexStorePlugin.DirectoryFactory> builtInDirectoryFactories = IndexModule.createBuiltInDirectoryFactories(
@@ -1026,7 +1047,7 @@ public class Node implements Closeable {
             if (FeatureFlags.isEnabled(FeatureFlags.WRITABLE_WARM_INDEX_EXPERIMENTAL_FLAG)) {
                 compositeDirectoryFactories.put(
                     TieringUtils.TIERED_COMPOSITE_INDEX_TYPE,
-                    new TieredDirectoryFactory(tieredStoragePrefetchSettingsSupplier)
+                    new TieredDirectoryFactory(tieredStoragePrefetchSettingsSupplier, warmFullFileManager)
                 );
             }
             final Map<String, org.opensearch.index.store.DataFormatAwareStoreDirectoryFactory> dataFormatAwareStoreDirectoryFactories =
@@ -1887,6 +1908,10 @@ public class Node implements Closeable {
                     b.bind(HotToWarmTieringService.class).asEagerSingleton();
                     b.bind(WarmToHotTieringService.class).asEagerSingleton();
                     b.bind(TierActionMetrics.class).toInstance(new TierActionMetrics(metricsRegistry));
+                    // Only warm nodes have a manager (it needs the node FileCache); Guice rejects a null instance.
+                    if (warmFullFileManager != null) {
+                        b.bind(WarmFullFileManager.class).toInstance(warmFullFileManager);
+                    }
                 }
             });
             injector = modules.createInjector();

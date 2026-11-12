@@ -36,6 +36,7 @@ import java.util.stream.Stream;
 import static org.opensearch.env.NodeEnvironment.processDirectoryFiles;
 import static org.opensearch.index.store.remote.directory.RemoteSnapshotDirectoryFactory.LOCAL_STORE_LOCATION;
 import static org.opensearch.index.store.remote.utils.FileTypeUtils.INDICES_FOLDER_IDENTIFIER;
+import static org.opensearch.index.store.remote.utils.FileTypeUtils.isPartialDownloadFile;
 
 /**
  * File Cache (FC) is introduced to solve the problem that the local disk cannot hold
@@ -76,6 +77,22 @@ public class FileCache implements RefCountedCache<Path, CachedIndexInput> {
 
     public long capacity() {
         return theCache.capacity();
+    }
+
+    /** @return the number of segments the cache is split into; each is an independent LRU with its share of the capacity */
+    public int segmentCount() {
+        return theCache.segmentCount();
+    }
+
+    /**
+     * The index of the segment that holds {@code filePath}, in {@code [0, segmentCount())}; two keys share a segment,
+     * and so compete for its capacity, exactly when they get the same index.
+     *
+     * @param filePath the cache key
+     * @return the segment index
+     */
+    public int segmentIndexFor(Path filePath) {
+        return theCache.segmentIndexFor(filePath);
     }
 
     @Override
@@ -231,6 +248,11 @@ public class FileCache implements RefCountedCache<Path, CachedIndexInput> {
             }
         }).filter(Files::isRegularFile).forEach(path -> {
             try {
+                if (isPartialDownloadFile(path.getFileName().toString())) {
+                    // A download that never reached its rename: incomplete, so it is dropped rather than registered.
+                    Files.deleteIfExists(path);
+                    return;
+                }
                 put(path.toAbsolutePath(), new RestoredCachedIndexInput(Files.size(path)));
                 decRef(path.toAbsolutePath());
             } catch (IOException e) {

@@ -31,12 +31,15 @@ public class BlobFetchRequest {
 
     private final long blobLength;
 
+    private final boolean atomicWrite;
+
     private BlobFetchRequest(Builder builder) {
         this.fileName = builder.fileName;
         this.filePath = builder.directory.getDirectory().resolve(fileName);
         this.directory = builder.directory;
         this.blobParts = builder.blobParts;
         this.blobLength = builder.blobParts.stream().mapToLong(o -> o.getLength()).sum();
+        this.atomicWrite = builder.atomicWrite;
     }
 
     public Path getFilePath() {
@@ -59,6 +62,22 @@ public class BlobFetchRequest {
         return blobLength;
     }
 
+    /**
+     * Whether the download is written to {@link #getTempFilePath()}, fsynced and then renamed to {@link #getFilePath()},
+     * so that a file at the final path is always complete. Off by default: the file is written in place.
+     */
+    public boolean isAtomicWrite() {
+        return atomicWrite;
+    }
+
+    /**
+     * The path an atomic-write download is written to before the rename: next to the final path, with
+     * {@link FileTypeUtils#PARTIAL_DOWNLOAD_SUFFIX}.
+     */
+    public Path getTempFilePath() {
+        return filePath.resolveSibling(fileName + FileTypeUtils.PARTIAL_DOWNLOAD_SUFFIX);
+    }
+
     public static Builder builder() {
         return new Builder();
     }
@@ -76,6 +95,8 @@ public class BlobFetchRequest {
             + ", fileName='"
             + fileName
             + '\''
+            + ", atomicWrite="
+            + atomicWrite
             + '}';
     }
 
@@ -116,6 +137,7 @@ public class BlobFetchRequest {
         private List<BlobPart> blobParts;
         private FSDirectory directory;
         private String fileName;
+        private boolean atomicWrite;
 
         private Builder() {}
 
@@ -131,6 +153,12 @@ public class BlobFetchRequest {
 
         public Builder blobParts(List<BlobPart> blobParts) {
             this.blobParts = blobParts;
+            return this;
+        }
+
+        /** See {@link BlobFetchRequest#isAtomicWrite()}. */
+        public Builder atomicWrite(boolean atomicWrite) {
+            this.atomicWrite = atomicWrite;
             return this;
         }
 

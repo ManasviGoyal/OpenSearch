@@ -13,6 +13,7 @@ import com.carrotsearch.randomizedtesting.annotations.ThreadLeakFilters;
 import org.apache.lucene.store.IndexInput;
 import org.apache.lucene.store.MMapDirectory;
 import org.apache.lucene.store.SimpleFSLockFactory;
+import org.opensearch.common.util.CancellableThreads;
 import org.opensearch.index.store.remote.file.CleanerDaemonThreadLeakFilter;
 import org.opensearch.index.store.remote.filecache.FileCache;
 import org.opensearch.index.store.remote.filecache.FileCacheFactory;
@@ -23,11 +24,14 @@ import org.junit.After;
 import org.junit.Before;
 
 import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
@@ -334,6 +338,100 @@ public abstract class TransferManagerTestCase extends OpenSearchTestCase {
         transferManager.fetchBlobAsync(blobFetchRequest).join();
         waitUntil(() -> fileCache.getRef(blobFetchRequest.getFilePath()) == 1, 10, TimeUnit.SECONDS);
         assertEquals(Optional.of(1), Optional.of(fileCache.getRef(blobFetchRequest.getFilePath())));
+    }
+
+    public void testCancelledAsyncDownloadLeavesNoEntryOrFile() throws Exception {
+        // A download started under a cancellation handle and then cancelled while its read blocks: the future fails
+        // with the cancellation, and the cache entry and the partial file are removed as for any failed download.
+        final CountDownLatch latch = new CountDownLatch(1);
+        mockWaitForLatchReader(latch);
+        List<BlobFetchRequest.BlobPart> blobParts = new ArrayList<>();
+        blobParts.add(new BlobFetchRequest.BlobPart("blocking-blob", 0, EIGHT_MB));
+        BlobFetchRequest request = BlobFetchRequest.builder().fileName("cancelled-file").directory(directory).blobParts(blobParts).build();
+        CancellableThreads cancellableThreads = new CancellableThreads();
+        try {
+            CompletableFuture<IndexInput> future = transferManager.fetchBlobAsync(request, cancellableThreads);
+            assertFalse(future.isDone());
+            cancellableThreads.cancel("test");
+            ExecutionException failure = expectThrows(ExecutionException.class, () -> future.get(30, TimeUnit.SECONDS));
+            Throwable cause = failure.getCause();
+            while (cause != null && cause instanceof CancellableThreads.ExecutionCancelledException == false) {
+                cause = cause.getCause();
+            }
+            assertNotNull("the future fails with the cancellation", cause);
+            assertBusy(() -> {
+                MatcherAssert.assertThat(fileCache.usage(), equalTo(0L));
+                MatcherAssert.assertThat(fileCache.activeUsage(), equalTo(0L));
+                assertNull(fileCache.get(request.getFilePath()));
+                assertFalse(Files.exists(request.getFilePath()));
+            });
+        } finally {
+            latch.countDown();
+        }
+    }
+
+    public void testAtomicWriteRenamesACompleteFileIntoPlace() throws Exception {
+        // The download is written next to the final path and renamed to it once complete: afterwards only the final
+        // file exists and it is served from the cache like any other.
+        List<BlobFetchRequest.BlobPart> blobParts = new ArrayList<>();
+        blobParts.add(new BlobFetchRequest.BlobPart("blob", 0, EIGHT_MB));
+        BlobFetchRequest request = BlobFetchRequest.builder()
+            .fileName("atomic-file")
+            .directory(directory)
+            .blobParts(blobParts)
+            .atomicWrite(true)
+            .build();
+        try (IndexInput indexInput = transferManager.fetchBlobAsync(request).get(30, TimeUnit.SECONDS).clone()) {
+            assertIndexInputIsFunctional(indexInput);
+        }
+        assertTrue(Files.exists(request.getFilePath()));
+        assertFalse("no temp file is left behind", Files.exists(request.getTempFilePath()));
+        MatcherAssert.assertThat(fileCache.usage(), equalTo((long) EIGHT_MB));
+    }
+
+    public void testAtomicWriteFailureLeavesNeitherTempNorFinalFile() throws Exception {
+        // A download that fails mid-way never reaches the rename: the final path is untouched, the temp file is deleted
+        // and the cache entry is removed as for any failed download.
+        mockExceptionWhileReading();
+        List<BlobFetchRequest.BlobPart> blobParts = new ArrayList<>();
+        blobParts.add(new BlobFetchRequest.BlobPart("failure-blob", 0, EIGHT_MB));
+        BlobFetchRequest request = BlobFetchRequest.builder()
+            .fileName("atomic-failure")
+            .directory(directory)
+            .blobParts(blobParts)
+            .atomicWrite(true)
+            .build();
+        expectThrows(IOException.class, () -> transferManager.fetchBlob(request));
+        assertFalse(Files.exists(request.getFilePath()));
+        assertFalse(Files.exists(request.getTempFilePath()));
+        assertNull(fileCache.get(request.getFilePath()));
+        MatcherAssert.assertThat(fileCache.usage(), equalTo(0L));
+    }
+
+    public void testAtomicWriteRemovesAStaleTempFileAndItsEntryFirst() throws Exception {
+        // A temp file from an attempt that never renamed, which a restart has registered in the cache: the download
+        // removes both before it writes, so the stale bytes and their cache weight do not survive the new download.
+        List<BlobFetchRequest.BlobPart> blobParts = new ArrayList<>();
+        blobParts.add(new BlobFetchRequest.BlobPart("blob", 0, EIGHT_MB));
+        BlobFetchRequest request = BlobFetchRequest.builder()
+            .fileName("atomic-stale")
+            .directory(directory)
+            .blobParts(blobParts)
+            .atomicWrite(true)
+            .build();
+        Path temp = request.getTempFilePath();
+        Files.write(temp, new byte[1024]);
+        fileCache.put(temp, new FileCache.RestoredCachedIndexInput(1024));
+        fileCache.decRef(temp);
+        MatcherAssert.assertThat(fileCache.usage(), equalTo(1024L));
+
+        try (IndexInput indexInput = transferManager.fetchBlobAsync(request).get(30, TimeUnit.SECONDS).clone()) {
+            assertIndexInputIsFunctional(indexInput);
+        }
+        assertFalse(Files.exists(temp));
+        assertNull(fileCache.get(temp));
+        assertTrue(Files.exists(request.getFilePath()));
+        MatcherAssert.assertThat(fileCache.usage(), equalTo((long) EIGHT_MB));
     }
 
     protected abstract void initializeTransferManager() throws IOException;

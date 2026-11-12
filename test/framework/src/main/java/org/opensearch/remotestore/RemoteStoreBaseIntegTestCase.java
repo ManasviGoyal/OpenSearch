@@ -8,6 +8,8 @@
 
 package org.opensearch.remotestore;
 
+import org.apache.lucene.store.Directory;
+import org.apache.lucene.store.FilterDirectory;
 import org.opensearch.action.admin.cluster.remotestore.restore.RestoreRemoteStoreRequest;
 import org.opensearch.action.admin.cluster.repositories.get.GetRepositoriesRequest;
 import org.opensearch.action.admin.cluster.repositories.get.GetRepositoriesResponse;
@@ -70,6 +72,7 @@ import static org.opensearch.repositories.fs.ReloadableFsRepository.REPOSITORIES
 import static org.opensearch.test.hamcrest.OpenSearchAssertions.assertAcked;
 
 public class RemoteStoreBaseIntegTestCase extends OpenSearchIntegTestCase {
+
     protected static final String REPOSITORY_NAME = "test-remote-store-repo";
     protected static final String REPOSITORY_2_NAME = "test-remote-store-repo-2";
     protected static final String REPOSITORY_3_NAME = "test-remote-store-repo-3";
@@ -80,6 +83,25 @@ public class RemoteStoreBaseIntegTestCase extends OpenSearchIntegTestCase {
     protected static final String REFRESHED_OR_FLUSHED_OPERATIONS = "refreshed-or-flushed-operations";
     protected static final String MAX_SEQ_NO_TOTAL = "max-seq-no-total";
     protected static final String MAX_SEQ_NO_REFRESHED_OR_FLUSHED = "max-seq-no-refreshed-or-flushed";
+
+    /**
+     * Walks the {@link FilterDirectory} chain of a shard's store directory down to the first directory of {@code type}.
+     *
+     * @throws IllegalArgumentException if no directory of that type is in the chain
+     */
+    protected static <T extends Directory> T unwrapTo(Directory directory, Class<T> type) {
+        Directory current = directory;
+        while (current instanceof FilterDirectory) {
+            if (type.isInstance(current)) {
+                return type.cast(current);
+            }
+            current = ((FilterDirectory) current).getDelegate();
+        }
+        if (type.isInstance(current)) {
+            return type.cast(current);
+        }
+        throw new IllegalArgumentException("Expected " + type.getSimpleName() + " but got: " + directory.getClass().getName());
+    }
 
     protected Path segmentRepoPath;
     protected Path translogRepoPath;

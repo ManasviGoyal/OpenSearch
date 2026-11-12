@@ -1,0 +1,1281 @@
+/*
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * The OpenSearch Contributors require contributions made to
+ * this file be licensed under the Apache-2.0 license or a
+ * compatible open source license.
+ */
+package org.opensearch.storage.warmfullfile;
+
+import com.carrotsearch.randomizedtesting.annotations.ThreadLeakFilters;
+
+import org.apache.logging.log4j.Level;
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.core.LogEvent;
+import org.apache.lucene.codecs.CodecUtil;
+import org.apache.lucene.document.Document;
+import org.apache.lucene.index.ConcurrentMergeScheduler;
+import org.apache.lucene.index.IndexWriter;
+import org.apache.lucene.index.IndexWriterConfig;
+import org.apache.lucene.index.MergePolicy;
+import org.apache.lucene.index.MergeScheduler;
+import org.apache.lucene.index.SegmentCommitInfo;
+import org.apache.lucene.index.SegmentInfos;
+import org.apache.lucene.store.AlreadyClosedException;
+import org.apache.lucene.store.ByteBuffersDirectory;
+import org.apache.lucene.store.FSDirectory;
+import org.apache.lucene.store.IOContext;
+import org.apache.lucene.store.IndexInput;
+import org.apache.lucene.store.IndexOutput;
+import org.apache.lucene.store.MemorySegmentAccessInput;
+import org.apache.lucene.store.NIOFSDirectory;
+import org.apache.lucene.store.RandomAccessInput;
+import org.opensearch.common.lucene.store.ByteArrayIndexInput;
+import org.opensearch.common.lucene.store.InputStreamIndexInput;
+import org.opensearch.common.util.io.IOUtils;
+import org.opensearch.index.store.remote.file.CleanerDaemonThreadLeakFilter;
+import org.opensearch.index.store.remote.filecache.FileCache;
+import org.opensearch.index.store.remote.filecache.FileCacheFactory;
+import org.opensearch.index.store.remote.utils.TransferManager;
+import org.opensearch.storage.directory.TieredStorageBaseTestCase;
+import org.opensearch.storage.indexinput.PromotableCachedSwitchableIndexInput;
+import org.opensearch.storage.indexinput.PromotableSwitchableIndexInputWrapper;
+import org.opensearch.storage.indexinput.SwitchableIndexInput;
+import org.opensearch.storage.indexinput.SwitchableIndexInputWrapper;
+import org.opensearch.storage.prefetch.TieredStoragePrefetchSettings;
+import org.opensearch.test.MockLogAppender;
+import org.opensearch.test.junit.annotations.TestLogging;
+import org.opensearch.threadpool.ThreadPool;
+import org.junit.After;
+import org.junit.Before;
+
+import java.io.ByteArrayInputStream;
+import java.io.IOException;
+import java.lang.reflect.Method;
+import java.nio.ByteBuffer;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Queue;
+import java.util.Random;
+import java.util.Set;
+import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.Executor;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.Supplier;
+
+import static org.opensearch.storage.utils.DirectoryUtils.getFilePath;
+import static org.opensearch.storage.utils.DirectoryUtils.getFilePathSwitchable;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
+
+/**
+ * Tests for the wrapper's promotion trigger, whole-file view serving, and handle counting.
+ */
+@ThreadLeakFilters(filters = CleanerDaemonThreadLeakFilter.class)
+public class SwitchableIndexInputWrapperWholeFileTests extends TieredStorageBaseTestCase {
+
+    private static final String FILE_NAME = "_0.si";
+    private static final Supplier<TieredStoragePrefetchSettings> PREFETCH = () -> {
+        TieredStoragePrefetchSettings s = mock(TieredStoragePrefetchSettings.class);
+        when(s.getReadAheadBlockCount()).thenReturn(TieredStoragePrefetchSettings.DEFAULT_READ_AHEAD_BLOCK_COUNT);
+        when(s.getReadAheadEnableFileFormats()).thenReturn(TieredStoragePrefetchSettings.READ_AHEAD_ENABLE_FILE_FORMATS);
+        when(s.isStoredFieldsPrefetchEnabled()).thenReturn(true);
+        return s;
+    };
+
+    private FSDirectory localDirectory;
+    private FileCache fileCache;
+    private TransferManager transferManager;
+
+    @Before
+    public void setup() throws IOException {
+        setupRemoteSegmentStoreDirectory();
+        populateMetadata();
+        remoteSegmentStoreDirectory.init();
+        populateData();
+        localDirectory = FSDirectory.open(createTempDir());
+        // Same shape as the node cache (NodeCacheService): default segment count = availableProcessors(), which is what
+        // WarmFullFileManager's production constructor assumes. 1 GiB is only a limit; nothing is allocated.
+        fileCache = FileCacheFactory.createConcurrentLRUFileCache(1L << 30);
+        transferManager = new TransferManager(
+            (name, position, length) -> new InputStreamIndexInput(
+                remoteSegmentStoreDirectory.openBlockInput(name, position, length, IOContext.DEFAULT),
+                length
+            ),
+            fileCache,
+            threadPool
+        );
+    }
+
+    @After
+    public void closeLocalDirectory() throws IOException {
+        IOUtils.close(localDirectory);
+    }
+
+    /** The fixture file's original input over the fixture cache and directory, reading remote blocks through {@code tm}. */
+    private SwitchableIndexInput newInput(boolean cacheFromRemote, TransferManager tm) throws IOException {
+        return new SwitchableIndexInput(
+            "switchable",
+            FILE_NAME,
+            getFilePath(localDirectory, FILE_NAME),
+            getFilePathSwitchable(localDirectory, FILE_NAME),
+            fileCache,
+            localDirectory,
+            remoteSegmentStoreDirectory,
+            tm,
+            cacheFromRemote,
+            threadPool,
+            PREFETCH
+        );
+    }
+
+    /** An input in remote (block) mode: the file is already in the remote store. */
+    private SwitchableIndexInput remoteModeInput() throws IOException {
+        return newInput(true, transferManager);
+    }
+
+    private FullFileState stateFor(SwitchableIndexInput in) {
+        return stateFor(in, transferManager, localDirectory);
+    }
+
+    /**
+     * The family state for {@code in}, downloading through {@code tm} into {@code dir}. Marked remote when the input is in
+     * remote mode, as CachedSwitchableIndexInput does for a family created from remote.
+     */
+    private FullFileState stateFor(SwitchableIndexInput in, TransferManager tm, FSDirectory dir) {
+        FullFileState state = new FullFileState(tm, dir, fileCache, FILE_NAME, in.length(), getFilePath(localDirectory, FILE_NAME));
+        if (in.hasSwitchedToRemote()) {
+            state.markRemoteMode(null);
+        }
+        return state;
+    }
+
+    /** A manager whose setting lists the fixture file's extension, so eligible handles trigger. */
+    private WarmFullFileManager manager(Executor executor, AtomicLong clock) {
+        WarmFullFileManager manager = new WarmFullFileManager(fileCache, executor, clock::get, 8);
+        manager.onExtensionsChanged(Set.of(WarmFullFileSettings.extensionOf(FILE_NAME)));
+        return manager;
+    }
+
+    /** Writes a local whole-file copy whose byte at position p is p mod 251, and opens it as the family master. */
+    private IndexInput openMaster(long length) throws IOException {
+        String name = "master.bin";
+        try (IndexOutput out = localDirectory.createOutput(name, IOContext.DEFAULT)) {
+            for (long p = 0; p < length; p++) {
+                out.writeByte((byte) (p % 251));
+            }
+        }
+        return localDirectory.openInput(name, IOContext.DEFAULT);
+    }
+
+    private static byte expected(long p) {
+        return (byte) (p % 251);
+    }
+
+    private void makeFull(FullFileState st, IndexInput master) {
+        assertTrue(st.onAccess(0));
+        assertEquals(FullFileState.Completion.FULL, st.completePromotion(master, null, () -> {}, () -> {}, () -> {}));
+    }
+
+    // ---------------- Trigger ----------------
+
+    public void testFirstCloneRequestsPromotionExactlyOnce() throws IOException {
+        SwitchableIndexInput in = remoteModeInput();
+        FullFileState st = stateFor(in);
+        RecordingExecutor exec = new RecordingExecutor();
+        SwitchableIndexInputWrapper handle = new PromotableSwitchableIndexInputWrapper("h", in, st, manager(exec, new AtomicLong()));
+
+        IndexInput c1 = handle.clone();
+        assertEquals(FullFileState.State.PROMOTING, st.state());
+        assertEquals(1, exec.submitted.get());
+        IndexInput c2 = handle.clone();
+        assertEquals("no second request while PROMOTING", 1, exec.submitted.get());
+        assertTrue("block clones returned while not FULL", c1 instanceof SwitchableIndexInputWrapper);
+        assertTrue(c2 instanceof SwitchableIndexInputWrapper);
+        IOUtils.close(c1, c2, handle);
+    }
+
+    public void testFirstSliceRequestsPromotion() throws IOException {
+        SwitchableIndexInput in = remoteModeInput();
+        FullFileState st = stateFor(in);
+        RecordingExecutor exec = new RecordingExecutor();
+        SwitchableIndexInputWrapper handle = new PromotableSwitchableIndexInputWrapper("h", in, st, manager(exec, new AtomicLong()));
+
+        IndexInput s = handle.slice("s", 0, Math.min(16, in.length()));
+        assertEquals(1, exec.submitted.get());
+        assertTrue(s instanceof SwitchableIndexInputWrapper);
+        IOUtils.close(s, handle);
+    }
+
+    public void testConcurrentClonesRequestExactlyOnce() throws Exception {
+        SwitchableIndexInput in = remoteModeInput();
+        FullFileState st = stateFor(in);
+        RecordingExecutor exec = new RecordingExecutor();
+        SwitchableIndexInputWrapper handle = new PromotableSwitchableIndexInputWrapper("h", in, st, manager(exec, new AtomicLong()));
+
+        int threads = 8;
+        CountDownLatch start = new CountDownLatch(1);
+        Queue<IndexInput> clones = new ConcurrentLinkedQueue<>();
+        List<Thread> workers = new ArrayList<>();
+        for (int i = 0; i < threads; i++) {
+            Thread t = new Thread(() -> {
+                try {
+                    start.await();
+                    clones.add(handle.clone());
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+            });
+            workers.add(t);
+            t.start();
+        }
+        start.countDown();
+        for (Thread t : workers) {
+            t.join();
+        }
+        assertEquals("exactly one promotion request across threads", 1, exec.submitted.get());
+        IOUtils.close(clones);
+        handle.close();
+    }
+
+    public void testNioServedFileIsDeclinedWithoutDownloadAndIsNeverRetried() throws Exception {
+        // End to end through the trigger: the local directory serves the file with NIO, so promotion is declined for
+        // good at admission, with nothing read. Later searches must not trigger again.
+        SwitchableIndexInput in = remoteModeInput();
+        AtomicInteger reads = new AtomicInteger();
+        TransferManager countingTm = new TransferManager((name, position, length) -> {
+            reads.incrementAndGet();
+            return new ByteArrayInputStream(new byte[(int) length]);
+        }, fileCache, threadPool);
+        try (NIOFSDirectory nio = new NIOFSDirectory(localDirectory.getDirectory())) {
+            FullFileState st = stateFor(in, countingTm, nio);
+            AtomicLong clock = new AtomicLong(0);
+            WarmFullFileManager mgr = manager(Runnable::run, clock);
+            SwitchableIndexInputWrapper handle = new PromotableSwitchableIndexInputWrapper("h", in, st, mgr);
+
+            IndexInput first = handle.clone(); // triggers the one and only attempt
+            assertBusy(() -> assertEquals(Long.MAX_VALUE, st.retryAt()), 30, TimeUnit.SECONDS);
+            assertEquals(FullFileState.State.BLOCK, st.state());
+            assertEquals("nothing downloaded", 0, reads.get());
+
+            clock.set(TimeUnit.DAYS.toMillis(365)); // far past any 60 s retry window
+            IndexInput again = handle.clone();
+            assertTrue("still served by blocks", again instanceof SwitchableIndexInputWrapper);
+            assertEquals("never retried", FullFileState.State.BLOCK, st.state());
+            assertEquals("still nothing downloaded", 0, reads.get());
+            assertNull(fileCache.get(getFilePath(localDirectory, FILE_NAME)));
+            IOUtils.close(first, again, handle);
+        }
+    }
+
+    public void testNullManagerMeansFeatureOff() throws IOException {
+        // Non-warm nodes have no FileCache, so Node builds no manager. An eligible handle must still work on blocks.
+        SwitchableIndexInput in = remoteModeInput();
+        FullFileState st = stateFor(in);
+        SwitchableIndexInputWrapper handle = new PromotableSwitchableIndexInputWrapper("h", in, st, null);
+
+        IndexInput c = handle.clone();
+        IndexInput s = handle.slice("s", 0, Math.min(16, in.length()));
+        assertTrue(c instanceof SwitchableIndexInputWrapper);
+        assertTrue(s instanceof SwitchableIndexInputWrapper);
+        assertEquals("no promotion without a manager", FullFileState.State.BLOCK, st.state());
+        handle.close();
+        assertEquals(0, st.handleCount());
+        IOUtils.close(c, s);
+    }
+
+    public void testHandleOfClosedFamilyNeverTriggersOrGetsViews() throws IOException {
+        // A handle whose family closed under it (e.g. cacheFile replaced the entry in the two-thread openInput race) is
+        // CLOSED for good: eligible or not, it never requests a promotion and stays on blocks.
+        SwitchableIndexInput in = remoteModeInput();
+        FullFileState st = stateFor(in);
+        RecordingExecutor exec = new RecordingExecutor();
+        SwitchableIndexInputWrapper handle = new PromotableSwitchableIndexInputWrapper("h", in, st, manager(exec, new AtomicLong()));
+        st.closeFamily();
+
+        IndexInput c = handle.clone();
+        IndexInput s = handle.slice("s", 0, Math.min(16, in.length()));
+        assertEquals("no promotion requested", 0, exec.submitted.get());
+        assertEquals(FullFileState.State.CLOSED, st.state());
+        assertTrue("block clone, not a view", c instanceof SwitchableIndexInputWrapper);
+        assertTrue("block slice, not a view", s instanceof SwitchableIndexInputWrapper);
+        IOUtils.close(c, s, handle);
+    }
+
+    public void testLocalModeHandleTriggersOnlyAfterSwitchToRemote() throws IOException {
+        // The searcher opens its handle while the file is still local (before the upload). Clones and slices taken then
+        // must not request a promotion; the first clone after switchToRemote must.
+        syncLocalAndRemoteForFile(localDirectory, FILE_NAME);
+        SwitchableIndexInput in = newInput(false, transferManager); // local mode: the file has not been uploaded yet
+        FullFileState st = stateFor(in);
+        RecordingExecutor exec = new RecordingExecutor();
+        SwitchableIndexInputWrapper handle = new PromotableSwitchableIndexInputWrapper("h", in, st, manager(exec, new AtomicLong()));
+
+        IndexInput localClone = handle.clone();
+        IndexInput localSlice = handle.slice("s", 0, Math.min(16, in.length()));
+        assertEquals("no request while the file is local", 0, exec.submitted.get());
+        assertEquals(FullFileState.State.BLOCK, st.state());
+
+        in.switchToRemote();
+        assertTrue(in.hasSwitchedToRemote());
+        IndexInput switchedClone = handle.clone();
+        assertEquals(
+            "the input's own flag is not enough: the family is not marked remote until the switch has finished",
+            0,
+            exec.submitted.get()
+        );
+        assertEquals(FullFileState.State.BLOCK, st.state());
+
+        st.markRemoteMode(null); // what TieredDirectory.afterSyncToRemote does once switchFileToRemote has returned
+        IndexInput remoteClone = handle.clone();
+        assertEquals("the first clone after the family is marked remote requests promotion", 1, exec.submitted.get());
+        assertEquals(FullFileState.State.PROMOTING, st.state());
+        IOUtils.close(localClone, localSlice, switchedClone, remoteClone, handle);
+    }
+
+    @TestLogging(value = "org.opensearch.storage.warmfullfile.WarmFullFileManager:DEBUG", reason = "request line is DEBUG")
+    public void testTriggerLogsOneRequestWithTheThreadName() throws Exception {
+        syncLocalAndRemoteForFile(localDirectory, FILE_NAME);
+        SwitchableIndexInput in = newInput(true, transferManager);
+        FullFileState st = stateFor(in);
+        RecordingExecutor exec = new RecordingExecutor();
+        SwitchableIndexInputWrapper handle = new PromotableSwitchableIndexInputWrapper("h", in, st, manager(exec, new AtomicLong()));
+        String loggerName = WarmFullFileManager.class.getName();
+        String expected = "whole-file promotion requested for "
+            + getFilePath(localDirectory, FILE_NAME)
+            + " on thread ["
+            + Thread.currentThread().getName()
+            + "]";
+        AtomicInteger seen = new AtomicInteger();
+        try (MockLogAppender appender = MockLogAppender.createForLoggers(LogManager.getLogger(WarmFullFileManager.class))) {
+            appender.addExpectation(new MockLogAppender.LoggingExpectation() {
+                @Override
+                public void match(LogEvent event) {
+                    if (event.getLevel() == Level.DEBUG
+                        && event.getLoggerName().equals(loggerName)
+                        && event.getMessage().getFormattedMessage().equals(expected)) {
+                        seen.incrementAndGet();
+                    }
+                }
+
+                @Override
+                public void assertMatched() {
+                    assertEquals("one request line for one promotion attempt", 1, seen.get());
+                }
+            });
+            IndexInput c1 = handle.clone(); // wins the CAS: logged
+            IndexInput c2 = handle.clone(); // PROMOTING: no CAS, no line
+            IndexInput s = handle.slice("s", 0, Math.min(16, in.length()));
+            assertEquals(1, exec.submitted.get());
+            appender.assertAllExpectationsMatched();
+            IOUtils.close(c1, c2, s);
+        }
+        handle.close();
+    }
+
+    public void testMergeThreadNeverRequestsPromotion() throws Exception {
+        syncLocalAndRemoteForFile(localDirectory, FILE_NAME);
+        SwitchableIndexInput in = newInput(true, transferManager);
+        FullFileState st = stateFor(in);
+        RecordingExecutor exec = new RecordingExecutor();
+        SwitchableIndexInputWrapper handle = new PromotableSwitchableIndexInputWrapper("h", in, st, manager(exec, new AtomicLong()));
+
+        // The same clone and slice calls a merge makes, on the kind of thread Lucene runs merges on.
+        Queue<IndexInput> mergeInputs = new ConcurrentLinkedQueue<>();
+        Thread merge = mergeThread(() -> {
+            mergeInputs.add(handle.clone());
+            mergeInputs.add(handle.slice("s", 0, Math.min(16, in.length())));
+        });
+        merge.start();
+        merge.join();
+        assertEquals("a merge thread never requests promotion", 0, exec.submitted.get());
+        assertEquals(FullFileState.State.BLOCK, st.state());
+
+        // A search thread does.
+        IndexInput searchClone = handle.clone();
+        assertEquals(1, exec.submitted.get());
+        assertEquals(FullFileState.State.PROMOTING, st.state());
+        IOUtils.close(mergeInputs);
+        IOUtils.close(searchClone, handle);
+    }
+
+    /** A real {@code ConcurrentMergeScheduler.MergeThread}, as Lucene runs merges on, that runs {@code body} instead of a merge. */
+    private static Thread mergeThread(Runnable body) throws IOException {
+        try (ByteBuffersDirectory segments = new ByteBuffersDirectory()) {
+            try (IndexWriter writer = new IndexWriter(segments, new IndexWriterConfig())) {
+                writer.addDocument(new Document());
+                writer.commit();
+            }
+            SegmentCommitInfo segment = SegmentInfos.readLatestCommit(segments).asList().get(0);
+            return new MergeThreadFactory().newMergeThread(new MergePolicy.OneMerge(List.of(segment)), body);
+        }
+    }
+
+    /** {@code MergeThread} is a protected member type of the scheduler, so only a subclass can construct one. */
+    private static final class MergeThreadFactory extends ConcurrentMergeScheduler {
+        Thread newMergeThread(MergePolicy.OneMerge merge, Runnable body) {
+            return new MergeThread(mock(MergeScheduler.MergeSource.class), merge) {
+                @Override
+                public void run() {
+                    body.run();
+                }
+            };
+        }
+    }
+
+    public void testNoRequestBeforeRetryAt() throws IOException {
+        SwitchableIndexInput in = remoteModeInput();
+        FullFileState st = stateFor(in);
+        AtomicLong clock = new AtomicLong(1_000);
+        assertTrue(st.onAccess(0));
+        assertTrue(st.abandonPromotion(5_000));
+        RecordingExecutor exec = new RecordingExecutor();
+        SwitchableIndexInputWrapper handle = new PromotableSwitchableIndexInputWrapper("h", in, st, manager(exec, clock));
+
+        IndexInput early = handle.clone();
+        assertEquals("before retryAt", 0, exec.submitted.get());
+        clock.set(5_000);
+        IndexInput due = handle.clone();
+        assertEquals("at retryAt", 1, exec.submitted.get());
+        IOUtils.close(early, due, handle);
+    }
+
+    public void testNoRequestWhileFull() throws IOException {
+        SwitchableIndexInput in = remoteModeInput();
+        FullFileState st = stateFor(in);
+        RecordingExecutor exec = new RecordingExecutor();
+        SwitchableIndexInputWrapper handle = new PromotableSwitchableIndexInputWrapper("h", in, st, manager(exec, new AtomicLong()));
+        IndexInput master = openMaster(in.length());
+        makeFull(st, master);
+
+        IndexInput c = handle.clone();
+        IndexInput s = handle.slice("s", 0, Math.min(16, in.length()));
+        assertEquals(0, exec.submitted.get());
+        IOUtils.close(c, s, handle, master);
+    }
+
+    public void testSubmitRejectedReturnsToBlock() throws IOException {
+        SwitchableIndexInput in = remoteModeInput();
+        FullFileState st = stateFor(in);
+        Executor rejecting = command -> { throw new RejectedExecutionException("full"); };
+        SwitchableIndexInputWrapper handle = new PromotableSwitchableIndexInputWrapper("h", in, st, manager(rejecting, new AtomicLong()));
+
+        IndexInput c = handle.clone();
+        assertEquals(FullFileState.State.BLOCK, st.state());
+        assertTrue(c instanceof SwitchableIndexInputWrapper);
+        IOUtils.close(c, handle);
+    }
+
+    // ---------------- Views ----------------
+
+    public void testCloneWhenFullReturnsViewWithMatchingBytesAndPosition() throws IOException {
+        SwitchableIndexInput in = remoteModeInput();
+        long len = in.length();
+        assumeTrue("need a few bytes to test", len >= 8);
+        FullFileState st = stateFor(in);
+        SwitchableIndexInputWrapper handle = new PromotableSwitchableIndexInputWrapper(
+            "h",
+            in,
+            st,
+            manager(new RecordingExecutor(), new AtomicLong())
+        );
+        IndexInput master = openMaster(len);
+        makeFull(st, master);
+
+        long pos = len / 2;
+        handle.seek(pos);
+        IndexInput view = handle.clone();
+        assertFalse("view, not a block wrapper", view instanceof SwitchableIndexInputWrapper);
+        assertEquals("clone keeps the file pointer", pos, view.getFilePointer());
+        assertEquals(len, view.length());
+        assertEquals(expected(pos), view.readByte());
+
+        view.seek(0);
+        byte[] all = new byte[(int) len];
+        view.readBytes(all, 0, all.length);
+        for (int i = 0; i < len; i++) {
+            assertEquals("byte " + i, expected(i), all[i]);
+        }
+        IOUtils.close(view, handle, master);
+    }
+
+    public void testSliceAndSliceOfSliceWhenFull() throws IOException {
+        SwitchableIndexInput in = remoteModeInput();
+        long len = in.length();
+        assumeTrue("need room for nested slices", len >= 16);
+        FullFileState st = stateFor(in);
+        SwitchableIndexInputWrapper handle = new PromotableSwitchableIndexInputWrapper(
+            "h",
+            in,
+            st,
+            manager(new RecordingExecutor(), new AtomicLong())
+        );
+        IndexInput master = openMaster(len);
+        makeFull(st, master);
+
+        long off = len / 4;
+        long sliceLen = len / 2;
+        IndexInput slice = handle.slice("s", off, sliceLen);
+        assertFalse(slice instanceof SwitchableIndexInputWrapper);
+        assertEquals("slice starts at 0", 0, slice.getFilePointer());
+        assertEquals(sliceLen, slice.length());
+        for (int i = 0; i < sliceLen; i++) {
+            assertEquals(expected(off + i), slice.readByte());
+        }
+
+        long off2 = sliceLen / 4;
+        IndexInput nested = slice.slice("ss", off2, sliceLen / 2);
+        assertEquals(expected(off + off2), nested.readByte());
+
+        if (slice instanceof RandomAccessInput rai) {
+            assertEquals("positional read", expected(off + 3), rai.readByte(3));
+        }
+        IOUtils.close(nested, slice, handle, master);
+    }
+
+    public void testBlockCloneTakenBeforeFullStaysABlockInput() throws IOException {
+        SwitchableIndexInput in = remoteModeInput();
+        long len = in.length();
+        FullFileState st = stateFor(in);
+        // No manager: the clone below must not trigger, so the test can move the state to FULL by hand.
+        SwitchableIndexInputWrapper handle = new PromotableSwitchableIndexInputWrapper("h", in, st, null);
+
+        IndexInput before = handle.clone();
+        IndexInput master = openMaster(len);
+        makeFull(st, master);
+        IndexInput after = handle.clone();
+
+        assertTrue("clones taken before FULL are never switched", before instanceof SwitchableIndexInputWrapper);
+        assertFalse("new clones get views once FULL", after instanceof SwitchableIndexInputWrapper);
+        // The pre-FULL clone still reads (block data in this fixture is all zeros).
+        assertEquals(0, before.readByte());
+        IOUtils.close(before, after, handle, master);
+    }
+
+    /**
+     * Writes a master of exactly {@code length} bytes with one value of each type at known positions (little-endian, as
+     * Lucene's DataOutput writes), then zero padding. Returns the positions in write order.
+     */
+    private long[] writeTypedMaster(String name, long length) throws IOException {
+        long[] pos = new long[8];
+        try (IndexOutput out = localDirectory.createOutput(name, IOContext.DEFAULT)) {
+            pos[0] = out.getFilePointer();
+            out.writeByte((byte) 0x5A);
+            pos[1] = out.getFilePointer();
+            out.writeShort((short) 0x1234);
+            pos[2] = out.getFilePointer();
+            out.writeInt(0xCAFEBABE);
+            pos[3] = out.getFilePointer();
+            out.writeLong(0x0123456789ABCDEFL);
+            pos[4] = out.getFilePointer();
+            out.writeVInt(300);
+            pos[5] = out.getFilePointer();
+            out.writeVLong(1L << 40);
+            pos[6] = out.getFilePointer();
+            for (float f : new float[] { 1.5f, -2.25f, 3.0f, 0.125f }) {
+                out.writeInt(Float.floatToIntBits(f));
+            }
+            pos[7] = out.getFilePointer();
+            for (long l : new long[] { 7L, -9L, Long.MAX_VALUE }) {
+                out.writeLong(l);
+            }
+            while (out.getFilePointer() < length) {
+                out.writeByte((byte) 0);
+            }
+        }
+        return pos;
+    }
+
+    public void testViewsMatchEveryReadMethod() throws IOException {
+        SwitchableIndexInput in = remoteModeInput();
+        long len = in.length();
+        assumeTrue("fixture must hold the typed header", len >= 128);
+        FullFileState st = stateFor(in);
+        SwitchableIndexInputWrapper handle = new PromotableSwitchableIndexInputWrapper(
+            "h",
+            in,
+            st,
+            manager(new RecordingExecutor(), new AtomicLong())
+        );
+        long[] p = writeTypedMaster("typed.bin", len);
+        IndexInput master = localDirectory.openInput("typed.bin", IOContext.DEFAULT);
+        makeFull(st, master);
+
+        // Sequential reads on a clone view.
+        IndexInput view = handle.clone();
+        assertFalse(view instanceof SwitchableIndexInputWrapper);
+        view.seek(0);
+        assertEquals((byte) 0x5A, view.readByte());
+        assertEquals((short) 0x1234, view.readShort());
+        assertEquals(0xCAFEBABE, view.readInt());
+        assertEquals(0x0123456789ABCDEFL, view.readLong());
+        assertEquals(300, view.readVInt());
+        assertEquals(1L << 40, view.readVLong());
+        float[] floats = new float[4];
+        view.readFloats(floats, 0, 4);
+        assertArrayEquals(new float[] { 1.5f, -2.25f, 3.0f, 0.125f }, floats, 0f);
+        long[] longs = new long[3];
+        view.readLongs(longs, 0, 3);
+        assertArrayEquals(new long[] { 7L, -9L, Long.MAX_VALUE }, longs);
+
+        // readBytes with an offset into the destination array.
+        view.seek(p[2]);
+        byte[] dst = new byte[6];
+        view.readBytes(dst, 2, 4);
+        assertEquals((byte) 0xBE, dst[2]); // little-endian low byte of 0xCAFEBABE
+        assertEquals((byte) 0xCA, dst[5]);
+
+        // Positional reads (RandomAccessInput) on the clone view do not move the file pointer.
+        RandomAccessInput rai = (RandomAccessInput) view;
+        long before = view.getFilePointer();
+        assertEquals((byte) 0x5A, rai.readByte(p[0]));
+        assertEquals((short) 0x1234, rai.readShort(p[1]));
+        assertEquals(0xCAFEBABE, rai.readInt(p[2]));
+        assertEquals(0x0123456789ABCDEFL, rai.readLong(p[3]));
+        assertEquals(before, view.getFilePointer());
+
+        // A slice view is re-based to 0: the int at p[2] is at 0, the long right after it at 4.
+        IndexInput slice = handle.slice("s", p[2], 12);
+        assertEquals(0xCAFEBABE, slice.readInt());
+        assertEquals(0x0123456789ABCDEFL, ((RandomAccessInput) slice).readLong(4));
+        IOUtils.close(slice, view, handle, master);
+    }
+
+    public void testViewsAreRealMmapInputsWithCorrectSegmentBytes() throws Exception {
+        SwitchableIndexInput in = remoteModeInput();
+        long len = in.length();
+        assumeTrue("need a few bytes", len >= 64);
+        FullFileState st = stateFor(in);
+        SwitchableIndexInputWrapper handle = new PromotableSwitchableIndexInputWrapper(
+            "h",
+            in,
+            st,
+            manager(new RecordingExecutor(), new AtomicLong())
+        );
+        // FSDirectory.open on a 64-bit JVM is an MMapDirectory, so the master is a real mmap input.
+        IndexInput master = openMaster(len);
+        makeFull(st, master);
+
+        IndexInput view = handle.clone();
+        assertTrue("views must be Lucene's mmap input so k-NN's SIMD scorer can engage", view instanceof MemorySegmentAccessInput);
+        IndexInput slice = handle.slice("s", 10, 32);
+        assertTrue(slice instanceof MemorySegmentAccessInput);
+
+        // segmentSliceOrNull returns a segment over the right bytes. Called reflectively so this test does not
+        // reference the foreign-memory API directly (a preview API on JDK 21); the segment is read through its
+        // ByteBuffer view.
+        long segPos = 7;
+        long segLen = 20;
+        Method sliceOrNull = MemorySegmentAccessInput.class.getMethod("segmentSliceOrNull", long.class, long.class);
+        Method asByteBuffer = sliceOrNull.getReturnType().getMethod("asByteBuffer");
+        Object segment = sliceOrNull.invoke(view, segPos, segLen);
+        assertNotNull("single-chunk mapping must expose a segment", segment);
+        byte[] bytes = toBytes((ByteBuffer) asByteBuffer.invoke(segment));
+        assertEquals(segLen, bytes.length);
+        for (int i = 0; i < segLen; i++) {
+            assertEquals("segment byte " + i, expected(segPos + i), bytes[i]);
+        }
+
+        // On a slice view, positions are relative to the slice start.
+        Object sliceSegment = sliceOrNull.invoke(slice, 0L, 4L);
+        byte[] sliceBytes = toBytes((ByteBuffer) asByteBuffer.invoke(sliceSegment));
+        assertEquals(4, sliceBytes.length);
+        for (int i = 0; i < 4; i++) {
+            assertEquals(expected(10 + i), sliceBytes[i]);
+        }
+        IOUtils.close(slice, view, handle, master);
+    }
+
+    private static byte[] toBytes(ByteBuffer buffer) {
+        byte[] bytes = new byte[buffer.remaining()];
+        buffer.get(bytes);
+        return bytes;
+    }
+
+    public void testSliceBeyondHandleWindowIsRejectedWhenFull() throws IOException {
+        SwitchableIndexInput in = remoteModeInput();
+        long len = in.length();
+        assumeTrue("need room for a sub-window", len >= 64);
+        FullFileState st = stateFor(in);
+        SwitchableIndexInputWrapper handle = new PromotableSwitchableIndexInputWrapper(
+            "h",
+            in,
+            st,
+            manager(new RecordingExecutor(), new AtomicLong())
+        );
+        IndexInput master = openMaster(len);
+        makeFull(st, master);
+
+        // In-bounds slices are views.
+        IndexInput ok = handle.slice("ok", 8, 16);
+        assertTrue(ok instanceof MemorySegmentAccessInput);
+
+        // The handle's window is [0, len). Slicing past its end (or before its start) must fail, as on the block path,
+        // even though a larger master could serve those bytes.
+        expectThrows(IllegalArgumentException.class, () -> handle.slice("too-far", len - 4, 8));
+        expectThrows(IllegalArgumentException.class, () -> handle.slice("negative", -1, 4));
+        IOUtils.close(ok, handle, master);
+    }
+
+    public void testSliceOfSliceHandleCannotEscapeItsWindowWhenFull() throws IOException {
+        SwitchableIndexInput in = remoteModeInput();
+        long len = in.length();
+        assumeTrue("need room for a sub-window", len >= 64);
+        FullFileState st = stateFor(in);
+        // No manager: the slice below must not trigger, so the test can move the state to FULL by hand.
+        SwitchableIndexInputWrapper handle = new PromotableSwitchableIndexInputWrapper("h", in, st, null);
+
+        // Take a block slice BEFORE FULL (a wrapper over a 16-byte sub-window), then go FULL.
+        IndexInput window = handle.slice("w", 8, 16);
+        assertTrue(window instanceof SwitchableIndexInputWrapper);
+        IndexInput master = openMaster(len);
+        makeFull(st, master);
+
+        // Slicing that 16-byte window: in bounds is a view at the right absolute offset; out of bounds is rejected,
+        // even though the master holds bytes past the window.
+        IndexInput inner = window.slice("inner", 4, 8);
+        assertTrue(inner instanceof MemorySegmentAccessInput);
+        assertEquals(expected(8 + 4), inner.readByte());
+        expectThrows(IllegalArgumentException.class, () -> window.slice("escape", 12, 8));
+        IOUtils.close(inner, window, handle, master);
+    }
+
+    // ---------------- Whole flow ----------------
+
+    public void testWrapperTriggersRealPromotionAndNextCloneIsView() throws Exception {
+        SwitchableIndexInput in = remoteModeInput();
+        long len = in.length();
+        FullFileState st = stateFor(in);
+        // Production constructor with 1 processor: 1 segment (budget = half the cache) and 1 slot. promote() runs inline
+        // on the calling thread; the download itself runs on the REMOTE_RECOVERY pool inside fetchBlobAsync.
+        WarmFullFileManager realManager = new WarmFullFileManager(fileCache, Runnable::run, threadPool::relativeTimeInMillis, 1);
+        realManager.onExtensionsChanged(Set.of(WarmFullFileSettings.extensionOf(FILE_NAME)));
+        SwitchableIndexInputWrapper handle = new PromotableSwitchableIndexInputWrapper("h", in, st, realManager);
+
+        // First clone: still blocks, and it starts the real promotion.
+        IndexInput first = handle.clone();
+        assertTrue("first clone is a block input", first instanceof SwitchableIndexInputWrapper);
+
+        assertBusy(() -> assertEquals(FullFileState.State.FULL, st.state()), 30, TimeUnit.SECONDS);
+        assertNotNull(st.localMaster());
+        assertTrue("whole file downloaded next to the shard files", Files.exists(getFilePath(localDirectory, FILE_NAME)));
+        assertEquals(len, localDirectory.fileLength(FILE_NAME));
+        assertNotNull("whole file is in the FileCache", fileCache.get(getFilePath(localDirectory, FILE_NAME)));
+        fileCache.decRef(getFilePath(localDirectory, FILE_NAME)); // undo the get() above
+
+        // Next clone: a view of the local mapping, reading the same bytes (all zeros in this fixture).
+        IndexInput second = handle.clone();
+        assertTrue("next clone is a whole-file view", second instanceof MemorySegmentAccessInput);
+        assertEquals(len, second.length());
+        assertEquals(0, second.readByte());
+        // The block clone taken before promotion is never switched. (Reading it here is not asserted: populateData()
+        // mocks every remote read with ONE shared IndexInput, which the whole-file download has already consumed, so a
+        // later block fetch would read an exhausted stream. Reading pre-FULL block clones next to views is covered by
+        // testBlockCloneTakenBeforeFullStaysABlockInput, which does not download.)
+        assertTrue(first instanceof SwitchableIndexInputWrapper);
+        IOUtils.close(second, first, handle);
+    }
+
+    /**
+     * A TransferManager serving slices of {@code content}, so a whole-file download returns exactly those bytes.
+     * populateData() serves every remote read from ONE shared mock stream, which other reads of the same test consume.
+     */
+    private TransferManager downloadTransferManager(byte[] content) {
+        return new TransferManager(
+            (name, position, length) -> new ByteArrayInputStream(content, (int) position, (int) length),
+            fileCache,
+            threadPool
+        );
+    }
+
+    /** The fixture file's length of bytes ending in a Lucene footer, as a whole-file download must to pass its checksum check. */
+    private byte[] footeredContent() throws IOException {
+        long length = remoteSegmentStoreDirectory.fileLength(FILE_NAME);
+        String temp = "footered.tmp";
+        try (IndexOutput out = localDirectory.createOutput(temp, IOContext.DEFAULT)) {
+            for (long i = 0; i < length - CodecUtil.footerLength(); i++) {
+                out.writeByte((byte) i);
+            }
+            CodecUtil.writeFooter(out);
+        }
+        byte[] content = Files.readAllBytes(getFilePath(localDirectory, temp));
+        localDirectory.deleteFile(temp);
+        return content;
+    }
+
+    /** The footer checksum of {@code content} as the remote store would record it. */
+    private static String footerChecksum(byte[] content) throws IOException {
+        return Long.toString(CodecUtil.retrieveChecksum(new ByteArrayIndexInput("content", content)));
+    }
+
+    // ---------------- ownership and deferred close ----------------
+
+    public void testTriggerFollowsTheSettingAtTriggerTime() throws IOException {
+        // The handle was opened as eligible, but the setting is read again at trigger time: with the extension gone
+        // nothing is requested, and once it is back the next clone requests the promotion.
+        SwitchableIndexInput in = remoteModeInput();
+        FullFileState st = stateFor(in);
+        RecordingExecutor exec = new RecordingExecutor();
+        WarmFullFileManager manager = manager(exec, new AtomicLong());
+        SwitchableIndexInputWrapper handle = new PromotableSwitchableIndexInputWrapper("h", in, st, manager);
+
+        manager.onExtensionsChanged(Set.of());
+        IndexInput off = handle.clone();
+        assertEquals("no request while the extension is not configured", 0, exec.submitted.get());
+        assertEquals(FullFileState.State.BLOCK, st.state());
+
+        manager.onExtensionsChanged(Set.of(WarmFullFileSettings.extensionOf(FILE_NAME)));
+        IndexInput on = handle.clone();
+        assertEquals("requested once the extension is configured again", 1, exec.submitted.get());
+        assertEquals(FullFileState.State.PROMOTING, st.state());
+        IOUtils.close(off, on, handle);
+    }
+
+    public void testDemotedFamilyServesBlocksReleasesAfterItsHandleAndPromotesAgain() throws Exception {
+        // A FULL family loses its extension from the setting while a handle and a view are open: new clones go back
+        // to blocks at once and nothing is requested, the open view keeps reading, and once the handle closes the
+        // mapping, the whole file and the budget are released. With the extension back, a new handle promotes again.
+        Path switchKey = getFilePathSwitchable(localDirectory, FILE_NAME);
+        Path fullPath = getFilePath(localDirectory, FILE_NAME);
+        byte[] content = footeredContent();
+        PromotableCachedSwitchableIndexInput entry = new PromotableCachedSwitchableIndexInput(
+            fileCache,
+            FILE_NAME,
+            localDirectory,
+            remoteSegmentStoreDirectory,
+            downloadTransferManager(content),
+            true,
+            threadPool,
+            PREFETCH
+        );
+        fileCache.put(switchKey, entry);
+        fileCache.decRef(switchKey);
+        FullFileState st = entry.fullFileState();
+        st.markRemoteMode(footerChecksum(content)); // the fixture metadata's checksum belongs to no real bytes
+        WarmFullFileManager realManager = new WarmFullFileManager(
+            fileCache,
+            threadPool.executor(ThreadPool.Names.REMOTE_RECOVERY),
+            threadPool::relativeTimeInMillis,
+            1
+        );
+        realManager.onExtensionsChanged(Set.of(WarmFullFileSettings.extensionOf(FILE_NAME)));
+        SwitchableIndexInputWrapper handle = new PromotableSwitchableIndexInputWrapper(
+            "h",
+            (SwitchableIndexInput) entry.getIndexInput().clone(),
+            st,
+            realManager
+        );
+        handle.clone(); // trigger
+        assertBusy(() -> assertEquals(FullFileState.State.FULL, st.state()), 30, TimeUnit.SECONDS);
+        IndexInput view = handle.clone();
+        assertTrue(view instanceof MemorySegmentAccessInput);
+        long requestedBefore = realManager.counters().get("requested").longValue();
+
+        realManager.onExtensionsChanged(Set.of());
+
+        assertEquals(FullFileState.State.BLOCK, st.state());
+        assertEquals(1L, realManager.counters().get("demoted").longValue());
+        assertTrue("release waits for the open handle", st.isMappingReleasePending());
+        IndexInput block = handle.clone();
+        assertTrue("new clones read blocks", block instanceof SwitchableIndexInputWrapper);
+        assertEquals(
+            "no promotion requested while the old mapping is held",
+            requestedBefore,
+            realManager.counters().get("requested").longValue()
+        );
+        assertEquals("the open view keeps reading", 0, view.readByte());
+        assertEquals("the family still holds its reference", Integer.valueOf(1), fileCache.getRef(fullPath));
+        assertEquals(content.length, realManager.counters().get("reservedBytes").longValue());
+
+        block.close();
+        handle.close();
+        assertBusy(() -> assertTrue(st.cleanupDone()), 30, TimeUnit.SECONDS);
+        assertNull("mapping released", st.localMaster());
+        assertNull("whole file dropped from the cache", fileCache.getRef(fullPath));
+        assertFalse(Files.exists(fullPath));
+        assertEquals("budget released", 0L, realManager.counters().get("reservedBytes").longValue());
+        assertFalse(st.isMappingReleasePending());
+
+        realManager.onExtensionsChanged(Set.of(WarmFullFileSettings.extensionOf(FILE_NAME)));
+        SwitchableIndexInputWrapper again = new PromotableSwitchableIndexInputWrapper(
+            "h2",
+            (SwitchableIndexInput) entry.getIndexInput().clone(),
+            st,
+            realManager
+        );
+        again.clone(); // trigger
+        assertBusy(() -> assertEquals(FullFileState.State.FULL, st.state()), 30, TimeUnit.SECONDS);
+        assertEquals(2L, realManager.counters().get("promoted").longValue());
+        IndexInput viewAgain = again.clone();
+        assertTrue(viewAgain instanceof MemorySegmentAccessInput);
+        IOUtils.close(viewAgain, again);
+        fileCache.remove(switchKey);
+        assertBusy(() -> assertTrue(st.cleanupDone()), 30, TimeUnit.SECONDS);
+    }
+
+    public void testReEnablingWhileTheHandleIsOpenServesViewsAgainWithoutADownload() throws Exception {
+        // The setting drops the extension and lists it again while the reader's handle stays open throughout: the
+        // family is demoted, then restored from the mapping it still holds, and the next clone is a view again with
+        // no download and no new promotion request.
+        Path switchKey = getFilePathSwitchable(localDirectory, FILE_NAME);
+        byte[] content = footeredContent();
+        PromotableCachedSwitchableIndexInput entry = new PromotableCachedSwitchableIndexInput(
+            fileCache,
+            FILE_NAME,
+            localDirectory,
+            remoteSegmentStoreDirectory,
+            downloadTransferManager(content),
+            true,
+            threadPool,
+            PREFETCH
+        );
+        fileCache.put(switchKey, entry);
+        fileCache.decRef(switchKey);
+        FullFileState st = entry.fullFileState();
+        st.markRemoteMode(footerChecksum(content));
+        WarmFullFileManager realManager = new WarmFullFileManager(
+            fileCache,
+            threadPool.executor(ThreadPool.Names.REMOTE_RECOVERY),
+            threadPool::relativeTimeInMillis,
+            1
+        );
+        realManager.onExtensionsChanged(Set.of(WarmFullFileSettings.extensionOf(FILE_NAME)));
+        SwitchableIndexInputWrapper handle = new PromotableSwitchableIndexInputWrapper(
+            "h",
+            (SwitchableIndexInput) entry.getIndexInput().clone(),
+            st,
+            realManager
+        );
+        handle.clone(); // trigger
+        assertBusy(() -> assertEquals(FullFileState.State.FULL, st.state()), 30, TimeUnit.SECONDS);
+        IndexInput master = st.localMaster();
+        long requestedBefore = realManager.counters().get("requested").longValue();
+
+        realManager.onExtensionsChanged(Set.of());
+        IndexInput block = handle.clone();
+        assertTrue("blocks while demoted", block instanceof SwitchableIndexInputWrapper);
+
+        realManager.onExtensionsChanged(Set.of(WarmFullFileSettings.extensionOf(FILE_NAME)));
+
+        assertEquals(FullFileState.State.FULL, st.state());
+        assertSame("the held mapping is served again", master, st.localMaster());
+        IndexInput view = handle.clone();
+        assertTrue("views again after the restore", view instanceof MemorySegmentAccessInput);
+        assertEquals(0, view.readByte());
+        assertEquals("no promotion was requested", requestedBefore, realManager.counters().get("requested").longValue());
+        assertEquals(1L, realManager.counters().get("promoted").longValue());
+        assertEquals(1L, realManager.counters().get("restored").longValue());
+        assertEquals(content.length, realManager.counters().get("reservedBytes").longValue());
+
+        IOUtils.close(view, block, handle);
+        fileCache.remove(switchKey);
+        assertBusy(() -> assertTrue(st.cleanupDone()), 30, TimeUnit.SECONDS);
+    }
+
+    public void testDeferredCloseKeepsMappingUntilLastHandleThenReleasesEverything() throws Exception {
+        Path switchKey = getFilePathSwitchable(localDirectory, FILE_NAME);
+        Path fullPath = getFilePath(localDirectory, FILE_NAME);
+        byte[] content = footeredContent();
+        // The family's cache entry, as TieredDirectory.cacheFile creates it.
+        PromotableCachedSwitchableIndexInput entry = new PromotableCachedSwitchableIndexInput(
+            fileCache,
+            FILE_NAME,
+            localDirectory,
+            remoteSegmentStoreDirectory,
+            downloadTransferManager(content),
+            true,
+            threadPool,
+            PREFETCH
+        );
+        fileCache.put(switchKey, entry);
+        fileCache.decRef(switchKey);
+        FullFileState st = entry.fullFileState();
+        st.markRemoteMode(footerChecksum(content)); // the fixture metadata's checksum belongs to no real bytes
+        // Real pool: the cleanup must run off the FileCache listener thread, as in production.
+        WarmFullFileManager realManager = new WarmFullFileManager(
+            fileCache,
+            threadPool.executor(ThreadPool.Names.REMOTE_RECOVERY),
+            threadPool::relativeTimeInMillis,
+            1
+        );
+        realManager.onExtensionsChanged(Set.of(WarmFullFileSettings.extensionOf(FILE_NAME)));
+        SwitchableIndexInputWrapper handle = new PromotableSwitchableIndexInputWrapper(
+            "h",
+            (SwitchableIndexInput) entry.getIndexInput().clone(),
+            st,
+            realManager
+        );
+
+        handle.clone(); // trigger
+        assertBusy(() -> assertEquals(FullFileState.State.FULL, st.state()), 30, TimeUnit.SECONDS);
+        assertEquals("after FULL the whole-file entry has exactly one reference", Integer.valueOf(1), fileCache.getRef(fullPath));
+        IndexInput view = handle.clone();
+        assertTrue(view instanceof MemorySegmentAccessInput);
+
+        // fileCache.remove ignores refcounts and closes the family (the deleteFile/prune/close path) while a view is open.
+        fileCache.remove(switchKey);
+        assertEquals(FullFileState.State.CLOSED, st.state());
+        assertFalse("not unmapped while a handle is open", st.cleanupDone());
+        assertEquals("the view keeps reading", 0, view.readByte());
+        assertEquals(Integer.valueOf(1), fileCache.getRef(fullPath));
+
+        // Last handle closes: the deferred cleanup closes the family's master and releases its reference.
+        IndexInput master = st.localMaster();
+        handle.close();
+        assertBusy(() -> assertTrue(st.cleanupDone()), 30, TimeUnit.SECONDS);
+        assertNull("master released", st.localMaster());
+        assertEquals(Integer.valueOf(0), fileCache.getRef(fullPath));
+        // The family's master is closed. (Whether a stale view then throws is up to Lucene: since 10.x, MMapDirectory
+        // groups a segment's files into one ref-counted shared Arena, so the memory is unmapped only after every input
+        // in the group closes. Not asserted here; it is not part of the wrapper's contract.)
+        expectThrows(AlreadyClosedException.class, master::readByte);
+
+        // The whole file is now evictable: prune removes the entry and deletes the file.
+        fileCache.prune();
+        assertNull(fileCache.getRef(fullPath));
+        assertFalse(Files.exists(fullPath));
+        view.close();
+    }
+
+    public void testFamilyClosedWithoutHandlesCleansUpOnPoolNotOnRemovingThread() throws Exception {
+        Path switchKey = getFilePathSwitchable(localDirectory, FILE_NAME);
+        byte[] content = footeredContent();
+        PromotableCachedSwitchableIndexInput entry = new PromotableCachedSwitchableIndexInput(
+            fileCache,
+            FILE_NAME,
+            localDirectory,
+            remoteSegmentStoreDirectory,
+            downloadTransferManager(content),
+            true,
+            threadPool,
+            PREFETCH
+        );
+        fileCache.put(switchKey, entry);
+        fileCache.decRef(switchKey);
+        FullFileState st = entry.fullFileState();
+        st.markRemoteMode(footerChecksum(content)); // the fixture metadata's checksum belongs to no real bytes
+        // Runs promote() and the download for real, but holds the cleanup to show that it is not run inline.
+        List<Runnable> held = new CopyOnWriteArrayList<>();
+        AtomicBoolean holdCleanup = new AtomicBoolean(false);
+        Executor exec = command -> {
+            if (holdCleanup.get()) {
+                held.add(command);
+            } else {
+                threadPool.executor(ThreadPool.Names.REMOTE_RECOVERY).execute(command);
+            }
+        };
+        WarmFullFileManager realManager = new WarmFullFileManager(fileCache, exec, threadPool::relativeTimeInMillis, 1);
+        realManager.onExtensionsChanged(Set.of(WarmFullFileSettings.extensionOf(FILE_NAME)));
+        SwitchableIndexInputWrapper handle = new PromotableSwitchableIndexInputWrapper(
+            "h",
+            (SwitchableIndexInput) entry.getIndexInput().clone(),
+            st,
+            realManager
+        );
+        handle.clone();
+        assertBusy(() -> assertEquals(FullFileState.State.FULL, st.state()), 30, TimeUnit.SECONDS);
+        handle.close(); // no handles left; the family is still open
+        holdCleanup.set(true);
+
+        // Remove on this thread: the removal listener runs closeFamily() here. The cleanup re-enters the FileCache
+        // (decRef), so it must be handed to the pool, never run on this (lock-holding) thread.
+        fileCache.remove(switchKey);
+        assertEquals(FullFileState.State.CLOSED, st.state());
+        assertEquals("cleanup handed to the pool", 1, held.size());
+        assertFalse("and not run inline", st.cleanupDone());
+
+        held.get(0).run();
+        assertTrue(st.cleanupDone());
+    }
+
+    // ---------------- Publish-FULL race ----------------
+
+    public void testConcurrentClonesAndSlicesReadCorrectBytesAcrossFullPublication() throws Exception {
+        // Eight threads keep cloning and slicing one handle and reading random positions while a real promotion runs:
+        // before the download (blocks), while the download is held on a gate (blocks), and after FULL is published
+        // (views). Every byte read must match the position-dependent remote content whichever path served it.
+        final String promotionThread = "whole-file-promotion";
+        CountDownLatch downloadReached = new CountDownLatch(1);
+        CountDownLatch downloadGate = new CountDownLatch(1);
+        // Position-aware remote: block reads and the whole-file download both come from here and agree byte for byte.
+        // Only the whole-file download (which runs on the promotion thread) waits on the gate.
+        TransferManager positionAware = new TransferManager((name, position, length) -> {
+            if (Thread.currentThread().getName().equals(promotionThread)) {
+                downloadReached.countDown();
+                try {
+                    if (downloadGate.await(30, TimeUnit.SECONDS) == false) {
+                        throw new IOException("download gate was never opened");
+                    }
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    throw new IOException(e);
+                }
+            }
+            byte[] bytes = new byte[(int) length];
+            for (int i = 0; i < bytes.length; i++) {
+                bytes[i] = expected(position + i);
+            }
+            return new ByteArrayInputStream(bytes);
+        }, fileCache, threadPool);
+        SwitchableIndexInput in = newInput(true, positionAware);
+        final long len = in.length();
+        assumeTrue("need a few bytes to read", len >= 64);
+        FullFileState st = stateFor(in, positionAware, localDirectory);
+        ExecutorService promoter = Executors.newSingleThreadExecutor(r -> new Thread(r, promotionThread));
+        try {
+            SwitchableIndexInputWrapper handle = new PromotableSwitchableIndexInputWrapper(
+                "h",
+                in,
+                st,
+                manager(promoter, new AtomicLong())
+            );
+
+            final int threads = 8;
+            AtomicBoolean stop = new AtomicBoolean(false);
+            AtomicLong iterations = new AtomicLong();
+            AtomicInteger blockResults = new AtomicInteger();
+            AtomicInteger viewResults = new AtomicInteger();
+            AtomicInteger[] viewsPerThread = new AtomicInteger[threads];
+            Queue<Throwable> failures = new ConcurrentLinkedQueue<>();
+            CountDownLatch start = new CountDownLatch(1);
+            List<Thread> workers = new ArrayList<>();
+            for (int t = 0; t < threads; t++) {
+                final AtomicInteger myViews = new AtomicInteger();
+                viewsPerThread[t] = myViews;
+                final Random random = new Random(randomLong());
+                Thread worker = new Thread(() -> {
+                    try {
+                        start.await();
+                        while (stop.get() == false) {
+                            IndexInput clone = handle.clone();
+                            try {
+                                classify(clone, blockResults, viewResults, myViews);
+                                long pos = random.nextInt((int) len);
+                                clone.seek(pos);
+                                byte got = clone.readByte();
+                                if (got != expected(pos)) {
+                                    throw new AssertionError("clone byte at " + pos + ": expected " + expected(pos) + " got " + got);
+                                }
+                                if (clone instanceof RandomAccessInput rai) {
+                                    long rpos = random.nextInt((int) len);
+                                    byte rgot = rai.readByte(rpos);
+                                    if (rgot != expected(rpos)) {
+                                        throw new AssertionError(
+                                            "positional byte at " + rpos + ": expected " + expected(rpos) + " got " + rgot
+                                        );
+                                    }
+                                }
+                            } finally {
+                                clone.close();
+                            }
+                            long off = random.nextInt((int) len);
+                            long sliceLen = 1 + random.nextInt((int) (len - off));
+                            IndexInput slice = handle.slice("s", off, sliceLen);
+                            try {
+                                classify(slice, blockResults, viewResults, myViews);
+                                long k = random.nextInt((int) sliceLen);
+                                slice.seek(k);
+                                byte got = slice.readByte();
+                                if (got != expected(off + k)) {
+                                    throw new AssertionError(
+                                        "slice byte at " + k + " (abs " + (off + k) + "): expected " + expected(off + k) + " got " + got
+                                    );
+                                }
+                            } finally {
+                                slice.close();
+                            }
+                            iterations.incrementAndGet();
+                        }
+                    } catch (Throwable e) {
+                        failures.add(e);
+                    }
+                });
+                workers.add(worker);
+                worker.start();
+            }
+            start.countDown();
+
+            // The first clone or slice triggers the promotion; its download then parks on the gate while readers go on.
+            assertTrue("promotion reached the download", downloadReached.await(30, TimeUnit.SECONDS));
+            assertEquals(FullFileState.State.PROMOTING, st.state());
+            long beforeGate = iterations.get();
+            assertBusy(() -> assertTrue("readers progress while PROMOTING", iterations.get() >= beforeGate + 50), 30, TimeUnit.SECONDS);
+            assertEquals("no views before FULL", 0, viewResults.get());
+            assertTrue("blocks served before FULL", blockResults.get() > 0);
+            assertTrue("no read failures before FULL: " + failures, failures.isEmpty());
+
+            downloadGate.countDown();
+            assertBusy(() -> assertEquals(FullFileState.State.FULL, st.state()), 30, TimeUnit.SECONDS);
+            assertBusy(() -> {
+                for (int t = 0; t < threads; t++) {
+                    assertTrue("thread " + t + " got a view after FULL", viewsPerThread[t].get() >= 1);
+                }
+            }, 30, TimeUnit.SECONDS);
+
+            stop.set(true);
+            for (Thread worker : workers) {
+                worker.join(TimeUnit.SECONDS.toMillis(30));
+                assertFalse("worker finished", worker.isAlive());
+            }
+            if (failures.isEmpty() == false) {
+                AssertionError error = new AssertionError(failures.size() + " read failures, first: " + failures.peek());
+                failures.forEach(error::addSuppressed);
+                throw error;
+            }
+            assertTrue(blockResults.get() > 0);
+            assertTrue(viewResults.get() > 0);
+            assertEquals(FullFileState.State.FULL, st.state());
+            handle.close();
+            assertEquals(0, st.handleCount());
+        } finally {
+            promoter.shutdown();
+            assertTrue(terminate(promoter));
+        }
+    }
+
+    /** Counts a clone/slice result as a block wrapper or a whole-file view, failing on anything else. */
+    private static void classify(IndexInput result, AtomicInteger blocks, AtomicInteger views, AtomicInteger myViews) {
+        if (result instanceof SwitchableIndexInputWrapper) {
+            blocks.incrementAndGet();
+        } else if (result instanceof MemorySegmentAccessInput) {
+            views.incrementAndGet();
+            myViews.incrementAndGet();
+        } else {
+            throw new AssertionError("unexpected input type " + result.getClass().getName());
+        }
+    }
+
+    // ---------------- Handle count ----------------
+
+    public void testOpenedHandleHoldsOneCountReleasedOnceOnClose() throws IOException {
+        SwitchableIndexInput in = remoteModeInput();
+        FullFileState st = stateFor(in);
+        SwitchableIndexInputWrapper handle = new PromotableSwitchableIndexInputWrapper(
+            "h",
+            in,
+            st,
+            manager(new RecordingExecutor(), new AtomicLong())
+        );
+        assertEquals(1, st.handleCount());
+
+        IndexInput c = handle.clone(); // derived wrappers do not count
+        IndexInput s = handle.slice("s", 0, Math.min(16, in.length()));
+        assertEquals(1, st.handleCount());
+
+        handle.close();
+        assertEquals(0, st.handleCount());
+        handle.close(); // idempotent
+        assertEquals(0, st.handleCount());
+        IOUtils.close(c, s);
+    }
+}
