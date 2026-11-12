@@ -147,8 +147,10 @@ public class CompositeDirectory extends FilterDirectory implements RemoteSyncLis
         Set<String> allFiles = Stream.concat(Arrays.stream(localFiles), Arrays.stream(remoteFiles))
             .map(s -> s.contains(BLOCK_FILE_IDENTIFIER) ? s.substring(0, s.indexOf(BLOCK_FILE_IDENTIFIER)) : s)
             .collect(Collectors.toSet());
+        // Block files and in-flight downloads are this directory's own, not Lucene's: a listed but unreferenced
+        // `.download` file would be deleted by IndexFileDeleter or a store cleanup under the running download.
         Set<String> nonBlockLuceneFiles = allFiles.stream()
-            .filter(file -> !FileTypeUtils.isBlockFile(file))
+            .filter(file -> FileTypeUtils.isBlockFile(file) == false && FileTypeUtils.isPartialDownloadFile(file) == false)
             .collect(Collectors.toUnmodifiableSet());
         String[] files = new String[nonBlockLuceneFiles.size()];
         nonBlockLuceneFiles.toArray(files);
@@ -206,30 +208,28 @@ public class CompositeDirectory extends FilterDirectory implements RemoteSyncLis
     public long fileLength(String name) throws IOException {
         ensureOpen();
         logger.trace("Composite Directory[{}]: fileLength() called {}", this::toString, () -> name);
-        long fileLength;
         Path key = getFilePath(name);
         if (FileTypeUtils.isTempFile(name) || fileCache.get(key) != null) {
             try {
-                fileLength = localDirectory.fileLength(name);
+                final long localLength = localDirectory.fileLength(name);
                 logger.trace(
                     "Composite Directory[{}]: fileLength of {} fetched from Local - {}",
                     this::toString,
                     () -> name,
-                    () -> fileLength
+                    () -> localLength
                 );
+                return localLength;
+            } catch (NoSuchFileException e) {
+                // The cache entry outlived its file: it was deleted on the local directory directly, not through the
+                // cache. The remote store still has the file, so answer from there rather than fail the caller.
+                logger.debug("Composite Directory[{}]: {} has a cache entry but no local file; using the remote length", this, name);
             } finally {
                 fileCache.decRef(key);
             }
-        } else {
-            fileLength = remoteDirectory.fileLength(name);
-            logger.trace(
-                "Composite Directory[{}]: fileLength of {} fetched from Remote - {}",
-                this::toString,
-                () -> name,
-                () -> fileLength
-            );
         }
-        return fileLength;
+        final long remoteLength = remoteDirectory.fileLength(name);
+        logger.trace("Composite Directory[{}]: fileLength of {} fetched from Remote - {}", this::toString, () -> name, () -> remoteLength);
+        return remoteLength;
     }
 
     /**

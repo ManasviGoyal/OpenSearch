@@ -23,8 +23,8 @@ import java.lang.ref.Cleaner;
  */
 public class SwitchableIndexInputWrapper extends FilterIndexInput implements RandomAccessInput {
 
-    private final String resourceDescription;
-    private final SwitchableIndexInput switchableIndexInput;
+    final String resourceDescription;
+    final SwitchableIndexInput switchableIndexInput;
     private static final Logger logger = LogManager.getLogger(SwitchableIndexInputWrapper.class);
     private static final Cleaner CLEANER = Cleaner.create(OpenSearchExecutors.daemonThreadFactory("index-input-cleaner"));
 
