@@ -11,23 +11,33 @@ package org.opensearch.storage.directory;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.apache.lucene.index.IndexFileNames;
+import org.apache.lucene.store.DataAccessHint;
 import org.apache.lucene.store.Directory;
+import org.apache.lucene.store.FSDirectory;
 import org.apache.lucene.store.IOContext;
 import org.apache.lucene.store.IndexInput;
+import org.apache.lucene.store.ReadOnceHint;
 import org.opensearch.common.annotation.ExperimentalApi;
 import org.opensearch.index.store.CompositeDirectory;
 import org.opensearch.index.store.RemoteSegmentStoreDirectory;
+import org.opensearch.index.store.remote.file.AbstractBlockIndexInput;
 import org.opensearch.index.store.remote.filecache.CachedIndexInput;
 import org.opensearch.index.store.remote.filecache.FileCache;
 import org.opensearch.index.store.remote.utils.FileTypeUtils;
 import org.opensearch.storage.indexinput.CachedSwitchableIndexInput;
+import org.opensearch.storage.indexinput.PromotableCachedSwitchableIndexInput;
+import org.opensearch.storage.indexinput.PromotableSwitchableIndexInputWrapper;
 import org.opensearch.storage.indexinput.SwitchableIndexInput;
 import org.opensearch.storage.indexinput.SwitchableIndexInputWrapper;
 import org.opensearch.storage.prefetch.TieredStoragePrefetchSettings;
 import org.opensearch.storage.utils.DirectoryUtils;
+import org.opensearch.storage.warmfullfile.FullFileState;
+import org.opensearch.storage.warmfullfile.WarmFullFileManager;
+import org.opensearch.storage.warmfullfile.WarmFullFileSettings;
 import org.opensearch.threadpool.ThreadPool;
 
 import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
 import java.util.Arrays;
@@ -36,6 +46,7 @@ import java.util.function.Supplier;
 import java.util.stream.Stream;
 
 import static org.opensearch.index.store.remote.utils.FileTypeUtils.BLOCK_FILE_IDENTIFIER;
+import static org.opensearch.storage.prefetch.TieredStoragePrefetchSettings.CFS_FILE_SUFFIX;
 import static org.opensearch.storage.utils.DirectoryUtils.getFilePathSwitchable;
 import static org.apache.lucene.index.IndexFileNames.SEGMENTS;
 
@@ -49,17 +60,23 @@ public class TieredDirectory extends CompositeDirectory {
 
     private static final Logger logger = LogManager.getLogger(TieredDirectory.class);
 
+    // A file at or below one block is already served as a single block; a whole-file copy gains nothing.
+    static final long ONE_BLOCK_BYTES = AbstractBlockIndexInput.Builder.DEFAULT_BLOCK_SIZE;
+
     private final Supplier<TieredStoragePrefetchSettings> tieredStoragePrefetchSettingsSupplier;
+    private final WarmFullFileManager warmFullFileManager;
 
     public TieredDirectory(
         Directory localDirectory,
         Directory remoteDirectory,
         FileCache fileCache,
         ThreadPool threadPool,
-        Supplier<TieredStoragePrefetchSettings> tieredStoragePrefetchSettingsSupplier
+        Supplier<TieredStoragePrefetchSettings> tieredStoragePrefetchSettingsSupplier,
+        WarmFullFileManager warmFullFileManager
     ) {
         super(localDirectory, remoteDirectory, fileCache, threadPool);
         this.tieredStoragePrefetchSettingsSupplier = tieredStoragePrefetchSettingsSupplier;
+        this.warmFullFileManager = warmFullFileManager;
     }
 
     @Override
@@ -144,21 +161,66 @@ public class TieredDirectory extends CompositeDirectory {
                 throw new NoSuchFileException("File " + name + " not found in directory");
             }
             // For pre-created files already in remote, switchable entry would not be cached already locally, we need to download from
-            // remote and cache it in FileCache
-            cacheFile(name, true);
-            indexInput = fileCache.get(key);
-            // decrementing the ref here since refCount increases in cacheFile method, but since afterSyncToRemote won't be called (where we
-            // decRef) for files already in remote
-            fileCache.decRef(key);
+            // remote and cache it in FileCache. cacheFile creates the entry only if none is live, so concurrent opens of
+            // the same file share one family. The reference cacheFile leaves is released in the finally block below; for
+            // a locally written file afterSyncToRemote releases it instead.
+            indexInput = cacheFile(name, true);
         }
         try {
-            return new SwitchableIndexInputWrapper(
-                "SwitchableIndexInput (path=" + getFilePath(name) + ")",
-                (SwitchableIndexInput) indexInput.getIndexInput().clone()
-            );
+            SwitchableIndexInput original = (SwitchableIndexInput) indexInput.getIndexInput();
+            String resourceDescription = "SwitchableIndexInput (path=" + getFilePath(name) + ")";
+            // A promotable entry hands out the promotable wrapper, and only to a handle that passes the open-time rules,
+            // decided here because only openInput sees the IOContext. Every other handle is the existing wrapper: it
+            // reads blocks as before, never triggers and never reads the mapping.
+            if (indexInput instanceof PromotableCachedSwitchableIndexInput promotable && isEligibleForFullFile(name, context, original)) {
+                return new PromotableSwitchableIndexInputWrapper(
+                    resourceDescription,
+                    (SwitchableIndexInput) original.clone(),
+                    promotable.fullFileState(),
+                    warmFullFileManager
+                );
+            }
+            return new SwitchableIndexInputWrapper(resourceDescription, (SwitchableIndexInput) original.clone());
         } finally {
             fileCache.decRef(key);
         }
+    }
+
+    /**
+     * Decides, once per opened handle, whether this handle takes part in whole-file promotion (may trigger it and reads
+     * the mapping once FULL) or stays a plain block handle. All conditions must hold:
+     * the file is larger than one block and below the mmap chunk size; the context is a plain DEFAULT read (excludes
+     * merges and FLUSH); and it carries no ReadOnce/SEQUENTIAL hint (excludes recovery checksum reads). Temp/corrupted
+     * files never reach here (handled earlier in openInput).
+     *
+     * <p>The extension is not part of this decision: it selects the entry type when the family is created (see
+     * {@code newSwitchableEntry}), and the wrapper reads the setting again at trigger time so that an extension removed
+     * since then stops promoting. Remote (block) mode is not part of it either: the searcher opens its handles at
+     * refresh time and never reopens them for an unchanged segment, so a handle must be able to become promotable later,
+     * once the segment is uploaded; see {@link FullFileState#markRemoteMode(String)}.
+     */
+    // visible for testing
+    boolean isEligibleForFullFile(String name, IOContext context, SwitchableIndexInput original) {
+        // Not an ordinary Lucene special file: segments, lock or compound file.
+        if (FileTypeUtils.isSegmentsFile(name)
+            || FileTypeUtils.isLockFile(name)
+            || IndexFileNames.matchesExtension(name, CFS_FILE_SUFFIX)) {
+            return false;
+        }
+        if (original.length() <= ONE_BLOCK_BYTES) { // original input: offset 0, length == whole file length
+            return false;
+        }
+        // The mapping must be a single mmap chunk (Lucene's default chunk is 16 GiB). Above that,
+        // closing a view could unmap the master and segmentSliceOrNull returns null (no k-NN SIMD), so do not promote.
+        if (original.length() >= WarmFullFileManager.MAX_WHOLE_FILE_BYTES) {
+            return false;
+        }
+        // Only plain search reads: DEFAULT context (excludes MERGE/FLUSH) with no ReadOnce/SEQUENTIAL hint
+        // (excludes recovery checksum reads via IOContext.READONCE).
+        if (context.context() != IOContext.Context.DEFAULT) {
+            return false;
+        }
+        return context.hints().contains(ReadOnceHint.INSTANCE) == false && context.hints().contains(DataAccessHint.SEQUENTIAL) == false;
     }
 
     @Override
@@ -184,8 +246,14 @@ public class TieredDirectory extends CompositeDirectory {
     public void switchFileToRemote(String file) {
         Path filePath = getFilePathSwitchable(localDirectory, file);
         try {
-            SwitchableIndexInput switchableIndexInput = ((SwitchableIndexInput) fileCache.get(filePath).getIndexInput());
+            CachedIndexInput entry = fileCache.get(filePath);
+            SwitchableIndexInput switchableIndexInput = ((SwitchableIndexInput) entry.getIndexInput());
             switchableIndexInput.switchToRemote();
+            // A promotable family may start promoting only once its local copy is gone, because promotion removes the
+            // family's local cache entry. A family whose switch did not happen keeps serving the local copy on blocks.
+            if (entry instanceof PromotableCachedSwitchableIndexInput promotable && switchableIndexInput.hasSwitchedToRemote()) {
+                promotable.fullFileState().markRemoteMode(FullFileState.uploadedChecksum(remoteDirectory, file));
+            }
         } catch (IOException | IllegalStateException e) {
             logger.error("Failed to switch full file to blocked - " + file, e);
         } finally {
@@ -225,21 +293,72 @@ public class TieredDirectory extends CompositeDirectory {
         cacheFile(fileName, false);
     }
 
+    /**
+     * Caches the file's switchable entry (its family) and returns it with one reference taken for the caller. A locally
+     * written file is put as is: nothing opens it before its output closes, and its entry opens the local file and
+     * calls into the FileCache, which must not happen under a segment lock. A remote-only file is created under the
+     * key's segment lock, only when no live entry exists, so concurrent opens share one family; that entry does no IO
+     * and makes no cache call while it is built.
+     */
     // protected for testing
-    protected void cacheFile(String fileName, boolean cacheFromRemote) throws IOException {
+    protected CachedIndexInput cacheFile(String fileName, boolean cacheFromRemote) throws IOException {
         Path switchableFilePath = getFilePathSwitchable(localDirectory, fileName);
-        fileCache.put(
-            switchableFilePath,
-            new CachedSwitchableIndexInput(
+        if (cacheFromRemote == false) {
+            CachedSwitchableIndexInput entry = newSwitchableEntry(fileName, false);
+            fileCache.put(switchableFilePath, entry);
+            return entry;
+        }
+        try {
+            return fileCache.compute(switchableFilePath, (key, existing) -> {
+                if (existing != null && existing.isClosed() == false) {
+                    return existing;
+                }
+                try {
+                    return newSwitchableEntry(fileName, true);
+                } catch (IOException e) {
+                    throw new UncheckedIOException(e);
+                }
+            });
+        } catch (UncheckedIOException e) {
+            throw e.getCause();
+        }
+    }
+
+    /**
+     * A file whose extension the setting lists, or has listed since the node started, gets the promotable entry, which
+     * owns the family's promotion state; whether it promotes is decided by the current list at trigger time. Every
+     * other file, and every file when there is no manager, gets the existing entry. Listing an extension for the first
+     * time therefore applies to families created afterwards, while clearing and listing it again applies to every
+     * family, including those created while it was clear.
+     */
+    private CachedSwitchableIndexInput newSwitchableEntry(String fileName, boolean cacheFromRemote) throws IOException {
+        FSDirectory fsDirectory = DirectoryUtils.unwrapFSDirectory(localDirectory);
+        if (isCandidate(fileName)) {
+            return new PromotableCachedSwitchableIndexInput(
                 fileCache,
                 fileName,
-                DirectoryUtils.unwrapFSDirectory(localDirectory),
+                fsDirectory,
                 remoteDirectory,
                 transferManager,
                 cacheFromRemote,
                 threadPool,
                 tieredStoragePrefetchSettingsSupplier
-            )
+            );
+        }
+        return new CachedSwitchableIndexInput(
+            fileCache,
+            fileName,
+            fsDirectory,
+            remoteDirectory,
+            transferManager,
+            cacheFromRemote,
+            threadPool,
+            tieredStoragePrefetchSettingsSupplier
         );
+    }
+
+    /** Whether the file's extension is or has been listed in the promotion setting; never without a manager. */
+    private boolean isCandidate(String fileName) {
+        return warmFullFileManager != null && warmFullFileManager.hasBeenEligible(WarmFullFileSettings.extensionOf(fileName));
     }
 }

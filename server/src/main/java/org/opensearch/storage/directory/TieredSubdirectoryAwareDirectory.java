@@ -89,7 +89,9 @@ public class TieredSubdirectoryAwareDirectory extends FilterDirectory implements
                 remoteDirectory,
                 fileCache,
                 threadPool,
-                tieredStoragePrefetchSettingsSupplier
+                tieredStoragePrefetchSettingsSupplier,
+                // Whole-file promotion is not wired into the pluggable-data-format stack; a null manager keeps it off.
+                null
             );
             logger.debug("Created TieredSubdirectoryAwareDirectory (hasStoreHandlers={})", this.strategies.hasStoreHandlers());
             success = true;

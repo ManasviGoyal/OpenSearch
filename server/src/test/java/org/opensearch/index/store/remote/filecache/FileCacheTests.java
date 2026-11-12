@@ -465,6 +465,28 @@ public class FileCacheTests extends OpenSearchTestCase {
         assertEquals(0, fileCache.activeUsage());
     }
 
+    public void testRestoreDeletesPartialDownloadsInsteadOfRegisteringThem() throws IOException {
+        // A download that never reached its rename is incomplete and never served: the restore scan deletes it and
+        // registers only the complete files next to it.
+        String indexName = "test-warm-index";
+        String shardId = "0";
+        createWarmIndexFile(indexName, shardId, "_0.faiss");
+        createWarmIndexFile(indexName, shardId, "_0.faiss" + FileTypeUtils.PARTIAL_DOWNLOAD_SUFFIX);
+        Path shardPath = path.resolve(NodeEnvironment.INDICES_FOLDER).resolve(indexName).resolve(shardId);
+        Path indexPath = shardPath.resolve(FileTypeUtils.INDICES_FOLDER_IDENTIFIER);
+        Path partial = indexPath.resolve("_0.faiss" + FileTypeUtils.PARTIAL_DOWNLOAD_SUFFIX);
+        long completeSize = Files.size(indexPath.resolve("_0.faiss"));
+
+        FileCache fileCache = createFileCache(MEGA_BYTES);
+        fileCache.restoreFromDirectory(List.of(shardPath));
+
+        assertFalse("the partial download is deleted", Files.exists(partial));
+        assertNull("and not registered", fileCache.get(partial.toAbsolutePath()));
+        assertNotNull(fileCache.get(indexPath.resolve("_0.faiss").toAbsolutePath()));
+        fileCache.decRef(indexPath.resolve("_0.faiss").toAbsolutePath());
+        assertEquals("only the complete file is charged", completeSize, fileCache.usage());
+    }
+
     public void testRestoreFromMultipleDirectories() throws IOException {
         String index1 = "test-index-1";
         String index2 = "test-warm-index-2";
