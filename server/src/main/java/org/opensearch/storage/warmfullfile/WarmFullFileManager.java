@@ -156,7 +156,7 @@ public class WarmFullFileManager {
     private final Set<FullFileState> demotedFamilies = ConcurrentHashMap.newKeySet();
     // The search phases running on this node's warm shards: an evictable family hands views only inside one, and an
     // evicted family's mapping is released once the phases running at its demotion have ended.
-    private final SearchPhaseTracker searchPhases = new SearchPhaseTracker();
+    private final FullFileSearchPhaseTracker searchPhases = new FullFileSearchPhaseTracker();
     // A FULL family is evicted only once no view of it has been cut for this long (WarmFullFileSettings.EVICTION_MIN_IDLE).
     private volatile long evictionMinIdleMillis = WarmFullFileSettings.EVICTION_MIN_IDLE.getDefault(Settings.EMPTY).millis();
     private final CounterMetric evicted = new CounterMetric();
@@ -795,7 +795,7 @@ public class WarmFullFileManager {
     }
 
     /** @return the tracker of the search phases running on this node's warm shards, registered with every warm index */
-    public SearchPhaseTracker searchPhases() {
+    public FullFileSearchPhaseTracker searchPhases() {
         return searchPhases;
     }
 

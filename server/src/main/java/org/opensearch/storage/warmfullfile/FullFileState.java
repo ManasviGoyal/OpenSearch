@@ -435,7 +435,7 @@ public final class FullFileState {
 
     /**
      * Releases a demoted family's mapping now, without waiting for its handles to close: called once no search that
-     * could still hold a view of the mapping is running (see {@link SearchPhaseTracker#whenQuiesced}). The reader's
+     * could still hold a view of the mapping is running (see {@link FullFileSearchPhaseTracker#whenQuiesced}). The reader's
      * handles stay open and keep reading blocks. A no-op if nothing is owed, if the release is already scheduled, or
      * if a {@link #restore()} has put the family back to FULL in the meantime.
      *

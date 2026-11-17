@@ -2220,7 +2220,7 @@ public class WarmFullFileManagerTests extends OpenSearchTestCase {
         TransferManager tm = new TransferManager(new FixedContentStreamReader(content), fileCache, threadPool);
         AtomicLong clock = new AtomicLong(1_000);
         WarmFullFileManager mgr = newEvictingManager(fileCache, clock::get, 1_000);
-        SearchPhaseTracker tracker = mgr.searchPhases();
+        FullFileSearchPhaseTracker tracker = mgr.searchPhases();
         FullFileState a = newStateFor(tm, fileCache, "_a.faiss", content);
         startPromotion(mgr, a);
         awaitState(a, FullFileState.State.FULL);

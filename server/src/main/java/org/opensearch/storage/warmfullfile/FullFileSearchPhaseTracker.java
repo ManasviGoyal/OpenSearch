@@ -35,7 +35,7 @@ import java.util.concurrent.atomic.AtomicLong;
  * @opensearch.experimental
  */
 @ExperimentalApi
-public final class SearchPhaseTracker implements SearchOperationListener {
+public final class FullFileSearchPhaseTracker implements SearchOperationListener {
 
     private record Waiter(long generation, Runnable action) {
     }

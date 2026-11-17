@@ -18,10 +18,10 @@ import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.mockito.Mockito.mock;
 
-public class SearchPhaseTrackerTests extends OpenSearchTestCase {
+public class FullFileSearchPhaseTrackerTests extends OpenSearchTestCase {
 
     public void testInPhaseFollowsEnterAndExitOnTheCallingThread() throws Exception {
-        SearchPhaseTracker tracker = new SearchPhaseTracker();
+        FullFileSearchPhaseTracker tracker = new FullFileSearchPhaseTracker();
         assertFalse(tracker.inPhase());
         tracker.enter();
         assertTrue(tracker.inPhase());
@@ -46,21 +46,21 @@ public class SearchPhaseTrackerTests extends OpenSearchTestCase {
     }
 
     public void testExitWithoutEnterIsIgnored() {
-        SearchPhaseTracker tracker = new SearchPhaseTracker();
+        FullFileSearchPhaseTracker tracker = new FullFileSearchPhaseTracker();
         tracker.exit();
         assertFalse(tracker.inPhase());
         assertEquals(0, tracker.inFlight());
     }
 
     public void testActionRunsAtOnceWhenNoPhaseIsRunning() {
-        SearchPhaseTracker tracker = new SearchPhaseTracker();
+        FullFileSearchPhaseTracker tracker = new FullFileSearchPhaseTracker();
         AtomicInteger runs = new AtomicInteger();
         tracker.whenQuiesced(tracker.nextGeneration(), runs::incrementAndGet);
         assertEquals(1, runs.get());
     }
 
     public void testActionWaitsForThePhasesRunningAtTheGenerationAndNotForLaterOnes() throws Exception {
-        SearchPhaseTracker tracker = new SearchPhaseTracker();
+        FullFileSearchPhaseTracker tracker = new FullFileSearchPhaseTracker();
         AtomicInteger runs = new AtomicInteger();
 
         // A phase running before the generation is taken.
@@ -103,7 +103,7 @@ public class SearchPhaseTrackerTests extends OpenSearchTestCase {
     }
 
     public void testEveryWaiterOfAGenerationRunsOnceAndInOrder() throws Exception {
-        SearchPhaseTracker tracker = new SearchPhaseTracker();
+        FullFileSearchPhaseTracker tracker = new FullFileSearchPhaseTracker();
         List<Integer> runs = new ArrayList<>();
         CountDownLatch entered = new CountDownLatch(1);
         CountDownLatch mayExit = new CountDownLatch(1);
@@ -124,7 +124,7 @@ public class SearchPhaseTrackerTests extends OpenSearchTestCase {
     }
 
     public void testListenerHooksEnterAndExitAPhase() {
-        SearchPhaseTracker tracker = new SearchPhaseTracker();
+        FullFileSearchPhaseTracker tracker = new FullFileSearchPhaseTracker();
         SearchContext context = mock(SearchContext.class);
 
         tracker.onPreQueryPhase(context);
