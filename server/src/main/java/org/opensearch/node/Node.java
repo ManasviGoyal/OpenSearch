@@ -1162,7 +1162,7 @@ public class Node implements Closeable {
                 segmentReplicator::startReplication,
                 segmentReplicator::getSegmentReplicationStats,
                 dataFormatRegistry,
-                warmFullFileManager
+                warmFullFileManager == null ? null : warmFullFileManager.searchPhases()
             );
 
             final IngestService ingestService = new IngestService(
