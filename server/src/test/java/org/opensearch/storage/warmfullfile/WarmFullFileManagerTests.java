@@ -20,6 +20,8 @@ import org.apache.lucene.store.IndexOutput;
 import org.apache.lucene.store.MMapDirectory;
 import org.apache.lucene.store.NIOFSDirectory;
 import org.opensearch.common.lucene.store.ByteArrayIndexInput;
+import org.opensearch.common.settings.Settings;
+import org.opensearch.common.util.concurrent.ThreadContext;
 import org.opensearch.index.store.remote.file.CleanerDaemonThreadLeakFilter;
 import org.opensearch.index.store.remote.filecache.CachedFullFileIndexInput;
 import org.opensearch.index.store.remote.filecache.CachedIndexInput;
@@ -230,7 +232,9 @@ public class WarmFullFileManagerTests extends OpenSearchTestCase {
 
     /** As {@link #newManager(FileCache, int, double)} with an injected clock, for tests that assert on retryAt. */
     private static WarmFullFileManager newManager(FileCache fileCache, LongSupplier clock, int slots, double budgetFraction) {
-        return withFaissEligible(new WarmFullFileManager(fileCache, Runnable::run, clock, slots, budgetFraction, PART_SIZE));
+        return withFaissEligible(
+            new WarmFullFileManager(fileCache, new ThreadContext(Settings.EMPTY), Runnable::run, clock, slots, budgetFraction, PART_SIZE)
+        );
     }
 
     /** As above, with a hook that runs after admission and before the first remote read of every download. */
@@ -242,7 +246,16 @@ public class WarmFullFileManagerTests extends OpenSearchTestCase {
         Runnable beforeDownloadHook
     ) {
         return withFaissEligible(
-            new WarmFullFileManager(fileCache, Runnable::run, clock, slots, budgetFraction, PART_SIZE, beforeDownloadHook)
+            new WarmFullFileManager(
+                fileCache,
+                new ThreadContext(Settings.EMPTY),
+                Runnable::run,
+                clock,
+                slots,
+                budgetFraction,
+                PART_SIZE,
+                beforeDownloadHook
+            )
         );
     }
 
@@ -503,7 +516,15 @@ public class WarmFullFileManagerTests extends OpenSearchTestCase {
         FileCache fileCache = FileCacheFactory.createConcurrentLRUFileCache(10_000_000, 4);
         TransferManager tm = new TransferManager(new PositionDependentStreamReader(), fileCache, threadPool);
         WarmFullFileManager mgr = withFaissEligible(
-            new WarmFullFileManager(fileCache, threadPool.generic(), threadPool::relativeTimeInMillis, families, 0.5, PART_SIZE)
+            new WarmFullFileManager(
+                fileCache,
+                threadPool.getThreadContext(),
+                threadPool.generic(),
+                threadPool::relativeTimeInMillis,
+                families,
+                0.5,
+                PART_SIZE
+            )
         );
         List<FullFileState> states = new ArrayList<>();
         List<Path> switchKeys = new ArrayList<>();

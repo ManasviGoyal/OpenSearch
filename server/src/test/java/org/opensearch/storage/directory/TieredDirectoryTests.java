@@ -22,6 +22,7 @@ import org.apache.lucene.store.MergeInfo;
 import org.apache.lucene.store.ReadOnceHint;
 import org.opensearch.common.settings.ClusterSettings;
 import org.opensearch.common.settings.Settings;
+import org.opensearch.common.util.concurrent.ThreadContext;
 import org.opensearch.common.util.io.IOUtils;
 import org.opensearch.index.store.remote.file.CleanerDaemonThreadLeakFilter;
 import org.opensearch.index.store.remote.filecache.CachedIndexInput;
@@ -420,7 +421,7 @@ public class TieredDirectoryTests extends TieredStorageBaseTestCase {
     }
 
     private WarmFullFileManager recordingManager(RecordingExecutor executor) {
-        return new WarmFullFileManager(fileCache, executor, () -> 0L, 8);
+        return new WarmFullFileManager(fileCache, new ThreadContext(Settings.EMPTY), executor, () -> 0L, 8);
     }
 
     /** An original input in remote (block) mode whose whole-file length is {@code length}, as openInput passes it. */

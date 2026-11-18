@@ -8,20 +8,34 @@
 
 package org.opensearch.storage.warmfullfile;
 
+import org.opensearch.common.settings.Settings;
+import org.opensearch.common.util.concurrent.OpenSearchExecutors;
+import org.opensearch.common.util.concurrent.OpenSearchThreadPoolExecutor;
+import org.opensearch.common.util.concurrent.ThreadContext;
 import org.opensearch.search.internal.SearchContext;
 import org.opensearch.test.OpenSearchTestCase;
 
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.mockito.Mockito.mock;
 
 public class FullFileSearchPhaseTrackerTests extends OpenSearchTestCase {
 
+    private ThreadContext threadContext;
+    private FullFileSearchPhaseTracker tracker;
+
+    @Override
+    public void setUp() throws Exception {
+        super.setUp();
+        threadContext = new ThreadContext(Settings.EMPTY);
+        tracker = new FullFileSearchPhaseTracker(threadContext);
+    }
+
     public void testInPhaseFollowsEnterAndExitOnTheCallingThread() throws Exception {
-        FullFileSearchPhaseTracker tracker = new FullFileSearchPhaseTracker();
         assertFalse(tracker.inPhase());
         tracker.enter();
         assertTrue(tracker.inPhase());
@@ -35,7 +49,7 @@ public class FullFileSearchPhaseTrackerTests extends OpenSearchTestCase {
         assertFalse(tracker.inPhase());
         assertEquals(0, tracker.inFlight());
 
-        // Another thread is not inside this thread's phase.
+        // A thread that did not get this thread's context is not inside its phase.
         tracker.enter();
         boolean[] seen = new boolean[1];
         Thread other = new Thread(() -> seen[0] = tracker.inPhase());
@@ -45,22 +59,68 @@ public class FullFileSearchPhaseTrackerTests extends OpenSearchTestCase {
         tracker.exit();
     }
 
+    public void testATaskForkedFromAPhaseIsInsideIt() throws Exception {
+        // The pools copy the caller's context onto each task, so a slice or a k-NN per-leaf task sees the phase.
+        OpenSearchThreadPoolExecutor forked = OpenSearchExecutors.newFixed(
+            "forked",
+            1,
+            10,
+            OpenSearchExecutors.daemonThreadFactory("forked"),
+            threadContext
+        );
+        try {
+            assertFalse(forked.submit(tracker::inPhase).get());
+            tracker.enter();
+            assertTrue(forked.submit(tracker::inPhase).get());
+
+            // A slice reported on the forked thread nests in the same phase.
+            forked.submit(tracker::enter).get();
+            assertEquals(2, tracker.inFlight());
+            forked.submit(tracker::exit).get();
+            assertEquals(1, tracker.inFlight());
+            assertTrue(tracker.inPhase());
+
+            tracker.exit();
+            assertFalse(tracker.inPhase());
+            assertFalse(forked.submit(tracker::inPhase).get());
+            assertEquals(0, tracker.inFlight());
+        } finally {
+            forked.shutdownNow();
+            forked.awaitTermination(10, TimeUnit.SECONDS);
+        }
+    }
+
+    public void testTheScopeIsReusedByLaterPhasesOnTheSameContext() {
+        tracker.enter();
+        tracker.exit();
+        // The transient stays on the context once put; a later phase reuses it instead of putting a second one.
+        assertNotNull(threadContext.getTransient(FullFileSearchPhaseTracker.SCOPE_TRANSIENT));
+        assertFalse(tracker.inPhase());
+        tracker.enter();
+        assertTrue(tracker.inPhase());
+        tracker.exit();
+        assertFalse(tracker.inPhase());
+        assertEquals(0, tracker.inFlight());
+    }
+
     public void testExitWithoutEnterIsIgnored() {
-        FullFileSearchPhaseTracker tracker = new FullFileSearchPhaseTracker();
+        tracker.exit();
+        assertFalse(tracker.inPhase());
+        assertEquals(0, tracker.inFlight());
+        tracker.enter();
+        tracker.exit();
         tracker.exit();
         assertFalse(tracker.inPhase());
         assertEquals(0, tracker.inFlight());
     }
 
     public void testActionRunsAtOnceWhenNoPhaseIsRunning() {
-        FullFileSearchPhaseTracker tracker = new FullFileSearchPhaseTracker();
         AtomicInteger runs = new AtomicInteger();
         tracker.whenQuiesced(tracker.nextGeneration(), runs::incrementAndGet);
         assertEquals(1, runs.get());
     }
 
     public void testActionWaitsForThePhasesRunningAtTheGenerationAndNotForLaterOnes() throws Exception {
-        FullFileSearchPhaseTracker tracker = new FullFileSearchPhaseTracker();
         AtomicInteger runs = new AtomicInteger();
 
         // A phase running before the generation is taken.
@@ -103,7 +163,6 @@ public class FullFileSearchPhaseTrackerTests extends OpenSearchTestCase {
     }
 
     public void testEveryWaiterOfAGenerationRunsOnceAndInOrder() throws Exception {
-        FullFileSearchPhaseTracker tracker = new FullFileSearchPhaseTracker();
         List<Integer> runs = new ArrayList<>();
         CountDownLatch entered = new CountDownLatch(1);
         CountDownLatch mayExit = new CountDownLatch(1);
@@ -124,7 +183,6 @@ public class FullFileSearchPhaseTrackerTests extends OpenSearchTestCase {
     }
 
     public void testListenerHooksEnterAndExitAPhase() {
-        FullFileSearchPhaseTracker tracker = new FullFileSearchPhaseTracker();
         SearchContext context = mock(SearchContext.class);
 
         tracker.onPreQueryPhase(context);

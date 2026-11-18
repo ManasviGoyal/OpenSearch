@@ -21,6 +21,7 @@ import org.opensearch.common.lease.Releasable;
 import org.opensearch.common.metrics.CounterMetric;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.common.util.CancellableThreads;
+import org.opensearch.common.util.concurrent.ThreadContext;
 import org.opensearch.index.engine.OpenSearchConcurrentMergeScheduler;
 import org.opensearch.index.store.FsDirectoryFactory;
 import org.opensearch.index.store.remote.file.AbstractBlockIndexInput;
@@ -156,7 +157,7 @@ public class WarmFullFileManager {
     private final Set<FullFileState> demotedFamilies = ConcurrentHashMap.newKeySet();
     // The search phases running on this node's warm shards: an evictable family hands views only inside one, and an
     // evicted family's mapping is released once the phases running at its demotion have ended.
-    private final FullFileSearchPhaseTracker searchPhases = new FullFileSearchPhaseTracker();
+    private final FullFileSearchPhaseTracker searchPhases;
     // A FULL family is evicted only once no view of it has been cut for this long (WarmFullFileSettings.EVICTION_MIN_IDLE).
     private volatile long evictionMinIdleMillis = WarmFullFileSettings.EVICTION_MIN_IDLE.getDefault(Settings.EMPTY).millis();
     private final CounterMetric evicted = new CounterMetric();
@@ -188,26 +189,34 @@ public class WarmFullFileManager {
      * Production constructor.
      *
      * @param fileCache              the node file cache
+     * @param threadContext          the node thread context, which carries a search's scope to the threads it forks to
      * @param executor               the pool to run promote(), the completion handler, and the deferred cleanup on
      *                               (never the search thread, never the FileCache listener thread)
      * @param clock                  a monotonic millis clock (e.g. {@code threadPool::relativeTimeInMillis})
      * @param maxConcurrentDownloads the initial download cap, {@link WarmFullFileSettings#MAX_CONCURRENT_DOWNLOADS};
      *                               later values arrive through {@link #onMaxConcurrentDownloadsChanged}
      */
-    public WarmFullFileManager(FileCache fileCache, Executor executor, LongSupplier clock, int maxConcurrentDownloads) {
-        this(fileCache, executor, clock, maxConcurrentDownloads, DEFAULT_BUDGET_FRACTION, DEFAULT_PART_SIZE);
+    public WarmFullFileManager(
+        FileCache fileCache,
+        ThreadContext threadContext,
+        Executor executor,
+        LongSupplier clock,
+        int maxConcurrentDownloads
+    ) {
+        this(fileCache, threadContext, executor, clock, maxConcurrentDownloads, DEFAULT_BUDGET_FRACTION, DEFAULT_PART_SIZE);
     }
 
     /** Package-private constructor for tests (small slot count, budget fraction, and part size). */
     WarmFullFileManager(
         FileCache fileCache,
+        ThreadContext threadContext,
         Executor executor,
         LongSupplier clock,
         int maxConcurrentDownloads,
         double budgetFraction,
         long partSize
     ) {
-        this(fileCache, executor, clock, maxConcurrentDownloads, budgetFraction, partSize, () -> {});
+        this(fileCache, threadContext, executor, clock, maxConcurrentDownloads, budgetFraction, partSize, () -> {});
     }
 
     /**
@@ -218,6 +227,7 @@ public class WarmFullFileManager {
      */
     WarmFullFileManager(
         FileCache fileCache,
+        ThreadContext threadContext,
         Executor executor,
         LongSupplier clock,
         int maxConcurrentDownloads,
@@ -226,6 +236,7 @@ public class WarmFullFileManager {
         Runnable beforeDownloadHook
     ) {
         this.fileCache = fileCache;
+        this.searchPhases = new FullFileSearchPhaseTracker(threadContext);
         this.beforeDownloadHook = beforeDownloadHook;
         this.executor = executor;
         this.clock = clock;

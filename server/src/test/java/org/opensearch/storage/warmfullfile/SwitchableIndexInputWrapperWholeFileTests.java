@@ -32,6 +32,10 @@ import org.apache.lucene.store.NIOFSDirectory;
 import org.apache.lucene.store.RandomAccessInput;
 import org.opensearch.common.lucene.store.ByteArrayIndexInput;
 import org.opensearch.common.lucene.store.InputStreamIndexInput;
+import org.opensearch.common.settings.Settings;
+import org.opensearch.common.util.concurrent.OpenSearchExecutors;
+import org.opensearch.common.util.concurrent.OpenSearchThreadPoolExecutor;
+import org.opensearch.common.util.concurrent.ThreadContext;
 import org.opensearch.common.util.io.IOUtils;
 import org.opensearch.index.store.remote.file.CleanerDaemonThreadLeakFilter;
 import org.opensearch.index.store.remote.filecache.FileCache;
@@ -83,6 +87,9 @@ import static org.mockito.Mockito.when;
  */
 @ThreadLeakFilters(filters = CleanerDaemonThreadLeakFilter.class)
 public class SwitchableIndexInputWrapperWholeFileTests extends TieredStorageBaseTestCase {
+
+    // The node thread context the manager's phase tracker keeps a search's scope on; the base class pool is a mock.
+    private final ThreadContext threadContext = new ThreadContext(Settings.EMPTY);
 
     private static final String FILE_NAME = "_0.si";
     private static final Supplier<TieredStoragePrefetchSettings> PREFETCH = () -> {
@@ -162,7 +169,7 @@ public class SwitchableIndexInputWrapperWholeFileTests extends TieredStorageBase
 
     /** A manager whose setting lists the fixture file's extension, so eligible handles trigger. */
     private WarmFullFileManager manager(Executor executor, AtomicLong clock) {
-        WarmFullFileManager manager = new WarmFullFileManager(fileCache, executor, clock::get, 8);
+        WarmFullFileManager manager = new WarmFullFileManager(fileCache, new ThreadContext(Settings.EMPTY), executor, clock::get, 8);
         manager.onExtensionsChanged(Set.of(WarmFullFileSettings.extensionOf(FILE_NAME)));
         return manager;
     }
@@ -758,7 +765,13 @@ public class SwitchableIndexInputWrapperWholeFileTests extends TieredStorageBase
         FullFileState st = stateFor(in);
         // Production constructor with 1 processor: 1 segment (budget = half the cache) and 1 slot. promote() runs inline
         // on the calling thread; the download itself runs on the REMOTE_RECOVERY pool inside fetchBlobAsync.
-        WarmFullFileManager realManager = new WarmFullFileManager(fileCache, Runnable::run, threadPool::relativeTimeInMillis, 1);
+        WarmFullFileManager realManager = new WarmFullFileManager(
+            fileCache,
+            threadContext,
+            Runnable::run,
+            threadPool::relativeTimeInMillis,
+            1
+        );
         realManager.onExtensionsChanged(Set.of(WarmFullFileSettings.extensionOf(FILE_NAME)));
         SwitchableIndexInputWrapper handle = new PromotableSwitchableIndexInputWrapper("h", in, st, realManager);
 
@@ -864,6 +877,7 @@ public class SwitchableIndexInputWrapperWholeFileTests extends TieredStorageBase
         st.markRemoteMode(footerChecksum(content)); // the fixture metadata's checksum belongs to no real bytes
         WarmFullFileManager realManager = new WarmFullFileManager(
             fileCache,
+            threadContext,
             threadPool.executor(ThreadPool.Names.REMOTE_RECOVERY),
             threadPool::relativeTimeInMillis,
             1
@@ -939,6 +953,7 @@ public class SwitchableIndexInputWrapperWholeFileTests extends TieredStorageBase
         AtomicLong clock = new AtomicLong(1_000);
         WarmFullFileManager realManager = new WarmFullFileManager(
             fileCache,
+            threadContext,
             threadPool.executor(ThreadPool.Names.REMOTE_RECOVERY),
             clock::get,
             1
@@ -975,18 +990,38 @@ public class SwitchableIndexInputWrapperWholeFileTests extends TieredStorageBase
         assertTrue("outside a search phase: blocks", outside instanceof SwitchableIndexInputWrapper);
         assertEquals("not an access", 1_000L, st.lastAccessMillis());
 
-        realManager.searchPhases().enter();
+        // A pool built on the node context copies the caller's context onto each task, as the search pools do.
+        OpenSearchThreadPoolExecutor forkPool = OpenSearchExecutors.newFixed(
+            "fork",
+            1,
+            10,
+            OpenSearchExecutors.daemonThreadFactory("fork"),
+            threadContext
+        );
         IndexInput inside;
+        IndexInput forked;
+        IndexInput forkedOutside;
         try {
-            inside = handle.clone();
+            realManager.searchPhases().enter();
+            try {
+                inside = handle.clone();
+                // A task forked from the phase, as k-NN forks its per-leaf searches, shares the phase.
+                forked = forkPool.submit(handle::clone).get();
+            } finally {
+                realManager.searchPhases().exit();
+            }
+            forkedOutside = forkPool.submit(handle::clone).get();
         } finally {
-            realManager.searchPhases().exit();
+            forkPool.shutdownNow();
+            forkPool.awaitTermination(10, TimeUnit.SECONDS);
         }
         assertTrue("inside a search phase: a view", inside instanceof MemorySegmentAccessInput);
+        assertTrue("forked from the phase: a view", forked instanceof MemorySegmentAccessInput);
+        assertTrue("forked outside a phase: blocks", forkedOutside instanceof SwitchableIndexInputWrapper);
         assertEquals(5_000L, st.lastAccessMillis());
         assertEquals("the view reads the file", content[0], inside.readByte());
 
-        IOUtils.close(inside, outside, handle);
+        IOUtils.close(inside, outside, forked, forkedOutside, handle);
         st.closeFamily();
         assertTrue("state " + st.state() + ", handles " + st.handleCount(), st.cleanupDone());
         assertNull(st.localMaster());
@@ -1015,6 +1050,7 @@ public class SwitchableIndexInputWrapperWholeFileTests extends TieredStorageBase
         st.markRemoteMode(footerChecksum(content));
         WarmFullFileManager realManager = new WarmFullFileManager(
             fileCache,
+            threadContext,
             threadPool.executor(ThreadPool.Names.REMOTE_RECOVERY),
             threadPool::relativeTimeInMillis,
             1
@@ -1074,6 +1110,7 @@ public class SwitchableIndexInputWrapperWholeFileTests extends TieredStorageBase
         // Real pool: the cleanup must run off the FileCache listener thread, as in production.
         WarmFullFileManager realManager = new WarmFullFileManager(
             fileCache,
+            threadContext,
             threadPool.executor(ThreadPool.Names.REMOTE_RECOVERY),
             threadPool::relativeTimeInMillis,
             1
@@ -1144,7 +1181,7 @@ public class SwitchableIndexInputWrapperWholeFileTests extends TieredStorageBase
                 threadPool.executor(ThreadPool.Names.REMOTE_RECOVERY).execute(command);
             }
         };
-        WarmFullFileManager realManager = new WarmFullFileManager(fileCache, exec, threadPool::relativeTimeInMillis, 1);
+        WarmFullFileManager realManager = new WarmFullFileManager(fileCache, threadContext, exec, threadPool::relativeTimeInMillis, 1);
         realManager.onExtensionsChanged(Set.of(WarmFullFileSettings.extensionOf(FILE_NAME)));
         SwitchableIndexInputWrapper handle = new PromotableSwitchableIndexInputWrapper(
             "h",

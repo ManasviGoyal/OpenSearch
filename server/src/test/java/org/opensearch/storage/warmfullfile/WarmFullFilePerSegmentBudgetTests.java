@@ -11,6 +11,8 @@ import com.carrotsearch.randomizedtesting.annotations.ThreadLeakFilters;
 
 import org.apache.lucene.store.FSDirectory;
 import org.apache.lucene.store.IndexInput;
+import org.opensearch.common.settings.Settings;
+import org.opensearch.common.util.concurrent.ThreadContext;
 import org.opensearch.index.store.remote.file.CleanerDaemonThreadLeakFilter;
 import org.opensearch.index.store.remote.filecache.CachedIndexInput;
 import org.opensearch.index.store.remote.filecache.FileCache;
@@ -66,7 +68,7 @@ public class WarmFullFilePerSegmentBudgetTests extends OpenSearchTestCase {
         reader = new WarmFullFileManagerTests.PositionDependentStreamReader();
         transferManager = new TransferManager(reader, fileCache, threadPool);
         clock = new AtomicLong(10_000);
-        manager = new WarmFullFileManager(fileCache, Runnable::run, clock::get, 8, 0.5, PART_SIZE);
+        manager = new WarmFullFileManager(fileCache, new ThreadContext(Settings.EMPTY), Runnable::run, clock::get, 8, 0.5, PART_SIZE);
         manager.onExtensionsChanged(Set.of("faiss")); // as the settings listener tells it in production
         perSegmentCapacity = CAPACITY / SEGMENTS;
         cap = perSegmentCapacity / 2;

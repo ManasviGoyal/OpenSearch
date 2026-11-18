@@ -9,23 +9,30 @@
 package org.opensearch.storage.warmfullfile;
 
 import org.opensearch.common.annotation.ExperimentalApi;
+import org.opensearch.common.util.concurrent.ThreadContext;
 import org.opensearch.index.shard.SearchOperationListener;
 import org.opensearch.search.internal.SearchContext;
 
-import java.util.ArrayDeque;
 import java.util.Deque;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentLinkedDeque;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * Tracks the search phases running on this node's warm shards, so a whole-file mapping can be released while its
- * reader stays open. A query phase, a fetch phase or one slice of a concurrent segment search is a phase; each runs on
- * one thread and is reported by the {@link SearchOperationListener} hooks on that thread. A whole-file view is cut
- * only by a thread inside a phase ({@link #inPhase()}), so once every phase that was running when a family was
- * demoted has ended, no view of its mapping can still be read, and the mapping can be unmapped.
+ * reader stays open. A query phase, a fetch phase or one slice of a concurrent segment search is a phase, reported by
+ * the {@link SearchOperationListener} hooks. A whole-file view is cut only inside a phase ({@link #inPhase()}), so
+ * once every phase that was running when a family was demoted has ended, no view of its mapping can still be read,
+ * and the mapping can be unmapped.
+ *
+ * <p>The phases a request is inside are kept in a {@link Scope} stored as a transient of the {@link ThreadContext}.
+ * The thread pools copy the context onto every task they run, so a task forked from a phase (a concurrent segment
+ * search slice, or the per-leaf tasks k-NN submits through the searcher's task executor) shares its scope and is
+ * inside the phase too. A thread whose context has no scope, such as a merge thread or a recovery thread, is outside
+ * every phase and reads blocks.
  *
  * <p>Each phase is stamped with the generation current when it starts. {@link #whenQuiesced} takes a generation and
  * runs its action once no phase stamped at or before it is still running; phases that start later are not waited
@@ -37,15 +44,31 @@ import java.util.concurrent.atomic.AtomicLong;
 @ExperimentalApi
 public final class FullFileSearchPhaseTracker implements SearchOperationListener {
 
+    /** The {@link ThreadContext} transient under which a request's {@link Scope} is kept. */
+    static final String SCOPE_TRANSIENT = "warm_full_file.search_scope";
+
+    /**
+     * The phases one request is inside, shared by every thread the request's context was copied to. Entering pushes
+     * a token and exiting pops the most recent one; with slices on several threads a pop can take another slice's
+     * token, which is safe because tokens are interchangeable except for their generation stamp, and the most recent
+     * token never carries an older stamp than the phase that is ending.
+     */
+    static final class Scope {
+        private final Deque<Object> tokens = new ConcurrentLinkedDeque<>();
+    }
+
     private record Waiter(long generation, Runnable action) {
     }
 
+    private final ThreadContext threadContext;
     private final AtomicLong generation = new AtomicLong();
     // Every running phase, by its token, stamped with the generation it started under.
     private final Map<Object, Long> inFlight = new ConcurrentHashMap<>();
     private final List<Waiter> waiters = new CopyOnWriteArrayList<>();
-    // The phases the current thread is inside, outermost first; a slice executed inline nests in its query phase.
-    private final ThreadLocal<Deque<Object>> current = ThreadLocal.withInitial(ArrayDeque::new);
+
+    public FullFileSearchPhaseTracker(ThreadContext threadContext) {
+        this.threadContext = threadContext;
+    }
 
     @Override
     public void onPreQueryPhase(SearchContext searchContext) {
@@ -92,16 +115,22 @@ public final class FullFileSearchPhaseTracker implements SearchOperationListener
         exit();
     }
 
-    /** Records that the current thread has started a phase. */
+    /** Records that the current context has started a phase. */
     void enter() {
+        Scope scope = threadContext.getTransient(SCOPE_TRANSIENT);
+        if (scope == null) {
+            scope = new Scope();
+            threadContext.putTransient(SCOPE_TRANSIENT, scope);
+        }
         Object token = new Object();
         inFlight.put(token, generation.get());
-        current.get().addLast(token);
+        scope.tokens.addLast(token);
     }
 
-    /** Records that the current thread has ended its innermost phase, and runs the actions that unblocks. */
+    /** Records that the current context has ended its most recent phase, and runs the actions that unblocks. */
     void exit() {
-        Object token = current.get().pollLast();
+        Scope scope = threadContext.getTransient(SCOPE_TRANSIENT);
+        Object token = scope == null ? null : scope.tokens.pollLast();
         if (token == null) {
             return;
         }
@@ -109,9 +138,10 @@ public final class FullFileSearchPhaseTracker implements SearchOperationListener
         runQuiesced();
     }
 
-    /** @return true while the current thread is inside a search phase, i.e. may be handed a whole-file view */
+    /** @return true while the current context is inside a search phase, i.e. may be handed a whole-file view */
     public boolean inPhase() {
-        return current.get().isEmpty() == false;
+        Scope scope = threadContext.getTransient(SCOPE_TRANSIENT);
+        return scope != null && scope.tokens.isEmpty() == false;
     }
 
     /**

@@ -997,6 +997,7 @@ public class Node implements Closeable {
                     ? null
                     : new WarmFullFileManager(
                         nodeFileCache,
+                        threadPool.getThreadContext(),
                         threadPool.executor(ThreadPool.Names.GENERIC),
                         threadPool::relativeTimeInMillis,
                         warmFullFileSettings.getMaxConcurrentDownloads()
