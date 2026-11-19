@@ -397,18 +397,23 @@ public class WarmFullFileIT extends WarmFullFileBaseIT {
         assertTrue(wholeSegmentFiles(localFiles(second)).isEmpty());
 
         // The already promoted family was demoted by the settings change: it serves blocks again with the same
-        // results, and its mapping, whole file and budget are released once the reader's handles close (on reopen).
-        assertEquals(FullFileState.State.BLOCK, stateOf(first, firstFdt));
+        // results, and its mapping, whole file and budget are released once the searches reading it have ended.
+        FullFileState firstFamily = requireFamilyState(first, firstFdt);
+        assertEquals(FullFileState.State.BLOCK, firstFamily.state());
         assertEquals(1L, first.manager.counters().get("demoted").longValue());
         assertEquals(firstFingerprint, queryFingerprint(INDEX_NAME));
+        assertBusy(() -> {
+            assertTrue("released once no search reads it", firstFamily.cleanupDone());
+            assertTrue(wholeSegmentFiles(localFiles(first)).isEmpty());
+            assertEquals(0L, first.manager.counters().get("reservedBytes").longValue());
+        }, WAIT_TIMEOUT.seconds(), TimeUnit.SECONDS);
 
-        // Listing the extension again while the reader is still open restores the family from the mapping it kept:
-        // FULL at once, no download, same results. Then clear it once more before the reopen below.
-        long startedBefore = first.manager.counters().get("started").longValue();
+        // Listing the extension again promotes the family afresh on its next searches, with the same results. Then
+        // clear it once more before the reopen below.
         setFullFileExtensions(FDT_EXTENSION);
-        assertBusy(() -> assertEquals(FullFileState.State.FULL, stateOf(first, firstFdt)), WAIT_TIMEOUT.seconds(), TimeUnit.SECONDS);
-        assertEquals(1L, first.manager.counters().get("restored").longValue());
-        assertEquals("no download for the restore", startedBefore, first.manager.counters().get("started").longValue());
+        searchUntilPromoted(INDEX_NAME, first, firstFdt);
+        assertEquals(0L, first.manager.counters().get("restored").longValue());
+        assertEquals(2L, first.manager.counters().get("promoted").longValue());
         assertEquals(firstFingerprint, queryFingerprint(INDEX_NAME));
         clearFullFileExtensions();
         assertBusy(() -> assertEquals(FullFileState.State.BLOCK, stateOf(first, firstFdt)), WAIT_TIMEOUT.seconds(), TimeUnit.SECONDS);

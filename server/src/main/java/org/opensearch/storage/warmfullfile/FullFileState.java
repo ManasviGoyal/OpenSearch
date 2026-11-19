@@ -17,7 +17,6 @@ import org.opensearch.index.store.RemoteSegmentStoreDirectory;
 import org.opensearch.index.store.remote.filecache.FileCache;
 import org.opensearch.index.store.remote.utils.TransferManager;
 
-import java.io.IOException;
 import java.nio.file.Path;
 import java.util.concurrent.Executor;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -25,25 +24,23 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 
 /**
- * Per-file-family state for warm-tier whole-file promotion.
+ * Per-file (family) whole-file promotion state, shared by every handle of the file: the original opened by
+ * {@code TieredDirectory.openInput} and every clone and slice derived from it. One instance per
+ * {@code PromotableCachedSwitchableIndexInput}, so a file is downloaded and mapped at most once however many readers
+ * open it.
  *
- * <p>One instance is owned by each {@code PromotableCachedSwitchableIndexInput} (the family's cache entry). It tracks the
- * promotion lifecycle and holds what the node-level manager needs to download the whole file and later unmap it:
+ * <p>A promoted whole file is an ordinary file cache entry ({@link PromotedWholeFileEntry}): the family holds no
+ * reference on it while FULL. A search scope takes one reference and one in-flight count on its first view of the
+ * file ({@link #acquireView}) and gives both back when it ends ({@link #releaseView}), so between searches the file is
+ * unreferenced and the cache evicts it under pressure like a block. When the cache drops the entry, for any reason,
+ * {@link #onEntryRemoved} demotes the family to blocks and owes the unmap, which runs once the in-flight count is
+ * zero; a scope that holds a view never has the mapping closed under it. A thread outside a scope reads blocks.
  *
- * <pre>
- *   BLOCK  --(first eligible clone/slice triggers promotion)--&gt;  PROMOTING
- *   PROMOTING --(whole-file download completes, mapping opened)--&gt;  FULL
- *   PROMOTING --(decline or failure)--&gt;  BLOCK  (retry after retryAt)
- *   any --(family closes)--&gt;  CLOSED
- * </pre>
- *
- * Every transition is a named method of this class, taken under one lock: {@link #onAccess}, {@link #abandonPromotion},
- * {@link #completePromotion}, {@link #demote}, {@link #restore}, {@link #closeFamily} and the release that the last
- * {@link #decHandles} schedules. The mapping is published and the family moves to {@link State#FULL} in one step, so a
- * reader that sees FULL sees the mapping. When a FULL family closes, the unmap, the release of
- * the family's FileCache reference and the release of its budget run exactly once on the cleanup executor, after the
- * last handle closes; whichever of "family closed" and "last handle closed" happens second schedules it, so no thread
- * waits and nothing re-enters the FileCache from the removal listener.
+ * <p>Every transition is a named method of this class, taken under one lock: {@link #onAccess}, {@link #abandonPromotion},
+ * {@link #completePromotion}, {@link #demote}, {@link #restore}, {@link #onEntryRemoved}, {@link #closeFamily} and the
+ * release the last {@link #releaseView} schedules. The mapping is published and the family moves to {@link State#FULL}
+ * in one step, so a reader that sees FULL sees the mapping. The unmap and the release of the budget run exactly once
+ * per FULL period, on the cleanup executor, never on the cache listener thread.
  *
  * @opensearch.experimental
  */
@@ -78,6 +75,8 @@ public final class FullFileState {
     // together with remoteMode; null when the upload metadata was not available.
     private volatile String expectedChecksum;
     private final AtomicReference<IndexInput> localMaster = new AtomicReference<>();
+    // The cache entry of the current FULL period, which owns the mapping; the cache's removal of it demotes the family.
+    private volatile PromotedWholeFileEntry entry;
     // The handle a download of this family runs under; created by the first promotion that needs it, cancelled at
     // closeFamily, and left as CANCELLED afterwards so a promotion racing the close starts nothing.
     private final AtomicReference<CancellableThreads> downloadCancellation = new AtomicReference<>();
@@ -89,18 +88,22 @@ public final class FullFileState {
     // Set when a whole file assembled partly from this family's local blocks failed its checksum: the next download
     // reads every part from the remote store, since one of those blocks is corrupt and nothing says which.
     private volatile boolean localBlocksSuspect;
-    private final AtomicInteger handleCount = new AtomicInteger(0);
+    // Search scopes holding a view of the mapping; the unmap waits for zero.
+    private final AtomicInteger inFlightScopes = new AtomicInteger(0);
 
     // Teardown wiring, set by completePromotion together with the mapping.
     private volatile Executor cleanupExecutor;
     private volatile Runnable budgetRelease;
-    private volatile Runnable onClosedWithLiveHandles;
+    private volatile Runnable onAwaitingRelease;
     private volatile Runnable onCleanupDone;
-    // Set when the family left FULL (closed or demoted) with a mapping still published: the deferred unmap and decRef
-    // are owed exactly in that case.
+    private volatile Runnable onEvictedByCache;
+    // Set when the family left FULL (closed, demoted or evicted by the cache) with a mapping still published: the
+    // deferred unmap is owed exactly in that case.
     private volatile boolean mappingReleaseOwed;
-    // Orders the transitions out of FULL (close, demote), restore, the scheduling of the release and the start of a new
-    // FULL period against each other; never held across cache calls.
+    // Set once the cache has dropped this period's entry; the family then neither removes the key nor restores.
+    private volatile boolean entryRemoved;
+    // Orders the transitions out of FULL (close, demote, eviction), restore, the scheduling of the release and the start
+    // of a new FULL period against each other; never held across cache calls.
     private final Object releaseLock = new Object();
     // One-shot per FULL period: re-armed by completePromotion.
     private final AtomicBoolean cleanupScheduled = new AtomicBoolean(false);
@@ -114,12 +117,6 @@ public final class FullFileState {
     private final String fileName;
     private final long fileLength;
     private final Path fullFilePath;
-    // Whether the file may be evicted under budget pressure while its reader is open, which is safe only for files
-    // whose readers clone or slice the handle per query (WarmFullFileSettings.EVICTABLE_EXTENSIONS). Such a family
-    // hands views only to search phases, so its mapping can be released once the phases running at its demotion end.
-    private final boolean evictable;
-    // The last time a whole-file view was cut (monotonic millis), for the eviction policy's idle check.
-    private volatile long lastAccessMillis;
 
     /**
      * @param transferManager used to download the whole file in parts
@@ -143,25 +140,6 @@ public final class FullFileState {
         this.fileName = fileName;
         this.fileLength = fileLength;
         this.fullFilePath = fullFilePath;
-        this.evictable = WarmFullFileSettings.EVICTABLE_EXTENSIONS.contains(WarmFullFileSettings.extensionOf(fileName));
-    }
-
-    /**
-     * @return whether the file may be evicted under budget pressure while its reader is open; such a family hands
-     *         views only to search phases
-     */
-    public boolean evictable() {
-        return evictable;
-    }
-
-    /** Records that a whole-file view was cut now (monotonic millis). */
-    public void touch(long nowMillis) {
-        lastAccessMillis = nowMillis;
-    }
-
-    /** @return the last time a whole-file view was cut (monotonic millis), or 0 if none has been */
-    long lastAccessMillis() {
-        return lastAccessMillis;
     }
 
     /**
@@ -258,6 +236,11 @@ public final class FullFileState {
         return localMaster.get();
     }
 
+    /** @return the cache entry of the current FULL period, or null outside one */
+    PromotedWholeFileEntry entry() {
+        return entry;
+    }
+
     /** How {@link #completePromotion} ended. */
     enum Completion {
         /** The mapping is published and the family is FULL. */
@@ -270,24 +253,27 @@ public final class FullFileState {
 
     /**
      * Publishes the mapping of a PROMOTING family and moves it to FULL in one step, with the teardown that later gives
-     * the mapping, the family's cache reference and its budget back. A new FULL period starts here, so the one-shot
-     * release flags of the previous period are re-armed; that period's release has run by now, because
-     * {@link #onAccess} does not start a promotion while a release is pending and a closed family is never promoted.
+     * the mapping and the budget back. A new FULL period starts here, so the one-shot release flags of the previous
+     * period are re-armed; that period's release has run by now, because {@link #onAccess} does not start a promotion
+     * while a release is pending and a closed family is never promoted.
      *
-     * @param mapping                 the family's own whole-file mapping
-     * @param cleanupExecutor         pool the unmap + decRef run on (never the FileCache listener thread)
-     * @param budgetRelease           returns this file's reserved per-segment budget bytes; run once, by the deferred
-     *                                cleanup, together with the unmap and the release of the cache reference
-     * @param onClosedWithLiveHandles called if the family closes while handles are still open
-     * @param onCleanupDone           called once the deferred unmap + decRef has run
+     * @param entry             the cache entry that owns the family's whole-file mapping; the caller puts it in the
+     *                          cache right after
+     * @param cleanupExecutor   pool the unmap runs on (never the FileCache listener thread)
+     * @param budgetRelease     returns this file's reserved per-segment budget bytes; may run more than once, and
+     *                          gives the bytes back the first time: when the cache drops the file, or at the unmap
+     * @param onAwaitingRelease called if the family leaves FULL while scopes still hold views
+     * @param onCleanupDone     called once the deferred unmap has run
+     * @param onEvictedByCache  called when the cache drops the entry of a FULL family
      * @return {@link Completion#FULL}, or why nothing was installed
      */
     Completion completePromotion(
-        IndexInput mapping,
+        PromotedWholeFileEntry entry,
         Executor cleanupExecutor,
         Runnable budgetRelease,
-        Runnable onClosedWithLiveHandles,
-        Runnable onCleanupDone
+        Runnable onAwaitingRelease,
+        Runnable onCleanupDone,
+        Runnable onEvictedByCache
     ) {
         synchronized (releaseLock) {
             if (localMaster.get() != null) {
@@ -298,12 +284,15 @@ public final class FullFileState {
             }
             this.cleanupExecutor = cleanupExecutor;
             this.budgetRelease = budgetRelease;
-            this.onClosedWithLiveHandles = onClosedWithLiveHandles;
+            this.onAwaitingRelease = onAwaitingRelease;
             this.onCleanupDone = onCleanupDone;
+            this.onEvictedByCache = onEvictedByCache;
             mappingReleaseOwed = false;
+            entryRemoved = false;
             cleanupScheduled.set(false);
             cleanupDone = false;
-            localMaster.set(mapping);
+            this.entry = entry;
+            localMaster.set(entry.mapping());
             state.set(State.FULL);
             return Completion.FULL;
         }
@@ -315,29 +304,44 @@ public final class FullFileState {
     }
 
     /**
-     * Records a new live handle (called when a wrapper handle is opened).
-     * @return the new handle count
+     * Takes a search scope's hold on the whole file: one reference on the cache entry, so the cache does not evict
+     * it while the scope reads, and one in-flight count, so a demotion does not unmap under the scope. The reference
+     * is taken before the state is checked, so a family seen FULL under it cannot lose its entry to eviction in
+     * between; an explicit removal can still demote it, and then waits for this scope.
+     *
+     * @return true if the scope now holds the file and may cut views of {@link #localMaster()}; false when the family
+     *         is not FULL or the cache has dropped the file, in which case the scope reads blocks
      */
-    public int incHandles() {
-        return handleCount.incrementAndGet();
-    }
-
-    /**
-     * Releases a live handle (called when a wrapper handle closes). If this was the last handle of a family that
-     * already closed while FULL, schedules the deferred cleanup.
-     * @return the new handle count
-     */
-    public int decHandles() {
-        int remaining = handleCount.decrementAndGet();
-        if (remaining == 0) {
-            maybeScheduleCleanup();
+    boolean acquireView() {
+        if (state.get() != State.FULL) {
+            return false;
         }
-        return remaining;
+        if (fileCache.get(fullFilePath) == null) {
+            return false;
+        }
+        synchronized (releaseLock) {
+            if (state.get() == State.FULL && mappingReleaseOwed == false) {
+                inFlightScopes.incrementAndGet();
+                return true;
+            }
+        }
+        fileCache.decRef(fullFilePath);
+        return false;
     }
 
-    /** @return the current live handle count */
-    int handleCount() {
-        return handleCount.get();
+    /** Gives a scope's hold back; the last one out of a family that owes its release schedules the unmap. */
+    void releaseView() {
+        fileCache.decRef(fullFilePath);
+        synchronized (releaseLock) {
+            if (inFlightScopes.decrementAndGet() == 0) {
+                maybeScheduleCleanup();
+            }
+        }
+    }
+
+    /** @return the number of search scopes holding a view of the mapping */
+    int inFlightScopes() {
+        return inFlightScopes.get();
     }
 
     /**
@@ -351,26 +355,67 @@ public final class FullFileState {
     }
 
     /**
+     * Called by {@link PromotedWholeFileEntry#close()} when the cache drops the entry, by eviction, prune, clear or an
+     * explicit remove, inside the FileCache removal listener under a segment lock, so nothing here touches the cache.
+     * A FULL family is demoted: new reads go to blocks, and the mapping is released once no scope holds a view. The
+     * budget goes back now, since the file no longer occupies its segment. An entry of an earlier period, or of a
+     * family already demoted or closed, changes nothing beyond that.
+     *
+     * @param removed the entry the cache dropped
+     */
+    void onEntryRemoved(PromotedWholeFileEntry removed) {
+        boolean wasFull;
+        Runnable budget;
+        synchronized (releaseLock) {
+            if (removed != entry) {
+                return;
+            }
+            entryRemoved = true;
+            wasFull = state.compareAndSet(State.FULL, State.BLOCK);
+            if (wasFull) {
+                mappingReleaseOwed = true;
+            }
+            budget = budgetRelease;
+        }
+        if (budget != null) {
+            budget.run();
+        }
+        if (wasFull) {
+            Runnable evicted = onEvictedByCache;
+            if (evicted != null) {
+                evicted.run();
+            }
+            if (inFlightScopes.get() > 0) {
+                Runnable report = onAwaitingRelease;
+                if (report != null) {
+                    report.run();
+                }
+            }
+        }
+        maybeScheduleCleanup();
+    }
+
+    /**
      * The family-close routine. Called from {@code PromotableCachedSwitchableIndexInput.close()}, which runs
      * inside the FileCache removal listener under a segment lock, so this must not touch the FileCache inline.
      *
      * <p>Marks the state CLOSED and cancels a download in flight. If it was FULL, or demoted with its release still
-     * owed: schedules the unmap, the decRef and the budget release for when the handle count reaches zero (immediately
-     * on the cleanup executor if it already is), so the bytes count against the segment for as long as the whole file is
-     * held in it, and reports the family if handles are still open. If it was PROMOTING, the cancelled download fails
-     * and the manager's completion handler unwinds; if BLOCK with nothing owed, there is nothing to release.
+     * owed: schedules the unmap and the budget release for when no scope holds a view (immediately on the cleanup
+     * executor if none does), and reports the family if scopes still do. The whole-file entry is left to the cache,
+     * unreferenced and evictable. If it was PROMOTING, the cancelled download fails and the manager's completion
+     * handler unwinds; if BLOCK with nothing owed, there is nothing to release.
      */
     public void closeFamily() {
         State prev;
         boolean owesRelease;
         synchronized (releaseLock) {
             // Held with restore(): a restore that has just put the family back to FULL must not clear the release this
-            // close owes, or the mapping and the cache reference would never be given back.
+            // close owes, or the mapping would never be given back.
             prev = state.getAndSet(State.CLOSED);
             if (prev == State.FULL) {
                 mappingReleaseOwed = true;
             }
-            // A demoted family still holds its mapping, reference and budget until its handles close, like a FULL one.
+            // A demoted family still holds its mapping until its scopes end, like a FULL one.
             owesRelease = mappingReleaseOwed && cleanupDone == false;
         }
         CancellableThreads download = downloadCancellation.getAndSet(CANCELLED);
@@ -380,8 +425,8 @@ public final class FullFileState {
         if (owesRelease == false) {
             return;
         }
-        if (handleCount.get() > 0) {
-            Runnable report = onClosedWithLiveHandles;
+        if (inFlightScopes.get() > 0) {
+            Runnable report = onAwaitingRelease;
             if (report != null) {
                 report.run();
             }
@@ -390,10 +435,10 @@ public final class FullFileState {
     }
 
     /**
-     * Takes a FULL family back to BLOCK: no new whole-file view is handed out from now on, and once no handle remains
-     * the mapping is closed, the whole file is removed from the cache and the budget is released, through the same
-     * deferred cleanup a close uses. Views already cut keep reading the mapping until then. Until the release has run
-     * the family cannot be promoted again (see {@link #isMappingReleasePending()}).
+     * Takes a FULL family back to BLOCK: no new whole-file view is handed out from now on, and once no scope holds a
+     * view the mapping is closed, the whole file is removed from the cache and the budget is released, through the
+     * same deferred cleanup a close uses. Views already cut keep reading the mapping until then. Until the release has
+     * run the family cannot be promoted again (see {@link #isMappingReleasePending()}).
      *
      * @return true if the family was FULL and is now BLOCK; false if it was in any other state
      */
@@ -413,16 +458,17 @@ public final class FullFileState {
     }
 
     /**
-     * Takes a demoted family back to FULL while it still holds its mapping: the extension is in the setting again
-     * and nothing has been released, so views are served from the existing mapping from the next clone on, with no
-     * download and no second mapping. Refused once the deferred release has been scheduled, or if the family is not
-     * a demoted one; such a family is promoted again the ordinary way after its release.
+     * Takes a demoted family back to FULL while it still holds its mapping and the cache still holds its file: the
+     * extension is in the setting again and nothing has been released, so views are served from the existing mapping
+     * from the next clone on, with no download and no second mapping. Refused once the deferred release has been
+     * scheduled, once the cache has dropped the file, or if the family is not a demoted one; such a family is promoted
+     * again the ordinary way after its release.
      *
      * @return true if the family is FULL again
      */
     boolean restore() {
         synchronized (releaseLock) {
-            if (mappingReleaseOwed == false || cleanupScheduled.get() || localMaster.get() == null) {
+            if (mappingReleaseOwed == false || entryRemoved || cleanupScheduled.get() || localMaster.get() == null) {
                 return false;
             }
             if (state.compareAndSet(State.BLOCK, State.FULL) == false) {
@@ -430,38 +476,6 @@ public final class FullFileState {
             }
             mappingReleaseOwed = false;
             return true;
-        }
-    }
-
-    /**
-     * Releases a demoted family's mapping now, without waiting for its handles to close: called once no search that
-     * could still hold a view of the mapping is running (see {@link FullFileSearchPhaseTracker#whenQuiesced}). The reader's
-     * handles stay open and keep reading blocks. A no-op if nothing is owed, if the release is already scheduled, or
-     * if a {@link #restore()} has put the family back to FULL in the meantime.
-     *
-     * @return true if the release was scheduled by this call
-     */
-    boolean releaseAfterEviction() {
-        synchronized (releaseLock) {
-            if (mappingReleaseOwed == false || state.get() == State.FULL) {
-                return false;
-            }
-            Executor executor = cleanupExecutor;
-            if (executor == null || cleanupScheduled.compareAndSet(false, true) == false) {
-                return false;
-            }
-            try {
-                executor.execute(this::runCleanup);
-                return true;
-            } catch (RuntimeException e) {
-                cleanupScheduled.set(false);
-                logger.warn(
-                    "could not schedule whole-file release for {} after its eviction; will retry on its next handle release or close",
-                    fullFilePath,
-                    e
-                );
-                return false;
-            }
         }
     }
 
@@ -475,15 +489,14 @@ public final class FullFileState {
 
     /**
      * Schedules the cleanup exactly once per FULL period, and only when the family left FULL with a mapping and no
-     * handle remains.
-     * {@link #closeFamily()}, {@link #demote()} and {@link #decHandles()} call this after their own write, so whichever
-     * runs second sees both conditions true.
+     * scope holds a view. {@link #closeFamily()}, {@link #demote()}, {@link #onEntryRemoved} and {@link #releaseView()}
+     * call this after their own write, so whichever runs second sees both conditions true.
      */
     private void maybeScheduleCleanup() {
         // Held with closeFamily(), demote() and restore(): a restore must not slip in between this check and the
         // scheduling, or the release would run under a family that is FULL again.
         synchronized (releaseLock) {
-            if (mappingReleaseOwed == false || handleCount.get() != 0) {
+            if (mappingReleaseOwed == false || inFlightScopes.get() != 0) {
                 return;
             }
             Executor executor = cleanupExecutor;
@@ -493,40 +506,34 @@ public final class FullFileState {
             try {
                 executor.execute(this::runCleanup);
             } catch (RuntimeException e) {
-                // Nothing was queued, so a later decHandles(), demote() or closeFamily() may schedule it again. Never run
-                // inline: this may be the FileCache listener thread.
+                // Nothing was queued, so a later releaseView(), demote() or closeFamily() may schedule it again. Never
+                // run inline: this may be the FileCache listener thread.
                 cleanupScheduled.set(false);
-                logger.warn(
-                    "could not schedule whole-file cleanup for {}; will retry on the next handle release or close",
-                    fullFilePath,
-                    e
-                );
+                logger.warn("could not schedule whole-file cleanup for {}; will retry on the next scope end or close", fullFilePath, e);
             }
         }
     }
 
     private void runCleanup() {
-        IndexInput master = localMaster.getAndSet(null);
-        if (master != null) {
+        localMaster.set(null);
+        PromotedWholeFileEntry current = entry;
+        if (current != null) {
             try {
-                master.close(); // munmap: safe now, no handle (and so no view derived from one) remains
-            } catch (IOException | RuntimeException e) {
+                current.closeMapping(); // munmap: safe now, no scope holds a view
+            } catch (Exception e) {
                 logger.warn("failed to close whole-file mapping for {}", fullFilePath, e);
             }
         }
-        try {
-            fileCache.decRef(fullFilePath); // release the family's reference; the whole file becomes evictable
-            if (state.get() != State.CLOSED) {
-                // Demoted, not closed: the file is no longer served, so drop it from the cache now rather than leave it
-                // to eviction. A closing family leaves its entry in the cache without a reference, evictable, so a
-                // reopen on this node can join it without a download.
-                fileCache.remove(fullFilePath);
+        if (entryRemoved == false && state.get() != State.CLOSED) {
+            // Demoted, not closed: the file is no longer served, so drop it from the cache now rather than leave it
+            // to eviction. The key is still this family's: a new family for the file exists only after this one
+            // closes. A closing family leaves its entry to the cache, unreferenced and evictable.
+            try {
+                fileCache.remove(fullFilePath); // runs onEntryRemoved, which finds nothing more to do
+            } catch (RuntimeException e) {
+                logger.warn("failed to remove whole file {} from the cache", fullFilePath, e);
             }
-        } catch (RuntimeException e) {
-            logger.warn("failed to release whole-file cache reference for {}", fullFilePath, e);
         }
-        // The budget goes back with the reference, after it: the bytes count against the segment until the whole file
-        // no longer occupies it.
         Runnable release = budgetRelease;
         if (release != null) {
             release.run();
@@ -538,7 +545,7 @@ public final class FullFileState {
         }
     }
 
-    /** @return true once the deferred unmap + decRef has run */
+    /** @return true once the deferred unmap has run */
     boolean cleanupDone() {
         return cleanupDone;
     }

@@ -19,7 +19,6 @@ import org.apache.lucene.store.MemorySegmentAccessInput;
 import org.opensearch.common.annotation.ExperimentalApi;
 import org.opensearch.common.lease.Releasable;
 import org.opensearch.common.metrics.CounterMetric;
-import org.opensearch.common.settings.Settings;
 import org.opensearch.common.util.CancellableThreads;
 import org.opensearch.common.util.concurrent.ThreadContext;
 import org.opensearch.index.engine.OpenSearchConcurrentMergeScheduler;
@@ -155,20 +154,18 @@ public class WarmFullFileManager {
     private final Set<FullFileState> fullFamilies = ConcurrentHashMap.newKeySet();
     // Demoted families still holding their mapping, so a settings change can restore the ones whose extension returns.
     private final Set<FullFileState> demotedFamilies = ConcurrentHashMap.newKeySet();
-    // The search phases running on this node's warm shards: an evictable family hands views only inside one, and an
-    // evicted family's mapping is released once the phases running at its demotion have ended.
+    // The search scopes running on this node's warm shards: a family hands views only inside one, and the scope holds
+    // the whole file until it ends.
     private final FullFileSearchPhaseTracker searchPhases;
-    // A FULL family is evicted only once no view of it has been cut for this long (WarmFullFileSettings.EVICTION_MIN_IDLE).
-    private volatile long evictionMinIdleMillis = WarmFullFileSettings.EVICTION_MIN_IDLE.getDefault(Settings.EMPTY).millis();
+    // The capacity of one file cache segment; the budget cap is the configured fraction of it.
+    private final long perSegmentCapacity;
     private final CounterMetric evicted = new CounterMetric();
     private final CounterMetric evictedBytes = new CounterMetric();
     // Blocks of promoted files removed from the cache by the sweep, once nothing referenced them any more.
     private final CounterMetric blocksRemoved = new CounterMetric();
-    /**
-     * FULL families that closed while a reader still held handles. Each keeps its mapping, its whole file and its cache
-     * reference until the last handle closes; one that never leaves is a leaked IndexInput somewhere above.
-     */
-    private final Set<FullFileState> awaitingHandleClose = ConcurrentHashMap.newKeySet();
+    // Families that left FULL while search scopes still held views of their mapping, until the unmap runs; a scope
+    // that never ends shows as a count that never drops.
+    private final Set<FullFileState> awaitingRelease = ConcurrentHashMap.newKeySet();
     // The extensions the setting currently allows; the trigger re-checks this so a change applies to open handles too.
     private volatile Set<String> eligibleExtensions = Set.of();
     // Every extension the setting has listed since this manager was created. A file of such an extension gets the
@@ -243,8 +240,8 @@ public class WarmFullFileManager {
         this.maxConcurrentDownloads = Math.max(1, maxConcurrentDownloads);
         this.slots = new ResizableSemaphore(this.maxConcurrentDownloads);
         int segments = fileCache.segmentCount();
-        long perSegmentCapacity = (fileCache.capacity() + segments - 1) / segments;
-        this.budget = new SegmentBudget(segments, (long) (perSegmentCapacity * budgetFraction));
+        this.perSegmentCapacity = (fileCache.capacity() + segments - 1) / segments;
+        this.budget = new SegmentBudget(segments, capFor(budgetFraction));
         this.partSize = partSize > 0 ? partSize : DEFAULT_PART_SIZE;
         for (DeclineReason reason : DeclineReason.values()) {
             declinedByReason.put(reason, new CounterMetric());
@@ -388,15 +385,7 @@ public class WarmFullFileManager {
                 bytes = budget.reserve(segment, length);
                 if (bytes == null) {
                     close();
-                    if (evictColdest(segment)) {
-                        abandonPromotion(
-                            DeclineReason.BUDGET_EXCEEDED,
-                            "per-segment whole-file budget exceeded; a cold whole file is being evicted",
-                            clock.getAsLong() + NO_SLOT_RETRY_DELAY_MILLIS
-                        );
-                    } else {
-                        abandonPromotion(DeclineReason.BUDGET_EXCEEDED, "per-segment whole-file budget exceeded");
-                    }
+                    abandonPromotion(DeclineReason.BUDGET_EXCEEDED, "per-segment whole-file budget exceeded");
                     return;
                 }
 
@@ -410,7 +399,20 @@ public class WarmFullFileManager {
                 CachedIndexInput existing = fileCache.get(path);
                 if (existing != null) {
                     holdsReference = true;
-                    if (existing instanceof FileCache.RestoredCachedIndexInput) {
+                    if (existing instanceof PromotedWholeFileEntry earlier) {
+                        // The whole file of an earlier family of this file, left to the cache when that family closed
+                        // (an index reopen on this node): kept when it validates, like a file left on disk. The entry
+                        // becomes a restore placeholder, which fetchBlobAsync replaces without fetching; the earlier
+                        // family's entry is closed here, since a replacement is silent to the removal listener.
+                        reuse = validateExisting(st);
+                        if (reuse) {
+                            fileCache.put(path, new FileCache.RestoredCachedIndexInput(length));
+                            fileCache.decRef(path); // the put's reference; the attempt keeps the one from get()
+                            closeQuietly(earlier);
+                        } else {
+                            dropEntry();
+                        }
+                    } else if (existing instanceof FileCache.RestoredCachedIndexInput) {
                         // Validated under the reference taken above: a referenced entry is not evictable, so the file
                         // cannot be deleted under the validation. The reference is kept until fetchBlobAsync has replaced
                         // the placeholder (the node keeps its count across the replacement) and released after it.
@@ -535,7 +537,13 @@ public class WarmFullFileManager {
                     close();
                     return;
                 }
-                close(); // the family owns the rest; this gives back the slot
+                // The whole file is now an ordinary cache entry owned by the family's new entry: put under this
+                // attempt's reference, which keeps the key from eviction in between. A replacement is silent to the
+                // removal listener, so the download's own entry is closed here. The put's reference is given back with
+                // the attempt's, so the family holds none while FULL and a scope's reference is the only one.
+                closeQuietly(fileCache.put(path, st.entry()));
+                fileCache.decRef(path);
+                close(); // this gives back the attempt's reference and the slot
                 final long elapsedMillis = clock.getAsLong() - startedAt;
                 promoted.inc();
                 promotedBytes.inc(length);
@@ -581,9 +589,9 @@ public class WarmFullFileManager {
         }
 
         /**
-         * Hands the reserved bytes, the cache reference and the mapping to the family, which publishes the mapping and
-         * moves to FULL in one step. All three or none: when another completion handler published first, or the family
-         * left PROMOTING, this attempt still holds them for its {@link #close()}.
+         * Hands the reserved bytes and the mapping to the family, which publishes the mapping and moves to FULL in one
+         * step. Both or neither: when another completion handler published first, or the family left PROMOTING, this
+         * attempt still holds them for its {@link #close()}.
          *
          * @return true if the family is FULL and owns them
          */
@@ -592,11 +600,19 @@ public class WarmFullFileManager {
             // in the registry to take it out again.
             fullFamilies.add(st);
             Releasable reservation = bytes;
-            FullFileState.Completion completion = st.completePromotion(mapping, executor, () -> {
-                reservation.close();
-                fullFamilies.remove(st);
-                demotedFamilies.remove(st);
-            }, () -> awaitingHandleClose.add(st), () -> awaitingHandleClose.remove(st));
+            PromotedWholeFileEntry entry = new PromotedWholeFileEntry(fileCache, path, mapping, st);
+            FullFileState.Completion completion = st.completePromotion(
+                entry,
+                executor,
+                reservation::close,
+                () -> awaitingRelease.add(st),
+                () -> {
+                    awaitingRelease.remove(st);
+                    fullFamilies.remove(st);
+                    demotedFamilies.remove(st);
+                },
+                () -> onEvictedByCache(st)
+            );
             switch (completion) {
                 case PUBLISHED_BY_OTHER -> {
                     // Concurrent promote() calls join one in-flight download, so each gets a completion. The handler
@@ -612,10 +628,8 @@ public class WarmFullFileManager {
                 }
                 default -> {
                     bytes = null;
-                    holdsReference = false;
                     mapping = null;
                     published = true;
-                    st.touch(clock.getAsLong()); // counts as an access, so a fresh promotion is not evicted as idle
                     return true;
                 }
             }
@@ -810,61 +824,32 @@ public class WarmFullFileManager {
         return searchPhases;
     }
 
-    /** Applies a new minimum idle time for eviction ({@link WarmFullFileSettings#EVICTION_MIN_IDLE}), in milliseconds. */
-    public void onEvictionMinIdleChanged(long millis) {
-        this.evictionMinIdleMillis = millis;
-    }
-
     /**
-     * The eviction policy, run when a promotion is declined for budget. Of the evictable FULL families in the cache
-     * segment, the one idle longest is demoted, if it has been idle for at least the minimum: new clones of it read
-     * blocks at once, and its mapping, whole file and budget are released once the search phases running at that
-     * moment have ended, under its open reader. The family is promoted again by its next access after the release. A
-     * family searched within the minimum is kept, and the declined promotion stays declined.
-     *
-     * @return true if a family is being evicted, so the declined promotion may retry soon
+     * Called by a family's teardown when the file cache dropped its whole file while it was FULL, by eviction under
+     * pressure, a prune, a clear or an explicit remove. The family is already demoted; its mapping is released once
+     * the scopes reading it end, and its next access promotes it again.
      */
-    private boolean evictColdest(int segment) {
-        final long now = clock.getAsLong();
-        FullFileState coldest = null;
-        for (FullFileState st : fullFamilies) {
-            if (st.evictable() == false || st.state() != FullFileState.State.FULL) {
-                continue;
-            }
-            if (fileCache.segmentIndexFor(st.fullFilePath()) != segment || now - st.lastAccessMillis() < evictionMinIdleMillis) {
-                continue;
-            }
-            if (coldest == null || st.lastAccessMillis() < coldest.lastAccessMillis()) {
-                coldest = st;
-            }
-        }
-        if (coldest == null) {
-            return false;
-        }
-        final FullFileState st = coldest;
-        final long idleMillis = now - st.lastAccessMillis();
-        if (st.demote() == false) {
-            return false;
-        }
+    private void onEvictedByCache(FullFileState st) {
         fullFamilies.remove(st);
         evicted.inc();
         evictedBytes.inc(st.fileLength());
-        final long generation = searchPhases.nextGeneration();
         logger.info(
-            "evicting [{}] from its whole file: cache segment {} is over its whole-file budget and the file has been idle for {} ms;"
-                + " its mapping is released once the {} search phase(s) running now end",
+            "the file cache dropped the whole file of [{}]; it is served from blocks and its mapping is released once {} search scope(s) end",
             st.fullFilePath(),
-            segment,
-            idleMillis,
-            searchPhases.inFlight()
+            st.inFlightScopes()
         );
-        searchPhases.whenQuiesced(generation, () -> {
-            if (st.releaseAfterEviction() == false) {
-                logger.debug("evicted [{}] needs no release: restored, released or closed meanwhile", st.fullFilePath());
-            }
-            executor.execute(this::sweepIdleBlocks); // may run on the search thread that ended the last phase
-        });
-        return true;
+    }
+
+    /**
+     * Applies a new budget fraction from {@link WarmFullFileSettings#BUDGET_FRACTION}: the most whole-file bytes one
+     * cache segment may hold becomes that fraction of the segment's capacity. Reservations already held are untouched.
+     */
+    public void onBudgetFractionChanged(double fraction) {
+        budget.setCapPerSegment(capFor(fraction));
+    }
+
+    private long capFor(double fraction) {
+        return (long) (perSegmentCapacity * fraction);
     }
 
     /**
@@ -930,7 +915,7 @@ public class WarmFullFileManager {
     /**
      * Applies a new set of eligible extensions: remembers it for the trigger's check and demotes every FULL family
      * whose extension is no longer in it. A demoted family serves blocks from its next clone or slice; its mapping,
-     * cache reference and budget are released once its handles are gone.
+     * whole file and budget are released once the search scopes reading it end.
      *
      * @param extensions the eligible extensions, normalized as {@link WarmFullFileSettings#getExtensions()} returns them
      */
@@ -964,10 +949,10 @@ public class WarmFullFileManager {
         demotedFamilies.add(st);
         demoted.inc();
         logger.info(
-            "demoted [{}] back to blocks: extension [{}] is no longer configured; its mapping is released once its {} handle(s) close",
+            "demoted [{}] back to blocks: extension [{}] is no longer configured; its mapping is released once {} search scope(s) end",
             st.fullFilePath(),
             extension,
-            st.handleCount()
+            st.inFlightScopes()
         );
     }
 
@@ -1065,12 +1050,12 @@ public class WarmFullFileManager {
         counters.put("activeDownloads", (long) (maxConcurrentDownloads - slots.availablePermits()));
         int awaitingFamilies = 0;
         long awaitingBytes = 0;
-        for (FullFileState st : awaitingHandleClose) {
+        for (FullFileState st : awaitingRelease) {
             awaitingFamilies++;
             awaitingBytes += st.fileLength();
         }
-        counters.put("familiesAwaitingHandleClose", (long) awaitingFamilies);
-        counters.put("bytesAwaitingHandleClose", awaitingBytes);
+        counters.put("familiesAwaitingRelease", (long) awaitingFamilies);
+        counters.put("bytesAwaitingRelease", awaitingBytes);
         return Collections.unmodifiableMap(counters);
     }
 
@@ -1138,13 +1123,23 @@ public class WarmFullFileManager {
 
     /**
      * True for live cache entries that are never reused or served from, and so are removed before re-downloading: a
-     * completed whole-file entry or a switchable family entry. A restore placeholder is handled separately (its file
-     * may be reused), and fetchBlobAsync's own placeholder (a private type), in flight or complete, is joined, not
-     * removed: a complete one hands back its finished download, which is how a family created by an index reopen gets
-     * the whole file its predecessor left in the cache without a second download.
+     * completed whole-file entry of the download's own type or a switchable family entry. A restore placeholder and
+     * an earlier family's promoted entry are handled separately (their file may be reused), and fetchBlobAsync's own
+     * placeholder (a private type), in flight or complete, is joined, not removed.
      */
     private static boolean isKnownNonReusableEntry(CachedIndexInput entry) {
         return entry instanceof CachedFullFileIndexInput || entry instanceof CachedSwitchableIndexInput;
+    }
+
+    private static void closeQuietly(CachedIndexInput entry) {
+        if (entry == null) {
+            return;
+        }
+        try {
+            entry.close();
+        } catch (Exception e) {
+            logger.trace("ignored error closing cache entry");
+        }
     }
 
     private static void closeQuietly(IndexInput input) {

@@ -169,9 +169,19 @@ public class SwitchableIndexInputWrapperWholeFileTests extends TieredStorageBase
 
     /** A manager whose setting lists the fixture file's extension, so eligible handles trigger. */
     private WarmFullFileManager manager(Executor executor, AtomicLong clock) {
-        WarmFullFileManager manager = new WarmFullFileManager(fileCache, new ThreadContext(Settings.EMPTY), executor, clock::get, 8);
+        WarmFullFileManager manager = new WarmFullFileManager(fileCache, threadContext, executor, clock::get, 8);
         manager.onExtensionsChanged(Set.of(WarmFullFileSettings.extensionOf(FILE_NAME)));
         return manager;
+    }
+
+    /** Opens a search scope on the calling thread's context, which every manager of this class reads. */
+    private void enterScope() {
+        new FullFileSearchPhaseTracker(threadContext).enter();
+    }
+
+    /** Ends the scope opened by {@link #enterScope()} on this thread, giving back the whole files it holds. */
+    private void exitScope() {
+        new FullFileSearchPhaseTracker(threadContext).exit();
     }
 
     /** Writes a local whole-file copy whose byte at position p is p mod 251, and opens it as the family master. */
@@ -191,7 +201,16 @@ public class SwitchableIndexInputWrapperWholeFileTests extends TieredStorageBase
 
     private void makeFull(FullFileState st, IndexInput master) {
         assertTrue(st.onAccess(0));
-        assertEquals(FullFileState.Completion.FULL, st.completePromotion(master, null, () -> {}, () -> {}, () -> {}));
+        publish(st, master);
+    }
+
+    /** Publishes {@code master} as the family's mapping and puts its entry in the cache unreferenced, as the manager does. */
+    private void publish(FullFileState st, IndexInput master) {
+        Path path = st.fullFilePath();
+        PromotedWholeFileEntry entry = new PromotedWholeFileEntry(fileCache, path, master, st);
+        assertEquals(FullFileState.Completion.FULL, st.completePromotion(entry, Runnable::run, () -> {}, () -> {}, () -> {}, () -> {}));
+        fileCache.put(path, entry);
+        fileCache.decRef(path);
     }
 
     // ---------------- Trigger ----------------
@@ -297,7 +316,6 @@ public class SwitchableIndexInputWrapperWholeFileTests extends TieredStorageBase
         assertTrue(s instanceof SwitchableIndexInputWrapper);
         assertEquals("no promotion without a manager", FullFileState.State.BLOCK, st.state());
         handle.close();
-        assertEquals(0, st.handleCount());
         IOUtils.close(c, s);
     }
 
@@ -498,6 +516,7 @@ public class SwitchableIndexInputWrapperWholeFileTests extends TieredStorageBase
         );
         IndexInput master = openMaster(len);
         makeFull(st, master);
+        enterScope();
 
         long pos = len / 2;
         handle.seek(pos);
@@ -513,6 +532,7 @@ public class SwitchableIndexInputWrapperWholeFileTests extends TieredStorageBase
         for (int i = 0; i < len; i++) {
             assertEquals("byte " + i, expected(i), all[i]);
         }
+        exitScope();
         IOUtils.close(view, handle, master);
     }
 
@@ -529,6 +549,7 @@ public class SwitchableIndexInputWrapperWholeFileTests extends TieredStorageBase
         );
         IndexInput master = openMaster(len);
         makeFull(st, master);
+        enterScope();
 
         long off = len / 4;
         long sliceLen = len / 2;
@@ -547,6 +568,7 @@ public class SwitchableIndexInputWrapperWholeFileTests extends TieredStorageBase
         if (slice instanceof RandomAccessInput rai) {
             assertEquals("positional read", expected(off + 3), rai.readByte(3));
         }
+        exitScope();
         IOUtils.close(nested, slice, handle, master);
     }
 
@@ -554,18 +576,25 @@ public class SwitchableIndexInputWrapperWholeFileTests extends TieredStorageBase
         SwitchableIndexInput in = remoteModeInput();
         long len = in.length();
         FullFileState st = stateFor(in);
-        // No manager: the clone below must not trigger, so the test can move the state to FULL by hand.
-        SwitchableIndexInputWrapper handle = new PromotableSwitchableIndexInputWrapper("h", in, st, null);
+        // A recording executor: the clone below requests a promotion that never runs, so the test publishes by hand.
+        SwitchableIndexInputWrapper handle = new PromotableSwitchableIndexInputWrapper(
+            "h",
+            in,
+            st,
+            manager(new RecordingExecutor(), new AtomicLong())
+        );
 
         IndexInput before = handle.clone();
         IndexInput master = openMaster(len);
-        makeFull(st, master);
+        publish(st, master);
+        enterScope();
         IndexInput after = handle.clone();
 
         assertTrue("clones taken before FULL are never switched", before instanceof SwitchableIndexInputWrapper);
         assertFalse("new clones get views once FULL", after instanceof SwitchableIndexInputWrapper);
         // The pre-FULL clone still reads (block data in this fixture is all zeros).
         assertEquals(0, before.readByte());
+        exitScope();
         IOUtils.close(before, after, handle, master);
     }
 
@@ -617,6 +646,7 @@ public class SwitchableIndexInputWrapperWholeFileTests extends TieredStorageBase
         long[] p = writeTypedMaster("typed.bin", len);
         IndexInput master = localDirectory.openInput("typed.bin", IOContext.DEFAULT);
         makeFull(st, master);
+        enterScope();
 
         // Sequential reads on a clone view.
         IndexInput view = handle.clone();
@@ -655,6 +685,7 @@ public class SwitchableIndexInputWrapperWholeFileTests extends TieredStorageBase
         IndexInput slice = handle.slice("s", p[2], 12);
         assertEquals(0xCAFEBABE, slice.readInt());
         assertEquals(0x0123456789ABCDEFL, ((RandomAccessInput) slice).readLong(4));
+        exitScope();
         IOUtils.close(slice, view, handle, master);
     }
 
@@ -672,6 +703,7 @@ public class SwitchableIndexInputWrapperWholeFileTests extends TieredStorageBase
         // FSDirectory.open on a 64-bit JVM is an MMapDirectory, so the master is a real mmap input.
         IndexInput master = openMaster(len);
         makeFull(st, master);
+        enterScope();
 
         IndexInput view = handle.clone();
         assertTrue("views must be Lucene's mmap input so k-NN's SIMD scorer can engage", view instanceof MemorySegmentAccessInput);
@@ -700,6 +732,7 @@ public class SwitchableIndexInputWrapperWholeFileTests extends TieredStorageBase
         for (int i = 0; i < 4; i++) {
             assertEquals(expected(10 + i), sliceBytes[i]);
         }
+        exitScope();
         IOUtils.close(slice, view, handle, master);
     }
 
@@ -722,6 +755,7 @@ public class SwitchableIndexInputWrapperWholeFileTests extends TieredStorageBase
         );
         IndexInput master = openMaster(len);
         makeFull(st, master);
+        enterScope();
 
         // In-bounds slices are views.
         IndexInput ok = handle.slice("ok", 8, 16);
@@ -731,6 +765,7 @@ public class SwitchableIndexInputWrapperWholeFileTests extends TieredStorageBase
         // even though a larger master could serve those bytes.
         expectThrows(IllegalArgumentException.class, () -> handle.slice("too-far", len - 4, 8));
         expectThrows(IllegalArgumentException.class, () -> handle.slice("negative", -1, 4));
+        exitScope();
         IOUtils.close(ok, handle, master);
     }
 
@@ -739,14 +774,21 @@ public class SwitchableIndexInputWrapperWholeFileTests extends TieredStorageBase
         long len = in.length();
         assumeTrue("need room for a sub-window", len >= 64);
         FullFileState st = stateFor(in);
-        // No manager: the slice below must not trigger, so the test can move the state to FULL by hand.
-        SwitchableIndexInputWrapper handle = new PromotableSwitchableIndexInputWrapper("h", in, st, null);
+        // A recording executor: the slice below requests a promotion that never runs, so the test moves the state to
+        // FULL by hand.
+        SwitchableIndexInputWrapper handle = new PromotableSwitchableIndexInputWrapper(
+            "h",
+            in,
+            st,
+            manager(new RecordingExecutor(), new AtomicLong())
+        );
 
         // Take a block slice BEFORE FULL (a wrapper over a 16-byte sub-window), then go FULL.
         IndexInput window = handle.slice("w", 8, 16);
         assertTrue(window instanceof SwitchableIndexInputWrapper);
         IndexInput master = openMaster(len);
-        makeFull(st, master);
+        publish(st, master); // the slice above moved the family to PROMOTING
+        enterScope();
 
         // Slicing that 16-byte window: in bounds is a view at the right absolute offset; out of bounds is rejected,
         // even though the master holds bytes past the window.
@@ -754,6 +796,7 @@ public class SwitchableIndexInputWrapperWholeFileTests extends TieredStorageBase
         assertTrue(inner instanceof MemorySegmentAccessInput);
         assertEquals(expected(8 + 4), inner.readByte());
         expectThrows(IllegalArgumentException.class, () -> window.slice("escape", 12, 8));
+        exitScope();
         IOUtils.close(inner, window, handle, master);
     }
 
@@ -786,7 +829,8 @@ public class SwitchableIndexInputWrapperWholeFileTests extends TieredStorageBase
         assertNotNull("whole file is in the FileCache", fileCache.get(getFilePath(localDirectory, FILE_NAME)));
         fileCache.decRef(getFilePath(localDirectory, FILE_NAME)); // undo the get() above
 
-        // Next clone: a view of the local mapping, reading the same bytes (all zeros in this fixture).
+        // Next clone, inside a search scope: a view of the local mapping, reading the same bytes (all zeros in this fixture).
+        enterScope();
         IndexInput second = handle.clone();
         assertTrue("next clone is a whole-file view", second instanceof MemorySegmentAccessInput);
         assertEquals(len, second.length());
@@ -796,6 +840,7 @@ public class SwitchableIndexInputWrapperWholeFileTests extends TieredStorageBase
         // later block fetch would read an exhausted stream. Reading pre-FULL block clones next to views is covered by
         // testBlockCloneTakenBeforeFullStaysABlockInput, which does not download.)
         assertTrue(first instanceof SwitchableIndexInputWrapper);
+        exitScope();
         IOUtils.close(second, first, handle);
     }
 
@@ -854,9 +899,9 @@ public class SwitchableIndexInputWrapperWholeFileTests extends TieredStorageBase
         IOUtils.close(off, on, handle);
     }
 
-    public void testDemotedFamilyServesBlocksReleasesAfterItsHandleAndPromotesAgain() throws Exception {
-        // A FULL family loses its extension from the setting while a handle and a view are open: new clones go back
-        // to blocks at once and nothing is requested, the open view keeps reading, and once the handle closes the
+    public void testDemotedFamilyServesBlocksReleasesAfterItsScopeAndPromotesAgain() throws Exception {
+        // A FULL family loses its extension from the setting while a search scope holds a view: new clones go back
+        // to blocks at once and nothing is requested, the open view keeps reading, and once the scope ends the
         // mapping, the whole file and the budget are released. With the extension back, a new handle promotes again.
         Path switchKey = getFilePathSwitchable(localDirectory, FILE_NAME);
         Path fullPath = getFilePath(localDirectory, FILE_NAME);
@@ -891,6 +936,7 @@ public class SwitchableIndexInputWrapperWholeFileTests extends TieredStorageBase
         );
         handle.clone(); // trigger
         assertBusy(() -> assertEquals(FullFileState.State.FULL, st.state()), 30, TimeUnit.SECONDS);
+        enterScope();
         IndexInput view = handle.clone();
         assertTrue(view instanceof MemorySegmentAccessInput);
         long requestedBefore = realManager.counters().get("requested").longValue();
@@ -899,7 +945,7 @@ public class SwitchableIndexInputWrapperWholeFileTests extends TieredStorageBase
 
         assertEquals(FullFileState.State.BLOCK, st.state());
         assertEquals(1L, realManager.counters().get("demoted").longValue());
-        assertTrue("release waits for the open handle", st.isMappingReleasePending());
+        assertTrue("release waits for the scope", st.isMappingReleasePending());
         IndexInput block = handle.clone();
         assertTrue("new clones read blocks", block instanceof SwitchableIndexInputWrapper);
         assertEquals(
@@ -908,11 +954,11 @@ public class SwitchableIndexInputWrapperWholeFileTests extends TieredStorageBase
             realManager.counters().get("requested").longValue()
         );
         assertEquals("the open view keeps reading", 0, view.readByte());
-        assertEquals("the family still holds its reference", Integer.valueOf(1), fileCache.getRef(fullPath));
+        assertEquals("the scope holds the whole file", Integer.valueOf(1), fileCache.getRef(fullPath));
         assertEquals(content.length, realManager.counters().get("reservedBytes").longValue());
 
         block.close();
-        handle.close();
+        exitScope();
         assertBusy(() -> assertTrue(st.cleanupDone()), 30, TimeUnit.SECONDS);
         assertNull("mapping released", st.localMaster());
         assertNull("whole file dropped from the cache", fileCache.getRef(fullPath));
@@ -930,26 +976,25 @@ public class SwitchableIndexInputWrapperWholeFileTests extends TieredStorageBase
         again.clone(); // trigger
         assertBusy(() -> assertEquals(FullFileState.State.FULL, st.state()), 30, TimeUnit.SECONDS);
         assertEquals(2L, realManager.counters().get("promoted").longValue());
+        enterScope();
         IndexInput viewAgain = again.clone();
         assertTrue(viewAgain instanceof MemorySegmentAccessInput);
-        IOUtils.close(viewAgain, again);
+        exitScope();
+        IOUtils.close(viewAgain, again, handle);
         fileCache.remove(switchKey);
         assertBusy(() -> assertTrue(st.cleanupDone()), 30, TimeUnit.SECONDS);
     }
 
-    public void testAnEvictableFamilyHandsViewsOnlyInsideASearchPhaseAndStampsItsLastAccess() throws Exception {
-        // A family of an evictable extension hands views only to search phases: a clone outside one reads blocks, one
-        // inside is a view and records the access time the eviction policy reads. A family of any other extension
-        // hands views out freely, as the other tests of this class show.
+    public void testAFamilyHandsViewsOnlyInsideASearchScope() throws Exception {
+        // A clone outside a search scope reads blocks; one inside is a view, and the scope holds the whole file for
+        // the search, on the thread that opened it and on the threads it forks to.
         String name = "_gate.faiss";
         byte[] content = footeredContent();
         try (IndexOutput out = localDirectory.createOutput(name, IOContext.DEFAULT)) {
             out.writeBytes(content, content.length);
         }
         Path fullPath = getFilePath(localDirectory, name);
-        fileCache.put(fullPath, new FileCache.RestoredCachedIndexInput(content.length)); // the family's reference
         FullFileState st = new FullFileState(null, localDirectory, fileCache, name, content.length, fullPath);
-        assertTrue(st.evictable());
         AtomicLong clock = new AtomicLong(1_000);
         WarmFullFileManager realManager = new WarmFullFileManager(
             fileCache,
@@ -961,8 +1006,7 @@ public class SwitchableIndexInputWrapperWholeFileTests extends TieredStorageBase
         assertTrue(st.onAccess(0));
         IndexInput mapping = localDirectory.openInput(name, IOContext.DEFAULT);
         // The cleanup runs inline on the test thread when the family closes below.
-        assertEquals(FullFileState.Completion.FULL, st.completePromotion(mapping, Runnable::run, () -> {}, () -> {}, () -> {}));
-        st.touch(clock.get());
+        publish(st, mapping);
 
         // The handle's block side is the fixture's switchable input; its length is the content's.
         Path switchKey = getFilePathSwitchable(localDirectory, FILE_NAME);
@@ -985,10 +1029,9 @@ public class SwitchableIndexInputWrapperWholeFileTests extends TieredStorageBase
             realManager
         );
 
-        clock.set(5_000);
         IndexInput outside = handle.clone();
-        assertTrue("outside a search phase: blocks", outside instanceof SwitchableIndexInputWrapper);
-        assertEquals("not an access", 1_000L, st.lastAccessMillis());
+        assertTrue("outside a search scope: blocks", outside instanceof SwitchableIndexInputWrapper);
+        assertEquals("nothing held", Integer.valueOf(0), fileCache.getRef(fullPath));
 
         // A pool built on the node context copies the caller's context onto each task, as the search pools do.
         OpenSearchThreadPoolExecutor forkPool = OpenSearchExecutors.newFixed(
@@ -1015,21 +1058,21 @@ public class SwitchableIndexInputWrapperWholeFileTests extends TieredStorageBase
             forkPool.shutdownNow();
             forkPool.awaitTermination(10, TimeUnit.SECONDS);
         }
-        assertTrue("inside a search phase: a view", inside instanceof MemorySegmentAccessInput);
-        assertTrue("forked from the phase: a view", forked instanceof MemorySegmentAccessInput);
-        assertTrue("forked outside a phase: blocks", forkedOutside instanceof SwitchableIndexInputWrapper);
-        assertEquals(5_000L, st.lastAccessMillis());
+        assertTrue("inside a search scope: a view", inside instanceof MemorySegmentAccessInput);
+        assertTrue("forked from the scope: a view", forked instanceof MemorySegmentAccessInput);
+        assertTrue("forked outside a scope: blocks", forkedOutside instanceof SwitchableIndexInputWrapper);
+        assertEquals("the scope gave the whole file back", Integer.valueOf(0), fileCache.getRef(fullPath));
         assertEquals("the view reads the file", content[0], inside.readByte());
 
         IOUtils.close(inside, outside, forked, forkedOutside, handle);
         st.closeFamily();
-        assertTrue("state " + st.state() + ", handles " + st.handleCount(), st.cleanupDone());
+        assertTrue("state " + st.state() + ", scopes " + st.inFlightScopes(), st.cleanupDone());
         assertNull(st.localMaster());
         fileCache.remove(switchKey);
     }
 
-    public void testReEnablingWhileTheHandleIsOpenServesViewsAgainWithoutADownload() throws Exception {
-        // The setting drops the extension and lists it again while the reader's handle stays open throughout: the
+    public void testReEnablingWhileAScopeReadsServesViewsAgainWithoutADownload() throws Exception {
+        // The setting drops the extension and lists it again while a search scope holds a view throughout: the
         // family is demoted, then restored from the mapping it still holds, and the next clone is a view again with
         // no download and no new promotion request.
         Path switchKey = getFilePathSwitchable(localDirectory, FILE_NAME);
@@ -1065,6 +1108,9 @@ public class SwitchableIndexInputWrapperWholeFileTests extends TieredStorageBase
         handle.clone(); // trigger
         assertBusy(() -> assertEquals(FullFileState.State.FULL, st.state()), 30, TimeUnit.SECONDS);
         IndexInput master = st.localMaster();
+        enterScope();
+        IndexInput held = handle.clone(); // the scope holds the whole file from here to its end
+        assertTrue(held instanceof MemorySegmentAccessInput);
         long requestedBefore = realManager.counters().get("requested").longValue();
 
         realManager.onExtensionsChanged(Set.of());
@@ -1083,12 +1129,13 @@ public class SwitchableIndexInputWrapperWholeFileTests extends TieredStorageBase
         assertEquals(1L, realManager.counters().get("restored").longValue());
         assertEquals(content.length, realManager.counters().get("reservedBytes").longValue());
 
-        IOUtils.close(view, block, handle);
+        exitScope();
+        IOUtils.close(view, held, block, handle);
         fileCache.remove(switchKey);
         assertBusy(() -> assertTrue(st.cleanupDone()), 30, TimeUnit.SECONDS);
     }
 
-    public void testDeferredCloseKeepsMappingUntilLastHandleThenReleasesEverything() throws Exception {
+    public void testDeferredCloseKeepsMappingUntilTheScopeEndsThenReleasesEverything() throws Exception {
         Path switchKey = getFilePathSwitchable(localDirectory, FILE_NAME);
         Path fullPath = getFilePath(localDirectory, FILE_NAME);
         byte[] content = footeredContent();
@@ -1125,20 +1172,23 @@ public class SwitchableIndexInputWrapperWholeFileTests extends TieredStorageBase
 
         handle.clone(); // trigger
         assertBusy(() -> assertEquals(FullFileState.State.FULL, st.state()), 30, TimeUnit.SECONDS);
-        assertEquals("after FULL the whole-file entry has exactly one reference", Integer.valueOf(1), fileCache.getRef(fullPath));
+        assertEquals("after FULL the whole-file entry is unreferenced", Integer.valueOf(0), fileCache.getRef(fullPath));
+        enterScope();
         IndexInput view = handle.clone();
         assertTrue(view instanceof MemorySegmentAccessInput);
+        assertEquals("the scope holds it", Integer.valueOf(1), fileCache.getRef(fullPath));
 
         // fileCache.remove ignores refcounts and closes the family (the deleteFile/prune/close path) while a view is open.
         fileCache.remove(switchKey);
         assertEquals(FullFileState.State.CLOSED, st.state());
-        assertFalse("not unmapped while a handle is open", st.cleanupDone());
+        assertFalse("not unmapped while a scope reads", st.cleanupDone());
         assertEquals("the view keeps reading", 0, view.readByte());
         assertEquals(Integer.valueOf(1), fileCache.getRef(fullPath));
 
-        // Last handle closes: the deferred cleanup closes the family's master and releases its reference.
+        // The scope ends: the deferred cleanup closes the family's master.
         IndexInput master = st.localMaster();
         handle.close();
+        exitScope();
         assertBusy(() -> assertTrue(st.cleanupDone()), 30, TimeUnit.SECONDS);
         assertNull("master released", st.localMaster());
         assertEquals(Integer.valueOf(0), fileCache.getRef(fullPath));
@@ -1264,6 +1314,7 @@ public class SwitchableIndexInputWrapperWholeFileTests extends TieredStorageBase
                     try {
                         start.await();
                         while (stop.get() == false) {
+                            enterScope(); // each iteration is a search on this thread
                             IndexInput clone = handle.clone();
                             try {
                                 classify(clone, blockResults, viewResults, myViews);
@@ -1301,6 +1352,7 @@ public class SwitchableIndexInputWrapperWholeFileTests extends TieredStorageBase
                             } finally {
                                 slice.close();
                             }
+                            exitScope();
                             iterations.incrementAndGet();
                         }
                     } catch (Throwable e) {
@@ -1343,7 +1395,7 @@ public class SwitchableIndexInputWrapperWholeFileTests extends TieredStorageBase
             assertTrue(viewResults.get() > 0);
             assertEquals(FullFileState.State.FULL, st.state());
             handle.close();
-            assertEquals(0, st.handleCount());
+            assertEquals("every worker's scope ended", 0, st.inFlightScopes());
         } finally {
             promoter.shutdown();
             assertTrue(terminate(promoter));
@@ -1364,25 +1416,4 @@ public class SwitchableIndexInputWrapperWholeFileTests extends TieredStorageBase
 
     // ---------------- Handle count ----------------
 
-    public void testOpenedHandleHoldsOneCountReleasedOnceOnClose() throws IOException {
-        SwitchableIndexInput in = remoteModeInput();
-        FullFileState st = stateFor(in);
-        SwitchableIndexInputWrapper handle = new PromotableSwitchableIndexInputWrapper(
-            "h",
-            in,
-            st,
-            manager(new RecordingExecutor(), new AtomicLong())
-        );
-        assertEquals(1, st.handleCount());
-
-        IndexInput c = handle.clone(); // derived wrappers do not count
-        IndexInput s = handle.slice("s", 0, Math.min(16, in.length()));
-        assertEquals(1, st.handleCount());
-
-        handle.close();
-        assertEquals(0, st.handleCount());
-        handle.close(); // idempotent
-        assertEquals(0, st.handleCount());
-        IOUtils.close(c, s);
-    }
 }

@@ -8,6 +8,7 @@
 
 package org.opensearch.storage.warmfullfile;
 
+import org.opensearch.action.admin.indices.cache.clear.ClearIndicesCacheResponse;
 import org.opensearch.action.bulk.BulkRequest;
 import org.opensearch.action.bulk.BulkResponse;
 import org.opensearch.action.search.SearchResponse;
@@ -33,13 +34,14 @@ import static org.hamcrest.Matchers.greaterThan;
 import static org.hamcrest.Matchers.greaterThanOrEqualTo;
 
 /**
- * Eviction of a promoted whole file under budget pressure, while its segment reader stays open and searches run.
+ * A promoted whole file as a file cache entry: the budget caps admission and the cache decides what leaves. A
+ * declined promotion evicts nothing, and clearing the file cache drops a promoted file under its open reader, which
+ * answers from blocks with the same results and promotes the file again on its next searches.
  *
- * <p>Uses doc-values files ({@code .dvd}), which Lucene slices afresh for every query, so a released mapping is never
- * read by a cached clone; stored fields would not do, since their reader keeps a clone per thread, which is why only
- * such extensions are evictable. The whole-file budget is one per file cache segment, and a file lands in the segment its path hashes to, so the second index's
- * merged segment is named so that its {@code .dvd} shares the first index's cache segment. The budget fraction is
- * set so that one such file fits the segment's budget and two do not.
+ * <p>Uses doc-values files ({@code .dvd}). The whole-file budget is one per file cache segment, and a file lands in
+ * the segment its path hashes to, so the second index's merged segment is named so that its {@code .dvd} shares the
+ * first index's cache segment. The budget fraction is set so that one such file fits the segment's budget and two
+ * do not.
  */
 public class WarmFullFileEvictionIT extends WarmFullFileBaseIT {
 
@@ -72,7 +74,7 @@ public class WarmFullFileEvictionIT extends WarmFullFileBaseIT {
             .build();
     }
 
-    public void testBudgetPressureEvictsAColdWholeFileUnderItsOpenReaderAndKeepsAHotOne() throws Exception {
+    public void testABudgetDeclineEvictsNothingAndClearingTheCacheDropsAWholeFileUnderItsReader() throws Exception {
         String warmNode = startCluster();
         createKeywordIndex(INDEX_A);
         indexKeywordDocs(INDEX_A, 0, DOCS);
@@ -94,7 +96,6 @@ public class WarmFullFileEvictionIT extends WarmFullFileBaseIT {
         );
 
         setFullFileExtensions(DVD_EXTENSION);
-        setEvictionMinIdle("1s");
         reopenIndex(INDEX_A);
         reopenIndex(INDEX_B);
         a = warmShard(INDEX_A, warmNode);
@@ -110,40 +111,41 @@ public class WarmFullFileEvictionIT extends WarmFullFileBaseIT {
         Path wholeFileA = a.directory.getFilePath(dvdA);
         WarmFullFileManager manager = a.manager;
 
-        // A promotes and goes idle. The first search on B asks for B's promotion, which the budget declines; that
-        // evicts A, the coldest whole file in the segment: A's new reads go back to blocks, its mapping and file are
-        // released once the searches running at that moment have ended, under A's open reader, and B promotes on its
-        // retry.
+        // A promotes. Searches on B ask for B's promotion, which the budget declines; nothing is evicted for it, since
+        // which whole files leave is the cache's decision, and A keeps serving its whole file.
         searchUntilPromoted(INDEX_A, a, dvdA);
         String fingerprintA = fingerprint(INDEX_A);
         FullFileState familyA = requireFamilyState(a, dvdA);
-        assertBusy(
-            () -> assertThat(manager.relativeTimeInMillis() - familyA.lastAccessMillis(), greaterThan(1_000L)),
-            WAIT_TIMEOUT.seconds(),
-            TimeUnit.SECONDS
-        );
-        searchUntilPromoted(INDEX_B, b, dvdB);
+        assertBusy(() -> {
+            searchKeywords(INDEX_B);
+            assertThat(manager.counters().get("declined.BUDGET_EXCEEDED"), greaterThanOrEqualTo(1L));
+        }, WAIT_TIMEOUT.seconds(), TimeUnit.SECONDS);
         String fingerprintB = fingerprint(INDEX_B);
+        assertEquals(0L, manager.counters().get("evicted").longValue());
+        assertEquals(FullFileState.State.FULL, familyA.state());
+        assertEquals(FullFileState.State.BLOCK, stateOf(b, dvdB));
+        assertEquals(lengthA, manager.counters().get("reservedBytes").longValue());
+
+        // Clearing A's file cache drops its whole file, an unreferenced entry between searches: A's reads go back to
+        // blocks with the same results, its mapping is released under its open reader, and its budget goes back.
+        ClearIndicesCacheResponse cleared = client().admin().indices().prepareClearCache(INDEX_A).setFileCache(true).get();
+        assertEquals(cleared.toString(), 0, cleared.getFailedShards());
         assertEquals(1L, manager.counters().get("evicted").longValue());
         assertEquals(lengthA, manager.counters().get("evictedBytes").longValue());
         assertEquals(FullFileState.State.BLOCK, familyA.state());
         assertBusy(() -> {
             assertTrue("A's mapping released under its open reader", familyA.cleanupDone());
             assertFalse("A's whole file deleted", Files.exists(wholeFileA));
-            assertEquals("only B's budget is held", lengthB, manager.counters().get("reservedBytes").longValue());
+            assertEquals("A's budget given back", 0L, manager.counters().get("reservedBytes").longValue());
         }, DOWNLOAD_TIMEOUT.seconds(), TimeUnit.SECONDS);
-
-        // With a long minimum idle time, searches on A ask for its promotion again and are declined: B was searched
-        // recently, so it is kept and nothing more is evicted. A answers from blocks with the same results.
-        setEvictionMinIdle("1h");
-        assertBusy(() -> {
-            assertEquals("A answers from blocks", fingerprintA, fingerprint(INDEX_A));
-            assertThat(manager.counters().get("declined.BUDGET_EXCEEDED"), greaterThanOrEqualTo(2L));
-        }, WAIT_TIMEOUT.seconds(), TimeUnit.SECONDS);
-        assertEquals(1L, manager.counters().get("evicted").longValue());
-        assertEquals(FullFileState.State.FULL, stateOf(b, dvdB));
-        assertEquals(FullFileState.State.BLOCK, familyA.state());
+        assertEquals("A answers from blocks", fingerprintA, fingerprint(INDEX_A));
         assertEquals(fingerprintB, fingerprint(INDEX_B));
+
+        // A's next searches promote it again.
+        searchUntilPromoted(INDEX_A, a, dvdA);
+        assertEquals(2L, manager.counters().get("promoted").longValue());
+        assertEquals(fingerprintA, fingerprint(INDEX_A));
+        assertEquals(FullFileState.State.FULL, familyA.state());
 
         deleteIndex(INDEX_A, INDEX_B);
     }
@@ -222,16 +224,6 @@ public class WarmFullFileEvictionIT extends WarmFullFileBaseIT {
             .collect(Collectors.toList());
         assertEquals("expected exactly one doc-values file after the force merge: " + dvds, 1, dvds.size());
         return dvds.get(0);
-    }
-
-    private void setEvictionMinIdle(String minIdle) {
-        assertAcked(
-            client().admin()
-                .cluster()
-                .prepareUpdateSettings()
-                .setPersistentSettings(Settings.builder().put(WarmFullFileSettings.EVICTION_MIN_IDLE.getKey(), minIdle))
-                .get()
-        );
     }
 
     /**

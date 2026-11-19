@@ -157,7 +157,7 @@ public class WarmFullFilePerSegmentBudgetTests extends OpenSearchTestCase {
         for (FullFileState st : full) {
             assertNotNull(fileCache.get(st.fullFilePath()));
             fileCache.decRef(st.fullFilePath());
-            assertEquals(Integer.valueOf(1), fileCache.getRef(st.fullFilePath()));
+            assertEquals("the family holds no reference", Integer.valueOf(0), fileCache.getRef(st.fullFilePath()));
         }
     }
 

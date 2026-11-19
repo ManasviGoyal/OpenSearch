@@ -26,7 +26,7 @@ final class SegmentBudget {
     private static final Logger logger = LogManager.getLogger(SegmentBudget.class);
 
     private final AtomicLongArray reserved;
-    private final long capPerSegment;
+    private volatile long capPerSegment;
 
     /**
      * @param segments      the file cache's segment count
@@ -57,6 +57,11 @@ final class SegmentBudget {
     /** @return the most whole-file bytes one segment may hold */
     long capPerSegment() {
         return capPerSegment;
+    }
+
+    /** Applies a new cap; reservations already held are untouched, and a segment over the new cap admits nothing until it is under. */
+    void setCapPerSegment(long capPerSegment) {
+        this.capPerSegment = capPerSegment;
     }
 
     /** @return the number of segments */

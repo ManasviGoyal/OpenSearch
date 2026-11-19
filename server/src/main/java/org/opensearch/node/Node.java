@@ -1005,7 +1005,7 @@ public class Node implements Closeable {
                 if (warmFullFileManager != null) {
                     warmFullFileSettings.addListener(warmFullFileManager::onExtensionsChanged);
                     warmFullFileSettings.addMaxConcurrentDownloadsListener(warmFullFileManager::onMaxConcurrentDownloadsChanged);
-                    warmFullFileSettings.addEvictionMinIdleListener(warmFullFileManager::onEvictionMinIdleChanged);
+                    warmFullFileSettings.addBudgetFractionListener(warmFullFileManager::onBudgetFractionChanged);
                 }
             } else {
                 tieredStoragePrefetchSettings = null;

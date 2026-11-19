@@ -17,7 +17,6 @@ import org.opensearch.storage.warmfullfile.FullFileState;
 import org.opensearch.storage.warmfullfile.WarmFullFileManager;
 
 import java.io.IOException;
-import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
  * A {@link SwitchableIndexInputWrapper} whose file may be promoted to a whole local file.
@@ -34,14 +33,9 @@ public class PromotableSwitchableIndexInputWrapper extends SwitchableIndexInputW
     private final String fullCloneDescription;
     private final FullFileState fullFileState;
     private final WarmFullFileManager manager;
-    // Non-null only for handles opened by openInput: true while this handle holds its one count on the family state.
-    private final AtomicBoolean handleCounted;
     private static final Logger logger = LogManager.getLogger(PromotableSwitchableIndexInputWrapper.class);
 
     /**
-     * Constructor for a handle opened by {@code TieredDirectory.openInput}. The handle holds one count on the family
-     * state until it is closed, so the family mapping is not unmapped while it may still be in use.
-     *
      * @param resourceDescription a human-readable description
      * @param in                  the underlying switchable input
      * @param fullFileState       the family's whole-file promotion state
@@ -53,29 +47,10 @@ public class PromotableSwitchableIndexInputWrapper extends SwitchableIndexInputW
         FullFileState fullFileState,
         WarmFullFileManager manager
     ) {
-        this(resourceDescription, in, fullFileState, manager, true);
-    }
-
-    private PromotableSwitchableIndexInputWrapper(
-        String resourceDescription,
-        SwitchableIndexInput in,
-        FullFileState fullFileState,
-        WarmFullFileManager manager,
-        boolean countsHandle
-    ) {
         super(resourceDescription, in);
         this.fullCloneDescription = "Full clone " + resourceDescription;
         this.fullFileState = fullFileState;
         this.manager = manager;
-        if (countsHandle) {
-            fullFileState.incHandles();
-            // Released only on close(), deliberately NOT by the Cleaner: a whole-file view does not reference this
-            // wrapper, so the wrapper can become unreachable while a view derived from it is still in use; a Cleaner
-            // release could then let the deferred close unmap under that live view (SIGSEGV).
-            this.handleCounted = new AtomicBoolean(true);
-        } else {
-            this.handleCounted = null;
-        }
     }
 
     @Override
@@ -89,13 +64,11 @@ public class PromotableSwitchableIndexInputWrapper extends SwitchableIndexInputW
             return view;
         }
         requestPromotion();
-        // Derived wrappers share the family state but do not hold a handle count.
         return new PromotableSwitchableIndexInputWrapper(
             "Cloned " + resourceDescription,
             switchableIndexInput.clone(),
             fullFileState,
-            manager,
-            false
+            manager
         );
     }
 
@@ -116,8 +89,7 @@ public class PromotableSwitchableIndexInputWrapper extends SwitchableIndexInputW
             "Sliced " + resourceDescription,
             switchableIndexInput.slice(sliceDescription, offset, length),
             fullFileState,
-            manager,
-            false
+            manager
         );
     }
 
@@ -129,26 +101,22 @@ public class PromotableSwitchableIndexInputWrapper extends SwitchableIndexInputW
 
     /**
      * A view of the family's whole-file mapping, or null when the handle must keep reading blocks: the family is not
-     * FULL, the mapping is not published, the mapping was closed under this read, or the family is evictable and this
-     * thread is not inside a search phase. Blocks are always valid, so every fallback is silent except an
-     * unexpected I/O error, which is logged at DEBUG.
+     * FULL, the mapping is not published, this thread is outside a search scope, the scope found the file dropped
+     * from the cache, or the mapping was closed under this read. Blocks are always valid, so every fallback is silent
+     * except an unexpected I/O error, which is logged at DEBUG.
      */
     private IndexInput viewOrNull(String what, ViewCutter cutter) {
         IndexInput master = fullFileState.localMaster(); // read the volatile once
         if (fullFileState.state() != FullFileState.State.FULL || master == null) {
             return null;
         }
-        // An evictable family hands views only to search phases, so that once the phases running at its demotion
-        // have ended no view of its mapping can be read and the mapping can be released under the open reader.
-        if (fullFileState.evictable() && (manager == null || manager.searchPhases().inPhase() == false)) {
+        // The scope holds a reference on the whole file and an in-flight count on the family until the search ends,
+        // so the cache does not evict the file under this view and a demotion does not unmap it.
+        if (manager == null || manager.searchPhases().holdsView(fullFileState) == false) {
             return null;
         }
         try {
-            IndexInput view = cutter.cut(master);
-            if (manager != null) {
-                fullFileState.touch(manager.relativeTimeInMillis()); // for the eviction policy's idle check
-            }
-            return view;
+            return cutter.cut(master);
         } catch (AlreadyClosedException e) {
             return null;
         } catch (IOException e) {
@@ -178,17 +146,6 @@ public class PromotableSwitchableIndexInputWrapper extends SwitchableIndexInputW
     private void requestPromotion() {
         if (manager != null) {
             manager.requestPromotion(fullFileState);
-        }
-    }
-
-    @Override
-    public void close() throws IOException {
-        try {
-            super.close();
-        } finally {
-            if (handleCounted != null && handleCounted.compareAndSet(true, false)) {
-                fullFileState.decHandles();
-            }
         }
     }
 }

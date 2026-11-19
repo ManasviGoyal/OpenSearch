@@ -84,7 +84,7 @@ public class PromotableCachedSwitchableIndexInput extends CachedSwitchableIndexI
     public void close() throws Exception {
         if (familyClosed.compareAndSet(false, true)) {
             // Runs inside the FileCache removal listener under a segment lock. closeFamily() never touches the FileCache
-            // inline: it defers the unmap, the decRef and the budget release to a pool thread, once the last handle closes.
+            // inline: it defers the unmap and the budget release to a pool thread, once no search scope reads the mapping.
             fullFileState.closeFamily();
         }
         super.close();

@@ -14,30 +14,23 @@ import org.opensearch.index.shard.SearchOperationListener;
 import org.opensearch.search.internal.SearchContext;
 
 import java.util.Deque;
-import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedDeque;
-import java.util.concurrent.CopyOnWriteArrayList;
-import java.util.concurrent.atomic.AtomicLong;
 
 /**
- * Tracks the search phases running on this node's warm shards, so a whole-file mapping can be released while its
- * reader stays open. A query phase, a fetch phase or one slice of a concurrent segment search is a phase, reported by
- * the {@link SearchOperationListener} hooks. A whole-file view is cut only inside a phase ({@link #inPhase()}), so
- * once every phase that was running when a family was demoted has ended, no view of its mapping can still be read,
- * and the mapping can be unmapped.
+ * Tracks the search phases running on this node's warm shards as scopes, so a promoted whole file is referenced
+ * exactly while a search reads it. A query phase, a fetch phase or one slice of a concurrent segment search is a
+ * phase, reported by the {@link SearchOperationListener} hooks. The phases a request is inside form its
+ * {@link Scope}, stored as a transient of the {@link ThreadContext}: the thread pools copy the context onto every
+ * task they run, so a task forked from a phase (a concurrent segment search slice, or the per-leaf tasks k-NN
+ * submits through the searcher's task executor) shares the scope and is inside the phase too. A thread whose context
+ * has no scope, such as a merge thread or a recovery thread, is outside every phase and reads blocks.
  *
- * <p>The phases a request is inside are kept in a {@link Scope} stored as a transient of the {@link ThreadContext}.
- * The thread pools copy the context onto every task they run, so a task forked from a phase (a concurrent segment
- * search slice, or the per-leaf tasks k-NN submits through the searcher's task executor) shares its scope and is
- * inside the phase too. A thread whose context has no scope, such as a merge thread or a recovery thread, is outside
- * every phase and reads blocks.
- *
- * <p>Each phase is stamped with the generation current when it starts. {@link #whenQuiesced} takes a generation and
- * runs its action once no phase stamped at or before it is still running; phases that start later are not waited
- * for, because they were handed blocks, not views. The wait is therefore bounded by the longest phase in flight at
- * the demotion, on any shard, which is the length of one search.
+ * <p>A whole-file view is cut only through {@link #holdsView}: the first view of a family in a scope takes one
+ * reference on the whole-file cache entry and one in-flight count on the family, and the scope's end gives both
+ * back. Between searches a promoted file is therefore an unreferenced cache entry, evicted like a block, and a
+ * family demoted while a scope reads it unmaps only once that scope ends.
  *
  * @opensearch.experimental
  */
@@ -48,23 +41,17 @@ public final class FullFileSearchPhaseTracker implements SearchOperationListener
     static final String SCOPE_TRANSIENT = "warm_full_file.search_scope";
 
     /**
-     * The phases one request is inside, shared by every thread the request's context was copied to. Entering pushes
-     * a token and exiting pops the most recent one; with slices on several threads a pop can take another slice's
-     * token, which is safe because tokens are interchangeable except for their generation stamp, and the most recent
-     * token never carries an older stamp than the phase that is ending.
+     * The phases one request is inside and the whole files it holds, shared by every thread the request's context was
+     * copied to. Entering pushes a token and exiting pops one; the scope ends when no token is left. With slices on
+     * several threads a pop can take another slice's token, which is harmless because tokens are interchangeable.
      */
     static final class Scope {
         private final Deque<Object> tokens = new ConcurrentLinkedDeque<>();
-    }
-
-    private record Waiter(long generation, Runnable action) {
+        // The families this scope holds a view of; false for one whose file the cache had already dropped.
+        private final Map<FullFileState, Boolean> held = new ConcurrentHashMap<>();
     }
 
     private final ThreadContext threadContext;
-    private final AtomicLong generation = new AtomicLong();
-    // Every running phase, by its token, stamped with the generation it started under.
-    private final Map<Object, Long> inFlight = new ConcurrentHashMap<>();
-    private final List<Waiter> waiters = new CopyOnWriteArrayList<>();
 
     public FullFileSearchPhaseTracker(ThreadContext threadContext) {
         this.threadContext = threadContext;
@@ -122,64 +109,44 @@ public final class FullFileSearchPhaseTracker implements SearchOperationListener
             scope = new Scope();
             threadContext.putTransient(SCOPE_TRANSIENT, scope);
         }
-        Object token = new Object();
-        inFlight.put(token, generation.get());
-        scope.tokens.addLast(token);
+        scope.tokens.addLast(new Object());
     }
 
-    /** Records that the current context has ended its most recent phase, and runs the actions that unblocks. */
+    /** Records that the current context has ended a phase; the end of its last phase gives back every view it holds. */
     void exit() {
         Scope scope = threadContext.getTransient(SCOPE_TRANSIENT);
-        Object token = scope == null ? null : scope.tokens.pollLast();
-        if (token == null) {
+        if (scope == null || scope.tokens.pollLast() == null) {
             return;
         }
-        inFlight.remove(token);
-        runQuiesced();
+        if (scope.tokens.isEmpty()) {
+            for (Map.Entry<FullFileState, Boolean> hold : scope.held.entrySet()) {
+                if (hold.getValue()) {
+                    hold.getKey().releaseView();
+                }
+            }
+            scope.held.clear();
+        }
     }
 
-    /** @return true while the current context is inside a search phase, i.e. may be handed a whole-file view */
+    /** @return true while the current context is inside a search phase */
     public boolean inPhase() {
         Scope scope = threadContext.getTransient(SCOPE_TRANSIENT);
         return scope != null && scope.tokens.isEmpty() == false;
     }
 
     /**
-     * Starts a new generation: phases that start from now on are stamped with it, and are not waited for by a
-     * {@link #whenQuiesced} call for the generation returned.
+     * Whether the current scope holds a view of {@code family}, taking it on the first call for the family in the
+     * scope. Concurrent first calls from threads sharing the scope wait for the one that takes it, so no thread cuts
+     * a view before the hold exists.
      *
-     * @return the generation the phases running now, and every earlier one, are stamped at or below
+     * @return true if the caller may cut a view of the family's mapping; false outside a phase, when the family is
+     *         not FULL, or when the cache had dropped the file at the first call in this scope
      */
-    long nextGeneration() {
-        return generation.getAndIncrement();
-    }
-
-    /**
-     * Runs {@code action} once no phase stamped at or before {@code generation} is running: at once, on the calling
-     * thread, if none is; otherwise on the search thread that ends the last of them.
-     */
-    void whenQuiesced(long generation, Runnable action) {
-        waiters.add(new Waiter(generation, action));
-        runQuiesced();
-    }
-
-    /** @return the number of phases running on this node */
-    int inFlight() {
-        return inFlight.size();
-    }
-
-    private void runQuiesced() {
-        if (waiters.isEmpty()) {
-            return;
+    public boolean holdsView(FullFileState family) {
+        Scope scope = threadContext.getTransient(SCOPE_TRANSIENT);
+        if (scope == null || scope.tokens.isEmpty()) {
+            return false;
         }
-        long oldestRunning = Long.MAX_VALUE;
-        for (long started : inFlight.values()) {
-            oldestRunning = Math.min(oldestRunning, started);
-        }
-        for (Waiter waiter : waiters) {
-            if (waiter.generation() < oldestRunning && waiters.remove(waiter)) {
-                waiter.action().run();
-            }
-        }
+        return scope.held.computeIfAbsent(family, FullFileState::acquireView);
     }
 }

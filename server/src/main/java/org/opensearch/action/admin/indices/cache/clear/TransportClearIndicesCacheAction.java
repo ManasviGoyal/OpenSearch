@@ -48,6 +48,8 @@ import org.opensearch.common.Nullable;
 import org.opensearch.common.inject.Inject;
 import org.opensearch.core.action.support.DefaultShardOperationFailedException;
 import org.opensearch.core.common.io.stream.StreamInput;
+import org.opensearch.index.IndexService;
+import org.opensearch.index.shard.IndexShard;
 import org.opensearch.index.shard.ShardPath;
 import org.opensearch.indices.IndicesService;
 import org.opensearch.node.Node;
@@ -127,7 +129,13 @@ public class TransportClearIndicesCacheAction extends TransportBroadcastByNodeAc
     @Override
     protected EmptyResult shardOperation(ClearIndicesCacheRequest request, ShardRouting shardRouting) {
         if (request.fileCache()) {
-            ShardPath shardPath = ShardPath.loadFileCachePath(node.getNodeEnvironment(), shardRouting.shardId());
+            // The shard's own path: a writable warm shard keeps its cache entries under its ordinary shard path, a
+            // remote snapshot shard under the file cache path, which is the only one when the shard is not open here.
+            IndexService indexService = indicesService.indexService(shardRouting.index());
+            IndexShard indexShard = indexService == null ? null : indexService.getShardOrNull(shardRouting.id());
+            ShardPath shardPath = indexShard != null
+                ? indexShard.shardPath()
+                : ShardPath.loadFileCachePath(node.getNodeEnvironment(), shardRouting.shardId());
             if (node.fileCache() != null) {
                 Predicate<Path> pathStartsWithShardPathPredicate = path -> path.startsWith(shardPath.getDataPath());
                 node.fileCache().prune(pathStartsWithShardPathPredicate);
