@@ -12,6 +12,7 @@ import com.carrotsearch.randomizedtesting.annotations.ThreadLeakFilters;
 import org.apache.logging.log4j.Level;
 import org.apache.logging.log4j.LogManager;
 import org.apache.lucene.codecs.CodecUtil;
+import org.apache.lucene.store.AlreadyClosedException;
 import org.apache.lucene.store.FSDirectory;
 import org.apache.lucene.store.FSLockFactory;
 import org.apache.lucene.store.IOContext;
@@ -1468,6 +1469,30 @@ public class WarmFullFileManagerTests extends OpenSearchTestCase {
         assertEquals("downloaded again after the demotion", 2 * parts, reader.readCount());
         assertEquals(content.length, mgr.reservedBytesPerSegment()[0]);
         assertEquals(2L, mgr.counters().get("promoted").longValue());
+    }
+
+    public void testReleasingAWholeFileUnmapsItWhileAnotherFileOfTheSegmentStaysOpen() throws Exception {
+        // Another file of the same segment is open on the shard's directory, which maps a segment's files as one
+        // group that is unmapped only when all of them are closed. The whole file has a mapping of its own, so its
+        // release unmaps it: a view cut before the release can no longer be read.
+        String name = "_7.faiss";
+        byte[] content = footeredContent(FILE_LENGTH);
+        FileCache fileCache = newFileCache();
+        TransferManager tm = new TransferManager(new FixedContentStreamReader(content), fileCache, threadPool);
+        WarmFullFileManager mgr = newManager(fileCache, 4, 0.5);
+        Files.write(dir.resolve("_7.veq"), footeredContent(FILE_LENGTH));
+
+        try (IndexInput sameSegment = localDirectory.openInput("_7.veq", IOContext.DEFAULT)) {
+            FullFileState st = promoteToFull(mgr, fileCache, name, content, tm);
+            IndexInput view = st.localMaster().slice("view", 0, 16);
+            assertEquals(content[0], view.readByte());
+
+            mgr.onExtensionsChanged(Set.of());
+            assertBusy(() -> assertTrue("release ran", st.cleanupDone()), 30, TimeUnit.SECONDS);
+
+            expectThrows(AlreadyClosedException.class, view::readByte);
+            assertEquals("the other file is still readable", footeredContent(FILE_LENGTH)[0], sameSegment.readByte());
+        }
     }
 
     public void testAnExtensionChangeDemotesOnTheExecutorNotTheCallingThread() throws Exception {

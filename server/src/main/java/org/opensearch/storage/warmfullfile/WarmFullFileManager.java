@@ -16,6 +16,7 @@ import org.apache.lucene.store.IOContext;
 import org.apache.lucene.store.IndexInput;
 import org.apache.lucene.store.MMapDirectory;
 import org.apache.lucene.store.MemorySegmentAccessInput;
+import org.apache.lucene.store.NoLockFactory;
 import org.opensearch.ExceptionsHelper;
 import org.opensearch.common.annotation.ExperimentalApi;
 import org.opensearch.common.lease.Releasable;
@@ -528,7 +529,7 @@ public class WarmFullFileManager {
                     return;
                 }
                 // Open the family's OWN mapping with the RANDOM hint (do not reuse the cache entry's input).
-                mapping = localDirectory.openInput(st.fileName(), IOContext.DEFAULT.withHints(DataAccessHint.RANDOM));
+                mapping = openOwnMapping(localDirectory, st.fileName());
                 // The master must be Lucene's mmap input. Views of an NIO master would go through
                 // BufferedIndexInput (a copy per read, no k-NN SIMD), which is not the feature. Known directory types
                 // were settled in start(); this catches any other type, and the answer will not change for this family.
@@ -1133,6 +1134,24 @@ public class WarmFullFileManager {
             offset += partLen;
         }
         return parts;
+    }
+
+    /**
+     * Opens a mapping of the whole file that is unmapped when it is closed. The local directory maps the files of one
+     * segment as a group and unmaps them only when every input of the group is closed, so a file it memory-maps is
+     * opened through a directory of its own on the same path, which groups nothing. A directory type whose inputs are
+     * not known in advance opens the file itself, for the caller to check.
+     */
+    private static IndexInput openOwnMapping(FSDirectory localDirectory, String fileName) throws IOException {
+        final IOContext context = IOContext.DEFAULT.withHints(DataAccessHint.RANDOM);
+        if (Boolean.TRUE.equals(FsDirectoryFactory.isMemoryMapped(localDirectory, fileName)) == false) {
+            return localDirectory.openInput(fileName, context);
+        }
+        // Holds no lock and no state besides its settings, so it is not kept: the input does not need it once open.
+        final MMapDirectory own = new MMapDirectory(localDirectory.getDirectory(), NoLockFactory.INSTANCE, maxChunkSize(localDirectory));
+        own.setReadAdvice(MMapDirectory.ADVISE_BY_CONTEXT);
+        own.setGroupingFunction(MMapDirectory.NO_GROUPING);
+        return own.openInput(fileName, context);
     }
 
     /** The local directory's mmap chunk size if it is an MMapDirectory, else Lucene's default. */
