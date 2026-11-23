@@ -57,6 +57,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.LongSupplier;
+import java.util.stream.Stream;
 
 // CachedFullFileIndexInput (used by the pre-existing-entry tests) registers with a Cleaner whose daemon thread is never
 // stopped; the filter excludes that one thread from leak detection, as the other FileCache tests do.
@@ -914,7 +915,8 @@ public class WarmFullFileManagerTests extends OpenSearchTestCase {
         release.countDown();
         awaitState(held, FullFileState.State.FULL);
         awaitState(other, FullFileState.State.FULL);
-        assertEquals(0L, mgr.counters().get("activeDownloads").longValue());
+        // A download gives its slot back just after its family turns FULL.
+        assertBusy(() -> assertEquals(0L, mgr.counters().get("activeDownloads").longValue()), 30, TimeUnit.SECONDS);
     }
 
     public void testLoweringTheDownloadCapBelowTheRunningCountAdmitsNothingUntilEnoughFinish() throws Exception {
@@ -1844,36 +1846,32 @@ public class WarmFullFileManagerTests extends OpenSearchTestCase {
         assertEquals(content.length, stats.get("downloadedBytes").longValue());
     }
 
-    public void testDownloadIsRenamedIntoPlaceAndAStaleTempFileIsRemoved() throws Exception {
-        // A temp file left by a download that never reached its rename, registered in the cache by the restart that
-        // found it: the promotion removes it and its entry, downloads to the temp path again and renames the complete
-        // file into place, so only the whole file remains and it serves with the family's single reference.
+    public void testDownloadIsRenamedIntoPlaceAndLeavesNoTempFile() throws Exception {
+        // The promotion downloads to a temp file of its own and renames the complete file into place, so afterwards
+        // only the whole file exists and the cache holds nothing but it.
         String name = "_renamed.faiss";
         Path path = dir.resolve(name);
-        Path temp = path.resolveSibling(name + FileTypeUtils.PARTIAL_DOWNLOAD_SUFFIX);
         byte[] content = footeredContent(FILE_LENGTH);
         FixedContentStreamReader reader = new FixedContentStreamReader(content);
         FileCache fileCache = newFileCache();
         TransferManager tm = new TransferManager(reader, fileCache, threadPool);
         WarmFullFileManager mgr = newManager(fileCache, 4, 0.5);
-        Files.write(temp, Arrays.copyOf(content, content.length / 2));
-        putRestoredPlaceholder(fileCache, temp, content.length / 2);
-        long usageBefore = fileCache.usage();
 
         FullFileState st = newStateWithChecksum(tm, fileCache, name, content.length, footerChecksum(content));
         startPromotion(mgr, st);
         awaitState(st, FullFileState.State.FULL);
 
         assertEquals("one download, one read per part", partsFor(name, content.length), reader.readCount());
-        assertFalse("the stale temp file is gone", Files.exists(temp));
-        assertNull("and so is its cache entry", fileCache.get(temp));
         assertTrue(Files.exists(path));
+        try (Stream<Path> files = Files.list(dir)) {
+            assertEquals(
+                "no temp file is left behind",
+                List.of(),
+                files.map(file -> file.getFileName().toString()).filter(FileTypeUtils::isPartialDownloadFile).toList()
+            );
+        }
         assertServedUnreferenced(st, fileCache, path, content);
-        assertEquals(
-            "the cache holds the whole file and nothing for the temp",
-            usageBefore - content.length / 2 + content.length,
-            fileCache.usage()
-        );
+        assertEquals("the cache holds the whole file and nothing else", content.length, fileCache.usage());
         assertEquals(0L, mgr.counters().get("reused").longValue());
         assertEquals(1L, mgr.counters().get("started").longValue());
     }

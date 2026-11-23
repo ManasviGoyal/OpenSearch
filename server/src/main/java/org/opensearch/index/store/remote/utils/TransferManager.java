@@ -167,7 +167,8 @@ public class TransferManager {
         FileCache fileCache,
         StreamReader streamReader,
         BlobFetchRequest request,
-        CancellableThreads cancellableThreads
+        CancellableThreads cancellableThreads,
+        CachedIndexInput owner
     ) {
         try {
             // This local file cache is ref counted and may not strictly enforce configured capacity.
@@ -186,7 +187,7 @@ public class TransferManager {
             if (Files.exists(request.getFilePath()) == false) {
                 logger.trace("Fetching from Remote in createIndexInput of Transfer Manager");
                 if (request.isAtomicWrite()) {
-                    downloadAtomically(fileCache, streamReader, request, cancellableThreads);
+                    downloadAtomically(fileCache, streamReader, request, cancellableThreads, owner);
                 } else {
                     download(fileCache, streamReader, request, request.getFilePath(), cancellableThreads);
                 }
@@ -199,24 +200,26 @@ public class TransferManager {
     }
 
     /**
-     * Downloads to the request's temp path, fsyncs it, renames it to the final path and fsyncs the directory, so a
-     * file at the final path is complete even after a crash or a power loss mid-download. A temp file left by an
-     * earlier attempt, and the cache entry a restart may have made for it, are removed first. On any failure the temp
-     * file is deleted; the final path is never touched.
+     * Downloads to a temp path of its own, fsyncs it, renames it to the final path and fsyncs the directory, so a
+     * file at the final path is complete even after a crash or a power loss mid-download. The rename happens only
+     * while {@code owner}, the cache entry that runs this download, is the one the cache holds for the file. On any
+     * failure the temp file is deleted; the final path is never touched. A temp file a crash leaves behind is deleted
+     * when the file cache is restored at node start.
      */
     private static void downloadAtomically(
         FileCache fileCache,
         StreamReader streamReader,
         BlobFetchRequest request,
-        CancellableThreads cancellableThreads
+        CancellableThreads cancellableThreads,
+        CachedIndexInput owner
     ) throws IOException {
-        final Path temp = request.getTempFilePath();
-        fileCache.remove(temp); // closes and deletes a leftover a restart has registered; a no-op for an unknown key
-        Files.deleteIfExists(temp);
+        final Path temp = request.newTempFilePath();
         try {
             download(fileCache, streamReader, request, temp, cancellableThreads);
             IOUtils.fsync(temp, false);
-            Files.move(temp, request.getFilePath(), StandardCopyOption.ATOMIC_MOVE);
+            if (renameIfOwner(fileCache, temp, request.getFilePath(), owner) == false) {
+                throw new IOException("download of [" + request.getFilePath() + "] was superseded: its cache entry was removed");
+            }
             IOUtils.fsync(request.getFilePath().getParent(), true);
         } catch (IOException | RuntimeException e) {
             try {
@@ -226,6 +229,36 @@ public class TransferManager {
             }
             throw e;
         }
+    }
+
+    /**
+     * Renames {@code temp} to {@code key} if the cache holds {@code owner} for {@code key}, and says whether it did.
+     * The check and the rename run inside {@link FileCache#compute}, which excludes a removal of the key, so the file
+     * is never published for an entry that is gone: a download whose entry was removed is stale, and another download
+     * may own the file by now.
+     */
+    private static boolean renameIfOwner(FileCache fileCache, Path temp, Path key, CachedIndexInput owner) throws IOException {
+        final AtomicBoolean renamed = new AtomicBoolean();
+        final CachedIndexInput current;
+        try {
+            current = fileCache.compute(key, (path, existing) -> {
+                if (existing == owner) {
+                    try {
+                        Files.move(temp, key, StandardCopyOption.ATOMIC_MOVE);
+                    } catch (IOException e) {
+                        throw new UncheckedIOException(e);
+                    }
+                    renamed.set(true);
+                }
+                return existing;
+            });
+        } catch (UncheckedIOException e) {
+            throw e.getCause();
+        }
+        if (current != null) {
+            fileCache.decRef(key); // compute took a reference on the entry it found
+        }
+        return renamed.get();
     }
 
     private static void download(
@@ -367,10 +400,10 @@ public class TransferManager {
             if (isStarted.getAndSet(true) == false) {
                 // We're the first one here, need to download the block
                 try {
-                    result.complete(createIndexInput(fileCache, streamReader, request, cancellableThreads));
+                    result.complete(createIndexInput(fileCache, streamReader, request, cancellableThreads, this));
                 } catch (Exception e) {
                     result.completeExceptionally(e);
-                    fileCache.remove(request.getFilePath());
+                    removeOwnEntry();
                 }
             }
             try {
@@ -395,9 +428,9 @@ public class TransferManager {
                 // Create new future and set it as the result
                 CompletableFuture.supplyAsync(() -> {
                     try {
-                        return createIndexInput(fileCache, streamReader, request, cancellableThreads);
+                        return createIndexInput(fileCache, streamReader, request, cancellableThreads, this);
                     } catch (Exception e) {
-                        fileCache.remove(request.getFilePath());
+                        removeOwnEntry();
                         throw (e instanceof RuntimeException) ? (RuntimeException) e : new CompletionException(e);
                     }
                 }, executor).handle((indexInput, throwable) -> {
@@ -419,6 +452,23 @@ public class TransferManager {
                 fileCache.decRef(request.getFilePath());
             }
             return result;
+        }
+
+        /**
+         * Removes this entry after its download failed. An atomic-write download removes the key only while the cache
+         * holds this entry for it: the key may belong to a later download by now, whose entry and file a removal would
+         * take away.
+         */
+        private void removeOwnEntry() {
+            final Path key = request.getFilePath();
+            if (request.isAtomicWrite() == false) {
+                fileCache.remove(key);
+                return;
+            }
+            final CachedIndexInput other = fileCache.compute(key, (path, existing) -> existing == this ? null : existing);
+            if (other != null) {
+                fileCache.decRef(key); // compute took a reference on the entry it kept
+            }
         }
 
         @Override

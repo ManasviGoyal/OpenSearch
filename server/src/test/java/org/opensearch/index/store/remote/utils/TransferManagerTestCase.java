@@ -15,6 +15,7 @@ import org.apache.lucene.store.MMapDirectory;
 import org.apache.lucene.store.SimpleFSLockFactory;
 import org.opensearch.common.util.CancellableThreads;
 import org.opensearch.index.store.remote.file.CleanerDaemonThreadLeakFilter;
+import org.opensearch.index.store.remote.filecache.CachedIndexInput;
 import org.opensearch.index.store.remote.filecache.FileCache;
 import org.opensearch.index.store.remote.filecache.FileCacheFactory;
 import org.opensearch.test.OpenSearchTestCase;
@@ -36,6 +37,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
+import java.util.stream.Stream;
 
 import static org.hamcrest.Matchers.equalTo;
 import static org.hamcrest.Matchers.greaterThan;
@@ -385,7 +387,7 @@ public abstract class TransferManagerTestCase extends OpenSearchTestCase {
             assertIndexInputIsFunctional(indexInput);
         }
         assertTrue(Files.exists(request.getFilePath()));
-        assertFalse("no temp file is left behind", Files.exists(request.getTempFilePath()));
+        assertEquals("no temp file is left behind", List.of(), tempFiles());
         MatcherAssert.assertThat(fileCache.usage(), equalTo((long) EIGHT_MB));
     }
 
@@ -403,35 +405,112 @@ public abstract class TransferManagerTestCase extends OpenSearchTestCase {
             .build();
         expectThrows(IOException.class, () -> transferManager.fetchBlob(request));
         assertFalse(Files.exists(request.getFilePath()));
-        assertFalse(Files.exists(request.getTempFilePath()));
+        assertEquals(List.of(), tempFiles());
         assertNull(fileCache.get(request.getFilePath()));
         MatcherAssert.assertThat(fileCache.usage(), equalTo(0L));
     }
 
-    public void testAtomicWriteRemovesAStaleTempFileAndItsEntryFirst() throws Exception {
-        // A temp file from an attempt that never renamed, which a restart has registered in the cache: the download
-        // removes both before it writes, so the stale bytes and their cache weight do not survive the new download.
-        List<BlobFetchRequest.BlobPart> blobParts = new ArrayList<>();
-        blobParts.add(new BlobFetchRequest.BlobPart("blob", 0, EIGHT_MB));
+    public void testEachAtomicDownloadWritesToATempFileOfItsOwn() {
         BlobFetchRequest request = BlobFetchRequest.builder()
-            .fileName("atomic-stale")
+            .fileName("atomic-names")
             .directory(directory)
-            .blobParts(blobParts)
+            .blobParts(List.of(new BlobFetchRequest.BlobPart("blob", 0, EIGHT_MB)))
             .atomicWrite(true)
             .build();
-        Path temp = request.getTempFilePath();
-        Files.write(temp, new byte[1024]);
-        fileCache.put(temp, new FileCache.RestoredCachedIndexInput(1024));
-        fileCache.decRef(temp);
-        MatcherAssert.assertThat(fileCache.usage(), equalTo(1024L));
-
-        try (IndexInput indexInput = transferManager.fetchBlobAsync(request).get(30, TimeUnit.SECONDS).clone()) {
-            assertIndexInputIsFunctional(indexInput);
+        Path first = request.newTempFilePath();
+        Path second = request.newTempFilePath();
+        assertNotEquals("two downloads of one file never share a temp file", first, second);
+        for (Path temp : List.of(first, second)) {
+            assertEquals("next to the final file", request.getFilePath().getParent(), temp.getParent());
+            assertTrue("recognised as an in-flight download", FileTypeUtils.isPartialDownloadFile(temp.getFileName().toString()));
         }
-        assertFalse(Files.exists(temp));
-        assertNull(fileCache.get(temp));
-        assertTrue(Files.exists(request.getFilePath()));
-        MatcherAssert.assertThat(fileCache.usage(), equalTo((long) EIGHT_MB));
+    }
+
+    public void testASupersededAtomicDownloadNeitherPublishesNorRemovesTheNewerOne() throws Exception {
+        // A download blocks on its read. Its cache entry is removed, and a second download of the same file starts,
+        // completes and publishes. When the first one resumes it is stale: it must not rename its bytes over the
+        // published file, delete it, or remove the second download's cache entry.
+        final CountDownLatch latch = new CountDownLatch(1);
+        mockWaitForLatchReader(latch);
+        BlobFetchRequest stale = BlobFetchRequest.builder()
+            .fileName("atomic-superseded")
+            .directory(directory)
+            .blobParts(List.of(new BlobFetchRequest.BlobPart("blocking-blob", 0, EIGHT_MB)))
+            .atomicWrite(true)
+            .build();
+        BlobFetchRequest current = BlobFetchRequest.builder()
+            .fileName("atomic-superseded")
+            .directory(directory)
+            .blobParts(List.of(new BlobFetchRequest.BlobPart("blob", 0, EIGHT_MB)))
+            .atomicWrite(true)
+            .build();
+        Path key = current.getFilePath();
+        try {
+            CompletableFuture<IndexInput> staleFuture = transferManager.fetchBlobAsync(stale);
+            assertFalse(staleFuture.isDone());
+            fileCache.remove(key); // the stale download's entry leaves the cache while it still runs
+
+            try (IndexInput indexInput = transferManager.fetchBlobAsync(current).get(30, TimeUnit.SECONDS).clone()) {
+                assertIndexInputIsFunctional(indexInput);
+            }
+            assertTrue(Files.exists(key));
+            CachedIndexInput published = fileCache.get(key);
+            assertNotNull(published);
+            fileCache.decRef(key);
+
+            latch.countDown();
+            ExecutionException failure = expectThrows(ExecutionException.class, () -> staleFuture.get(30, TimeUnit.SECONDS));
+            assertTrue(failure.getCause().toString(), failure.getCause().getMessage().contains("superseded"));
+
+            assertTrue("the published file is untouched", Files.exists(key));
+            CachedIndexInput after = fileCache.get(key);
+            assertSame("the newer download still owns the key", published, after);
+            fileCache.decRef(key);
+            try (IndexInput indexInput = after.getIndexInput().clone()) {
+                assertIndexInputIsFunctional(indexInput);
+            }
+            assertEquals("the stale download deleted its own temp file", List.of(), tempFiles());
+            MatcherAssert.assertThat(fileCache.usage(), equalTo((long) EIGHT_MB));
+        } finally {
+            latch.countDown();
+        }
+    }
+
+    public void testAnAtomicDownloadWhoseEntryWasRemovedPublishesNothing() throws Exception {
+        // A download blocks on its read and its cache entry is removed. When it resumes no entry owns the key, so it
+        // must fail without leaving a file the cache does not track.
+        final CountDownLatch latch = new CountDownLatch(1);
+        mockWaitForLatchReader(latch);
+        BlobFetchRequest request = BlobFetchRequest.builder()
+            .fileName("atomic-removed")
+            .directory(directory)
+            .blobParts(List.of(new BlobFetchRequest.BlobPart("blocking-blob", 0, EIGHT_MB)))
+            .atomicWrite(true)
+            .build();
+        Path key = request.getFilePath();
+        final CompletableFuture<IndexInput> future;
+        try {
+            future = transferManager.fetchBlobAsync(request);
+            assertFalse(future.isDone());
+            fileCache.remove(key);
+        } finally {
+            latch.countDown();
+        }
+        ExecutionException failure = expectThrows(ExecutionException.class, () -> future.get(30, TimeUnit.SECONDS));
+        assertTrue(failure.getCause().toString(), failure.getCause().getMessage().contains("superseded"));
+
+        assertFalse("nothing is published", Files.exists(key));
+        assertNull("the key stays absent", fileCache.get(key));
+        assertEquals(List.of(), tempFiles());
+        MatcherAssert.assertThat(fileCache.usage(), equalTo(0L));
+        MatcherAssert.assertThat(fileCache.activeUsage(), equalTo(0L));
+    }
+
+    /** The in-flight download temp files in the test directory. */
+    private List<String> tempFiles() throws IOException {
+        try (Stream<Path> files = Files.list(directory.getDirectory())) {
+            return files.map(file -> file.getFileName().toString()).filter(FileTypeUtils::isPartialDownloadFile).sorted().toList();
+        }
     }
 
     protected abstract void initializeTransferManager() throws IOException;

@@ -10,6 +10,7 @@ package org.opensearch.index.store.remote.utils;
 
 import org.apache.lucene.store.Directory;
 import org.apache.lucene.store.FSDirectory;
+import org.opensearch.common.UUIDs;
 
 import java.nio.file.Path;
 import java.util.List;
@@ -75,7 +76,7 @@ public class BlobFetchRequest {
     }
 
     /**
-     * Whether the download is written to {@link #getTempFilePath()}, fsynced and then renamed to {@link #getFilePath()},
+     * Whether the download is written to {@link #newTempFilePath()}, fsynced and then renamed to {@link #getFilePath()},
      * so that a file at the final path is always complete. Off by default: the file is written in place.
      */
     public boolean isAtomicWrite() {
@@ -83,11 +84,12 @@ public class BlobFetchRequest {
     }
 
     /**
-     * The path an atomic-write download is written to before the rename: next to the final path, with
-     * {@link FileTypeUtils#PARTIAL_DOWNLOAD_SUFFIX}.
+     * A new path for one atomic-write download to write to before its rename: next to the final path, with a name of
+     * its own and {@link FileTypeUtils#PARTIAL_DOWNLOAD_SUFFIX}. Every call returns a different path, so two downloads
+     * of the same file never write to, rename or delete each other's temp file.
      */
-    public Path getTempFilePath() {
-        return filePath.resolveSibling(fileName + FileTypeUtils.PARTIAL_DOWNLOAD_SUFFIX);
+    public Path newTempFilePath() {
+        return filePath.resolveSibling(fileName + "." + UUIDs.randomBase64UUID() + FileTypeUtils.PARTIAL_DOWNLOAD_SUFFIX);
     }
 
     /**
