@@ -54,6 +54,7 @@ import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executor;
+import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -289,6 +290,23 @@ public class WarmFullFileManagerTests extends OpenSearchTestCase {
 
     private void awaitState(FullFileState st, FullFileState.State target) throws Exception {
         assertBusy(() -> assertEquals(target, st.state()), 10, TimeUnit.SECONDS);
+        if (target == FullFileState.State.FULL) {
+            awaitPromotionThreadsIdle();
+        }
+    }
+
+    /**
+     * A download's completion callback turns the family FULL and only then gives back its cache reference and its slot,
+     * counts the promotion and sweeps the blocks. This waits for the pool threads that run it, so that a test reads
+     * none of those half done.
+     */
+    private void awaitPromotionThreadsIdle() throws Exception {
+        ThreadPoolExecutor recovery = (ThreadPoolExecutor) threadPool.executor(ThreadPool.Names.REMOTE_RECOVERY);
+        ThreadPoolExecutor generic = (ThreadPoolExecutor) threadPool.generic();
+        assertBusy(() -> {
+            assertEquals(0, recovery.getActiveCount());
+            assertEquals(0, generic.getActiveCount());
+        }, 10, TimeUnit.SECONDS);
     }
 
     /**
