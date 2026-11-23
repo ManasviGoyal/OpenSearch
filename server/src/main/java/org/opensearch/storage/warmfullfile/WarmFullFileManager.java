@@ -142,7 +142,6 @@ public class WarmFullFileManager {
     private final CounterMetric started = new CounterMetric();
     private final CounterMetric reused = new CounterMetric();
     private final CounterMetric demoted = new CounterMetric();
-    private final CounterMetric restored = new CounterMetric();
     // Bytes read from the remote store by this node's downloads: a part copied from a local block, or a promotion
     // handed a download another one completed, adds nothing.
     private final CounterMetric downloadedBytes = new CounterMetric();
@@ -154,8 +153,6 @@ public class WarmFullFileManager {
     private final CounterMetric notMmapAfterDownload = new CounterMetric();
     // The families currently FULL on this node, so a settings change can find the ones to demote.
     private final Set<FullFileState> fullFamilies = ConcurrentHashMap.newKeySet();
-    // Demoted families still holding their mapping, so a settings change can restore the ones whose extension returns.
-    private final Set<FullFileState> demotedFamilies = ConcurrentHashMap.newKeySet();
     // The search scopes running on this node's warm shards: a family hands views only inside one, and the scope holds
     // the whole file until it ends.
     private final FullFileSearchPhaseTracker searchPhases;
@@ -622,7 +619,6 @@ public class WarmFullFileManager {
                 () -> {
                     awaitingRelease.remove(st);
                     fullFamilies.remove(st);
-                    demotedFamilies.remove(st);
                 },
                 () -> onEvictedByCache(st)
             );
@@ -936,7 +932,7 @@ public class WarmFullFileManager {
     public void onExtensionsChanged(Set<String> extensions) {
         everEligibleExtensions.addAll(extensions);
         eligibleExtensions = extensions;
-        if (fullFamilies.isEmpty() && demotedFamilies.isEmpty()) {
+        if (fullFamilies.isEmpty()) {
             // Nothing to bring in line. A family that turns FULL from here on checks the set itself as it publishes.
             return;
         }
@@ -949,9 +945,9 @@ public class WarmFullFileManager {
     }
 
     /**
-     * Demotes every FULL family whose extension is no longer eligible and restores every demoted one whose extension
-     * is eligible again. One run at a time, each against the current set, so the run for the latest change is also
-     * the last to act on a family.
+     * Demotes every FULL family whose extension is no longer eligible. One run at a time, each against the current
+     * set. A family whose extension is listed again is promoted the ordinary way by its next trigger, after its
+     * release has run.
      */
     private synchronized void applyEligibleExtensions() {
         for (FullFileState st : fullFamilies) {
@@ -962,13 +958,6 @@ public class WarmFullFileManager {
             }
             demoteIfNoLongerEligible(st);
         }
-        for (FullFileState st : demotedFamilies) {
-            if (st.state() == FullFileState.State.CLOSED) {
-                demotedFamilies.remove(st);
-                continue;
-            }
-            restoreIfEligibleAgain(st);
-        }
     }
 
     /** Demotes a FULL family whose extension the setting no longer lists; a no-op for any other family. */
@@ -978,33 +967,12 @@ public class WarmFullFileManager {
             return;
         }
         fullFamilies.remove(st);
-        demotedFamilies.add(st);
         demoted.inc();
         logger.info(
             "demoted [{}] back to blocks: extension [{}] is no longer configured; its mapping is released once {} search scope(s) end",
             st.fullFilePath(),
             extension,
             st.inFlightScopes()
-        );
-    }
-
-    /**
-     * Takes a demoted family back to FULL when its extension is listed again and its mapping is still held, so the
-     * setting is a live switch in both directions: nothing is downloaded or mapped a second time. A family whose
-     * release has already run is promoted again the ordinary way by its next trigger.
-     */
-    private void restoreIfEligibleAgain(FullFileState st) {
-        String extension = WarmFullFileSettings.extensionOf(st.fileName());
-        if (isExtensionEligible(extension) == false || st.restore() == false) {
-            return;
-        }
-        demotedFamilies.remove(st);
-        fullFamilies.add(st);
-        restored.inc();
-        logger.info(
-            "restored [{}] to its whole file: extension [{}] is configured again and the mapping was still held",
-            st.fullFilePath(),
-            extension
         );
     }
 
@@ -1041,7 +1009,7 @@ public class WarmFullFileManager {
 
     /**
      * This node's promotion counters, by name. Cumulative counters ({@code requested}, {@code started}, {@code reused},
-     * {@code promoted}, {@code demoted}, {@code restored}, {@code downloadedBytes}, {@code partsFromLocalBlocks},
+     * {@code promoted}, {@code demoted}, {@code downloadedBytes}, {@code partsFromLocalBlocks},
      * {@code bytesFromLocalBlocks}, {@code promotedBytes}, {@code downloadMillis}, {@code declined.<reason>} with the
      * totals {@code declined} and {@code failed}) never
      * decrease for the life of the node; {@code reservedBytes}, {@code activeDownloads},
@@ -1057,7 +1025,6 @@ public class WarmFullFileManager {
         counters.put("reused", reused.count());
         counters.put("promoted", promoted.count());
         counters.put("demoted", demoted.count());
-        counters.put("restored", restored.count());
         counters.put("evicted", evicted.count());
         counters.put("evictedBytes", evictedBytes.count());
         counters.put("blocksRemoved", blocksRemoved.count());

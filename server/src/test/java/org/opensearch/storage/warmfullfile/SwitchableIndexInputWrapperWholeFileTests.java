@@ -1071,10 +1071,10 @@ public class SwitchableIndexInputWrapperWholeFileTests extends TieredStorageBase
         fileCache.remove(switchKey);
     }
 
-    public void testReEnablingWhileAScopeReadsServesViewsAgainWithoutADownload() throws Exception {
+    public void testReEnablingWhileAScopeReadsKeepsServingBlocksUntilTheRelease() throws Exception {
         // The setting drops the extension and lists it again while a search scope holds a view throughout: the
-        // family is demoted, then restored from the mapping it still holds, and the next clone is a view again with
-        // no download and no new promotion request.
+        // family is demoted and stays on blocks, with no new promotion, until the scope has ended and the mapping
+        // has been released.
         Path switchKey = getFilePathSwitchable(localDirectory, FILE_NAME);
         byte[] content = footeredContent();
         PromotableCachedSwitchableIndexInput entry = new PromotableCachedSwitchableIndexInput(
@@ -1119,20 +1119,19 @@ public class SwitchableIndexInputWrapperWholeFileTests extends TieredStorageBase
 
         realManager.onExtensionsChanged(Set.of(WarmFullFileSettings.extensionOf(FILE_NAME)));
 
-        assertEquals(FullFileState.State.FULL, st.state());
-        assertSame("the held mapping is served again", master, st.localMaster());
-        IndexInput view = handle.clone();
-        assertTrue("views again after the restore", view instanceof MemorySegmentAccessInput);
-        assertEquals(0, view.readByte());
+        assertEquals(FullFileState.State.BLOCK, st.state());
+        assertSame("the scope keeps the mapping it reads", master, st.localMaster());
+        IndexInput again = handle.clone();
+        assertTrue("still blocks with the extension listed again", again instanceof SwitchableIndexInputWrapper);
+        assertEquals("no promotion while the release is pending", FullFileState.State.BLOCK, st.state());
         assertEquals("no promotion was requested", requestedBefore, realManager.counters().get("requested").longValue());
         assertEquals(1L, realManager.counters().get("promoted").longValue());
-        assertEquals(1L, realManager.counters().get("restored").longValue());
-        assertEquals(content.length, realManager.counters().get("reservedBytes").longValue());
 
         exitScope();
-        IOUtils.close(view, held, block, handle);
-        fileCache.remove(switchKey);
         assertBusy(() -> assertTrue(st.cleanupDone()), 30, TimeUnit.SECONDS);
+        assertNull(st.localMaster());
+        IOUtils.close(again, held, block, handle);
+        fileCache.remove(switchKey);
     }
 
     public void testDeferredCloseKeepsMappingUntilTheScopeEndsThenReleasesEverything() throws Exception {

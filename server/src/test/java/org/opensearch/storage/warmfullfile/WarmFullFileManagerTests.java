@@ -1680,11 +1680,11 @@ public class WarmFullFileManagerTests extends OpenSearchTestCase {
         assertEquals(content.length, mgr.reservedBytesPerSegment()[0]);
     }
 
-    public void testReAddingTheExtensionRestoresADemotedFamilyWhileAScopeReadsIt() throws Exception {
-        // A search scope keeps reading, so the demoted family still holds its mapping, file and budget. Listing the
-        // extension again takes it straight back to FULL: no download, no second mapping, nothing released; and the
-        // scope's end releases nothing either, since the family is FULL again.
-        String name = "_restore.faiss";
+    public void testReAddingTheExtensionWhileAScopeReadsDoesNotBringTheFileBack() throws Exception {
+        // A search scope keeps reading, so the demoted family still holds its mapping. Listing the extension again
+        // changes nothing for it: it serves blocks and cannot be promoted until the scope ends and the release has
+        // run. The next promotion after that downloads the file again.
+        String name = "_relisted.faiss";
         Path path = dir.resolve(name);
         byte[] content = footeredContent(FILE_LENGTH);
         FixedContentStreamReader reader = new FixedContentStreamReader(content);
@@ -1702,37 +1702,32 @@ public class WarmFullFileManagerTests extends OpenSearchTestCase {
 
         mgr.onExtensionsChanged(Set.of("faiss"));
 
-        assertEquals("FULL again", FullFileState.State.FULL, st.state());
-        assertFalse("nothing left to release", st.isMappingReleasePending());
-        assertSame("the same mapping is served", master, st.localMaster());
-        assertEquals("no remote read", parts, reader.readCount());
+        assertEquals("still on blocks", FullFileState.State.BLOCK, st.state());
+        assertTrue("the release is still owed", st.isMappingReleasePending());
+        assertSame("the scope keeps its mapping", master, st.localMaster());
+        assertFalse("no promotion while the release is pending", st.onAccess(mgr.relativeTimeInMillis()));
         assertEquals(1L, mgr.counters().get("demoted").longValue());
-        assertEquals(1L, mgr.counters().get("restored").longValue());
-        assertEquals("one promotion in total", 1L, mgr.counters().get("promoted").longValue());
-        assertEquals(content.length, mgr.reservedBytesPerSegment()[0]);
-        assertArrayEquals("served bytes", content, readAll(st.localMaster(), content.length));
-        assertEquals("the scope's reference", Integer.valueOf(1), fileCache.getRef(path));
+        assertEquals(1L, mgr.counters().get("promoted").longValue());
+        assertEquals("no remote read", parts, reader.readCount());
 
         st.releaseView();
-        assertFalse("the scope's end releases nothing from a restored family", st.cleanupDone());
-        assertSame(master, st.localMaster());
-        assertEquals(Integer.valueOf(0), fileCache.getRef(path));
-
-        // A second demotion, now with no scope reading, releases everything as usual.
-        mgr.onExtensionsChanged(Set.of());
         assertBusy(() -> {
             assertTrue(st.cleanupDone());
             assertNull(st.localMaster());
             assertNull(fileCache.get(path));
             assertEquals(0L, mgr.reservedBytesPerSegment()[0]);
         }, 30, TimeUnit.SECONDS);
-        assertEquals(2L, mgr.counters().get("demoted").longValue());
+
+        startPromotion(mgr, st);
+        awaitState(st, FullFileState.State.FULL);
+        assertEquals("downloaded again", 2 * parts, reader.readCount());
+        assertEquals(2L, mgr.counters().get("promoted").longValue());
     }
 
-    public void testReAddingTheExtensionAfterTheReleaseIsNotARestore() throws Exception {
-        // The demoted family's release already ran (no handle was open), so there is nothing to restore: listing the
-        // extension again does nothing by itself, and the next promotion downloads the file again.
-        String name = "_restore_late.faiss";
+    public void testReAddingTheExtensionAfterTheReleasePromotesAgain() throws Exception {
+        // The demoted family's release already ran (no handle was open). Listing the extension again does nothing by
+        // itself, and the next promotion downloads the file again.
+        String name = "_relisted_late.faiss";
         byte[] content = footeredContent(FILE_LENGTH);
         FixedContentStreamReader reader = new FixedContentStreamReader(content);
         FileCache fileCache = newFileCache();
@@ -1746,7 +1741,6 @@ public class WarmFullFileManagerTests extends OpenSearchTestCase {
         mgr.onExtensionsChanged(Set.of("faiss"));
 
         assertEquals(FullFileState.State.BLOCK, st.state());
-        assertEquals(0L, mgr.counters().get("restored").longValue());
         assertFalse(st.isMappingReleasePending());
         startPromotion(mgr, st);
         awaitState(st, FullFileState.State.FULL);

@@ -19,12 +19,17 @@ import org.opensearch.index.store.remote.filecache.FileCacheFactory;
 import org.opensearch.test.OpenSearchTestCase;
 
 import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.AbstractExecutorService;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CyclicBarrier;
 import java.util.concurrent.Executor;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.Consumer;
 
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
@@ -207,7 +212,6 @@ public class FullFileStateTests extends OpenSearchTestCase {
         assertEquals("reported: scopes still read the mapping", 1, f.awaitingReports.get());
         assertTrue("the scope keeps the mapping", f.executor.tasks.isEmpty());
         assertSame(f.master, f.st.localMaster());
-        assertFalse("restore is refused once the file is gone", f.st.restore());
 
         f.st.releaseView();
         assertEquals("the last scope out schedules the unmap", 1, f.executor.tasks.size());
@@ -359,17 +363,18 @@ public class FullFileStateTests extends OpenSearchTestCase {
     }
 
     public void testCloseOfADemotedFamilyWithScopesReportsAndReleasesOnTheLastOne() throws Exception {
-        // Demoted with a scope reading: the mapping and the budget are still held, so a close reports the scope like
-        // a FULL close does, and the last scope out releases everything.
+        // Demoted with a scope reading: the mapping and the budget are still held, so the demotion reports the scope,
+        // a close reports it again like a FULL close does, and the last scope out releases everything.
         Fixture f = new Fixture();
         f.goFull();
         assertTrue(f.st.acquireView());
         assertTrue(f.st.demote());
+        assertEquals("reported: demoted with scopes reading", 1, f.awaitingReports.get());
         assertTrue(f.executor.tasks.isEmpty());
 
         f.st.closeFamily();
         assertEquals(FullFileState.State.CLOSED, f.st.state());
-        assertEquals("reported: closed with scopes reading", 1, f.awaitingReports.get());
+        assertEquals("reported: closed with scopes reading", 2, f.awaitingReports.get());
         assertTrue("no cleanup while the scope reads", f.executor.tasks.isEmpty());
         assertEquals(0, f.budgetReleases.get());
 
@@ -528,43 +533,124 @@ public class FullFileStateTests extends OpenSearchTestCase {
         assertFalse(f.st.isMappingReleasePending());
     }
 
-    public void testConcurrentRestoreAndCloseNeverLoseTheMappingRelease() throws Exception {
-        // A demoted family (scope reading, mapping held) is restored by a settings change while the family closes on
-        // the FileCache listener thread. Whatever the order, once the scope ends exactly one cleanup must be scheduled:
-        // the mapping has to be released.
-        int lost = 0;
-        int restoredThenClosed = 0;
+    public void testConcurrentDemoteAndCloseScheduleTheReleaseOnce() throws Exception {
+        // A FULL family with a scope reading is demoted by a settings change while it closes on the FileCache listener
+        // thread. Whatever the order, once the scope ends exactly one cleanup is scheduled.
+        int wrong = 0;
         final int iterations = 20_000;
         for (int i = 0; i < iterations; i++) {
             Fixture f = new Fixture();
             f.goFull();
             assertTrue(f.st.acquireView());
-            assertTrue(f.st.demote());
             CyclicBarrier barrier = new CyclicBarrier(2);
-            boolean[] restored = new boolean[1];
-            Thread restorer = new Thread(() -> {
+            Thread demoter = new Thread(() -> {
                 await(barrier);
-                restored[0] = f.st.restore();
+                f.st.demote();
             });
             Thread closer = new Thread(() -> {
                 await(barrier);
                 f.st.closeFamily();
             });
-            restorer.start();
+            demoter.start();
             closer.start();
-            restorer.join();
+            demoter.join();
             closer.join();
             assertEquals(FullFileState.State.CLOSED, f.st.state());
+            assertTrue("the scope keeps the mapping", f.executor.tasks.isEmpty());
             f.st.releaseView();
-            if (restored[0]) {
-                restoredThenClosed++;
-            }
             if (f.executor.tasks.size() != 1) {
-                lost++;
+                wrong++;
             }
         }
-        logger.info("restore won {} of {} races; cleanup lost {} times", restoredThenClosed, iterations, lost);
-        assertEquals("iterations whose mapping release was never scheduled", 0, lost);
+        assertEquals("iterations whose mapping release was not scheduled exactly once", 0, wrong);
+    }
+
+    public void testEveryWayOutOfFullEndsInTheSameRelease() throws Exception {
+        // The cache dropping the file, a demotion and a close each take the family out of FULL at once, report it
+        // while a scope still reads, and leave the mapping to one release that runs when the scope ends.
+        List<Consumer<Fixture>> waysOut = List.of(f -> f.fileCache.remove(f.path), f -> assertTrue(f.st.demote()), f -> f.st.closeFamily());
+        for (Consumer<Fixture> wayOut : waysOut) {
+            Fixture f = new Fixture();
+            f.goFull();
+            assertTrue(f.st.acquireView());
+
+            wayOut.accept(f);
+
+            assertNotEquals(FullFileState.State.FULL, f.st.state());
+            assertFalse("no new view", f.st.acquireView());
+            assertEquals("reported: a scope still reads the mapping", 1, f.awaitingReports.get());
+            assertTrue("the scope keeps the mapping", f.executor.tasks.isEmpty());
+            assertSame(f.master, f.st.localMaster());
+            verify(f.master, never()).close();
+
+            f.st.releaseView();
+            f.runCleanupOnce();
+
+            verify(f.master).close();
+            assertNull(f.st.localMaster());
+            assertTrue(f.st.cleanupDone());
+            assertEquals(1, f.cleanupsDone.get());
+            assertEquals(1, f.budgetReleases.get());
+            assertFalse(f.st.isMappingReleasePending());
+            assertTrue("nothing further is scheduled", f.executor.tasks.isEmpty());
+        }
+    }
+
+    public void testTheReleaseDoesNothingOnceItsExecutorIsShutDown() throws Exception {
+        // The node is stopping when the queued release runs: the mapping, the file and the budget are left as they
+        // are, for the process exit and the next start.
+        Fixture f = new Fixture();
+        List<Runnable> queued = new ArrayList<>();
+        AtomicBoolean shutdown = new AtomicBoolean();
+        ExecutorService pool = new AbstractExecutorService() {
+            @Override
+            public void execute(Runnable command) {
+                queued.add(command);
+            }
+
+            @Override
+            public void shutdown() {
+                shutdown.set(true);
+            }
+
+            @Override
+            public List<Runnable> shutdownNow() {
+                shutdown.set(true);
+                return List.of();
+            }
+
+            @Override
+            public boolean isShutdown() {
+                return shutdown.get();
+            }
+
+            @Override
+            public boolean isTerminated() {
+                return false;
+            }
+
+            @Override
+            public boolean awaitTermination(long timeout, TimeUnit unit) {
+                return false;
+            }
+        };
+        assertTrue(f.st.onAccess(0));
+        PromotedWholeFileEntry entry = new PromotedWholeFileEntry(f.fileCache, f.path, f.master, f.st);
+        assertEquals(
+            FullFileState.Completion.FULL,
+            f.st.completePromotion(entry, pool, f.budgetReleases::incrementAndGet, () -> {}, f.cleanupsDone::incrementAndGet, () -> {})
+        );
+
+        assertTrue(f.st.demote());
+        assertEquals("the release is queued", 1, queued.size());
+        pool.shutdown();
+        queued.get(0).run();
+
+        verify(f.master, never()).close();
+        assertSame(f.master, f.st.localMaster());
+        assertFalse(f.st.cleanupDone());
+        assertEquals(0, f.cleanupsDone.get());
+        assertEquals(0, f.budgetReleases.get());
     }
 
     private static void await(CyclicBarrier barrier) {

@@ -412,7 +412,6 @@ public class WarmFullFileIT extends WarmFullFileBaseIT {
         // clear it once more before the reopen below.
         setFullFileExtensions(FDT_EXTENSION);
         searchUntilPromoted(INDEX_NAME, first, firstFdt);
-        assertEquals(0L, first.manager.counters().get("restored").longValue());
         assertEquals(2L, first.manager.counters().get("promoted").longValue());
         assertEquals(firstFingerprint, queryFingerprint(INDEX_NAME));
         clearFullFileExtensions();
@@ -434,7 +433,7 @@ public class WarmFullFileIT extends WarmFullFileBaseIT {
      * The setting is cleared, the index is closed and reopened while it is clear, and the extension is listed again:
      * the next searches promote the file with no further reopen. The family created by the reopen is promotable because
      * the extension had been listed on the node before; the family that was demoted by the clear is gone with the reopen,
-     * so this is a fresh promotion, not a restore.
+     * so this is a fresh promotion.
      */
     public void testListingExtensionAgainAfterReopenWhileClearPromotesWithoutAnotherReopen() throws Exception {
         String warmNode = startCluster();
@@ -454,7 +453,6 @@ public class WarmFullFileIT extends WarmFullFileBaseIT {
 
         setFullFileExtensions(FDT_EXTENSION);
         searchUntilPromoted(INDEX_NAME, reopened, fdt);
-        assertEquals(0L, reopened.manager.counters().get("restored").longValue());
         assertEquals(fingerprint, queryFingerprint(INDEX_NAME));
 
         deleteIndex(INDEX_NAME);
