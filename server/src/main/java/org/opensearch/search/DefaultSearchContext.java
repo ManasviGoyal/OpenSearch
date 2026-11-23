@@ -274,6 +274,10 @@ final class DefaultSearchContext extends SearchContext {
         this.clusterService = clusterService;
         this.engineSearcher = readerContext.acquireSearcher("search");
         this.concurrentSearchMode = evaluateConcurrentSearchMode(executor);
+        // The shard's search listeners may wrap the executor the searcher hands its tasks to.
+        final Executor searcherExecutor = executor == null
+            ? null
+            : indexShard.getSearchOperationListener().wrapSearcherExecutor(indexShard, executor);
         this.searcher = new ContextIndexSearcher(
             engineSearcher.getIndexReader(),
             engineSearcher.getSimilarity(),
@@ -281,7 +285,7 @@ final class DefaultSearchContext extends SearchContext {
             engineSearcher.getQueryCachingPolicy(),
             lowLevelCancellation,
             concurrentSearchMode.equals(CONCURRENT_SEGMENT_SEARCH_MODE_AUTO)
-                || concurrentSearchMode.equals(CONCURRENT_SEGMENT_SEARCH_MODE_ALL) ? executor : null,
+                || concurrentSearchMode.equals(CONCURRENT_SEGMENT_SEARCH_MODE_ALL) ? searcherExecutor : null,
             this
         );
         this.relativeTimeSupplier = relativeTimeSupplier;

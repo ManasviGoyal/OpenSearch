@@ -77,6 +77,7 @@ import org.opensearch.index.query.ParsedQuery;
 import org.opensearch.index.query.QueryBuilder;
 import org.opensearch.index.query.QueryShardContext;
 import org.opensearch.index.shard.IndexShard;
+import org.opensearch.index.shard.SearchOperationListener;
 import org.opensearch.search.aggregations.AggregatorFactories;
 import org.opensearch.search.aggregations.MultiBucketConsumerService;
 import org.opensearch.search.aggregations.SearchContextAggregations;
@@ -107,9 +108,11 @@ import java.util.List;
 import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.Executor;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Function;
 import java.util.function.Supplier;
 
@@ -155,6 +158,8 @@ public class DefaultSearchContextTests extends OpenSearchTestCase {
 
         ThreadPool threadPool = new TestThreadPool(this.getClass().getName());
         IndexShard indexShard = mock(IndexShard.class);
+        when(indexShard.getSearchOperationListener()).thenReturn(new SearchOperationListener() {
+        });
         QueryCachingPolicy queryCachingPolicy = mock(QueryCachingPolicy.class);
         when(indexShard.getQueryCachingPolicy()).thenReturn(queryCachingPolicy);
         when(indexShard.getThreadPool()).thenReturn(threadPool);
@@ -519,6 +524,16 @@ public class DefaultSearchContextTests extends OpenSearchTestCase {
 
         ThreadPool threadPool = new TestThreadPool(this.getClass().getName());
         IndexShard indexShard = mock(IndexShard.class);
+        AtomicInteger executorWraps = new AtomicInteger();
+        when(indexShard.getSearchOperationListener()).thenReturn(new SearchOperationListener() {
+            @Override
+            public Executor wrapSearcherExecutor(IndexShard shard, Executor searcherExecutor) {
+                assertSame(indexShard, shard);
+                assertSame(executor, searcherExecutor);
+                executorWraps.incrementAndGet();
+                return searcherExecutor;
+            }
+        });
         QueryCachingPolicy queryCachingPolicy = mock(QueryCachingPolicy.class);
         when(indexShard.getQueryCachingPolicy()).thenReturn(queryCachingPolicy);
         when(indexShard.getThreadPool()).thenReturn(threadPool);
@@ -589,6 +604,11 @@ public class DefaultSearchContextTests extends OpenSearchTestCase {
                 null,
                 Collections.emptyList()
             );
+            assertEquals(
+                "the shard's search listeners are asked once for the searcher's executor, if it has one",
+                executor == null ? 0 : 1,
+                executorWraps.get()
+            );
             assertThat(context.searcher().hasCancellations(), is(false));
             context.searcher().addQueryCancellation(() -> {});
             assertThat(context.searcher().hasCancellations(), is(true));
@@ -609,6 +629,8 @@ public class DefaultSearchContextTests extends OpenSearchTestCase {
 
         ThreadPool threadPool = new TestThreadPool(this.getClass().getName());
         IndexShard indexShard = mock(IndexShard.class);
+        when(indexShard.getSearchOperationListener()).thenReturn(new SearchOperationListener() {
+        });
         QueryCachingPolicy queryCachingPolicy = mock(QueryCachingPolicy.class);
         when(indexShard.getQueryCachingPolicy()).thenReturn(queryCachingPolicy);
         when(indexShard.getThreadPool()).thenReturn(threadPool);
@@ -632,11 +654,19 @@ public class DefaultSearchContextTests extends OpenSearchTestCase {
         BigArrays bigArrays = new MockBigArrays(new MockPageCacheRecycler(Settings.EMPTY), new NoneCircuitBreakerService());
 
         IndexShard systemIndexShard = mock(IndexShard.class);
+
+        when(systemIndexShard.getSearchOperationListener()).thenReturn(new SearchOperationListener() {
+
+        });
         when(systemIndexShard.getQueryCachingPolicy()).thenReturn(queryCachingPolicy);
         when(systemIndexShard.getThreadPool()).thenReturn(threadPool);
         when(systemIndexShard.isSystem()).thenReturn(true);
 
         IndexShard throttledIndexShard = mock(IndexShard.class);
+
+        when(throttledIndexShard.getSearchOperationListener()).thenReturn(new SearchOperationListener() {
+
+        });
         when(throttledIndexShard.getQueryCachingPolicy()).thenReturn(queryCachingPolicy);
         when(throttledIndexShard.getThreadPool()).thenReturn(threadPool);
         IndexSettings throttledIndexSettings = new IndexSettings(
@@ -840,6 +870,8 @@ public class DefaultSearchContextTests extends OpenSearchTestCase {
 
         ThreadPool threadPool = new TestThreadPool(this.getClass().getName());
         IndexShard indexShard = mock(IndexShard.class);
+        when(indexShard.getSearchOperationListener()).thenReturn(new SearchOperationListener() {
+        });
         QueryCachingPolicy queryCachingPolicy = mock(QueryCachingPolicy.class);
         when(indexShard.getQueryCachingPolicy()).thenReturn(queryCachingPolicy);
         when(indexShard.getThreadPool()).thenReturn(threadPool);
@@ -863,11 +895,19 @@ public class DefaultSearchContextTests extends OpenSearchTestCase {
         BigArrays bigArrays = new MockBigArrays(new MockPageCacheRecycler(Settings.EMPTY), new NoneCircuitBreakerService());
 
         IndexShard systemIndexShard = mock(IndexShard.class);
+
+        when(systemIndexShard.getSearchOperationListener()).thenReturn(new SearchOperationListener() {
+
+        });
         when(systemIndexShard.getQueryCachingPolicy()).thenReturn(queryCachingPolicy);
         when(systemIndexShard.getThreadPool()).thenReturn(threadPool);
         when(systemIndexShard.isSystem()).thenReturn(true);
 
         IndexShard throttledIndexShard = mock(IndexShard.class);
+
+        when(throttledIndexShard.getSearchOperationListener()).thenReturn(new SearchOperationListener() {
+
+        });
         when(throttledIndexShard.getQueryCachingPolicy()).thenReturn(queryCachingPolicy);
         when(throttledIndexShard.getThreadPool()).thenReturn(threadPool);
         IndexSettings throttledIndexSettings = new IndexSettings(

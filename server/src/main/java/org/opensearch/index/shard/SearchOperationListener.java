@@ -41,6 +41,7 @@ import org.opensearch.search.internal.SearchContext;
 import org.opensearch.transport.TransportRequest;
 
 import java.util.List;
+import java.util.concurrent.Executor;
 
 /**
  * An listener for search, fetch and context events.
@@ -179,6 +180,20 @@ public interface SearchOperationListener {
     default void onSearchIdleReactivation() {}
 
     /**
+     * Lets a listener wrap the executor that a search context's searcher hands its tasks to, such as the slices of a
+     * concurrent segment search or the per-leaf tasks a query submits through the searcher's task executor. Called
+     * once per search context, before its searcher is built, and only when the searcher is given an executor. A
+     * listener that wraps must run every task it is handed, or pass it on.
+     *
+     * @param shard    the shard the search context is for
+     * @param executor the executor the searcher would use
+     * @return the executor the searcher uses: {@code executor} itself unless the listener wraps it
+     */
+    default Executor wrapSearcherExecutor(IndexShard shard, Executor executor) {
+        return executor;
+    }
+
+    /**
      * A Composite listener that multiplexes calls to each of the listeners methods.
      */
     final class CompositeListener implements SearchOperationListener {
@@ -188,6 +203,22 @@ public interface SearchOperationListener {
         CompositeListener(List<SearchOperationListener> listeners, Logger logger) {
             this.listeners = listeners;
             this.logger = logger;
+        }
+
+        @Override
+        public Executor wrapSearcherExecutor(IndexShard shard, Executor executor) {
+            Executor wrapped = executor;
+            for (SearchOperationListener listener : listeners) {
+                try {
+                    Executor next = listener.wrapSearcherExecutor(shard, wrapped);
+                    if (next != null) {
+                        wrapped = next;
+                    }
+                } catch (Exception e) {
+                    logger.warn(() -> new ParameterizedMessage("wrapSearcherExecutor listener [{}] failed", listener), e);
+                }
+            }
+            return wrapped;
         }
 
         @Override

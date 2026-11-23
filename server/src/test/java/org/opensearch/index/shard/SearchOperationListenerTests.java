@@ -43,6 +43,7 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
+import java.util.concurrent.Executor;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.hamcrest.Matchers.not;
@@ -448,5 +449,64 @@ public class SearchOperationListenerTests extends OpenSearchTestCase {
         assertEquals(2, freeScrollContext.get());
         assertEquals(2, searchIdleReactivateCount.get());
         assertEquals(2, validateSearchContext.get());
+    }
+
+    public void testADefaultListenerLeavesTheSearcherExecutorAlone() {
+        Executor executor = Runnable::run;
+        assertSame(executor, new SearchOperationListener() {
+        }.wrapSearcherExecutor(null, executor));
+    }
+
+    public void testCompositeFoldsTheSearcherExecutorWrappersAndSkipsAListenerThatFails() {
+        // Each listener wraps what the one before it returned. A listener that throws, or returns nothing, is skipped,
+        // so the searcher always gets an executor that still reaches the original one.
+        List<String> order = new ArrayList<>();
+        Executor original = task -> {
+            order.add("original");
+            task.run();
+        };
+        SearchOperationListener first = new SearchOperationListener() {
+            @Override
+            public Executor wrapSearcherExecutor(IndexShard shard, Executor executor) {
+                return task -> {
+                    order.add("first");
+                    executor.execute(task);
+                };
+            }
+        };
+        SearchOperationListener failing = new SearchOperationListener() {
+            @Override
+            public Executor wrapSearcherExecutor(IndexShard shard, Executor executor) {
+                throw new IllegalStateException("simulated");
+            }
+        };
+        SearchOperationListener returningNothing = new SearchOperationListener() {
+            @Override
+            public Executor wrapSearcherExecutor(IndexShard shard, Executor executor) {
+                return null;
+            }
+        };
+        SearchOperationListener plain = new SearchOperationListener() {
+        };
+        SearchOperationListener last = new SearchOperationListener() {
+            @Override
+            public Executor wrapSearcherExecutor(IndexShard shard, Executor executor) {
+                return task -> {
+                    order.add("last");
+                    executor.execute(task);
+                };
+            }
+        };
+        SearchOperationListener.CompositeListener composite = new SearchOperationListener.CompositeListener(
+            List.of(first, failing, returningNothing, plain, last),
+            logger
+        );
+
+        Executor wrapped = composite.wrapSearcherExecutor(null, original);
+        AtomicInteger ran = new AtomicInteger();
+        wrapped.execute(ran::incrementAndGet);
+
+        assertEquals(1, ran.get());
+        assertEquals("the last wrapper is outermost", List.of("last", "first", "original"), order);
     }
 }
