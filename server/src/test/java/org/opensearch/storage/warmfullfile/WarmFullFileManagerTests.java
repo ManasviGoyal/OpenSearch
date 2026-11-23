@@ -52,7 +52,9 @@ import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.Executor;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
@@ -1466,6 +1468,53 @@ public class WarmFullFileManagerTests extends OpenSearchTestCase {
         assertEquals("downloaded again after the demotion", 2 * parts, reader.readCount());
         assertEquals(content.length, mgr.reservedBytesPerSegment()[0]);
         assertEquals(2L, mgr.counters().get("promoted").longValue());
+    }
+
+    public void testAnExtensionChangeDemotesOnTheExecutorNotTheCallingThread() throws Exception {
+        // The setting drops the extension on the thread that applies cluster settings. That call only records the new
+        // set, so nothing new is promoted; the FULL family is demoted by the task handed to the executor.
+        String name = "_demote_off_thread.faiss";
+        byte[] content = footeredContent(FILE_LENGTH);
+        FileCache fileCache = newFileCache();
+        TransferManager tm = new TransferManager(new FixedContentStreamReader(content), fileCache, threadPool);
+        List<Runnable> deferred = new ArrayList<>();
+        AtomicBoolean defer = new AtomicBoolean();
+        Executor executor = task -> {
+            if (defer.get()) {
+                deferred.add(task);
+            } else {
+                task.run();
+            }
+        };
+        WarmFullFileManager mgr = new WarmFullFileManager(
+            fileCache,
+            new ThreadContext(Settings.EMPTY),
+            executor,
+            threadPool::relativeTimeInMillis,
+            4,
+            0.5,
+            PART_SIZE
+        );
+        mgr.onExtensionsChanged(Set.of("faiss"));
+        FullFileState st = promoteToFull(mgr, fileCache, name, content, tm);
+
+        defer.set(true);
+        mgr.onExtensionsChanged(Set.of());
+
+        assertFalse("the new set applies at once", mgr.isExtensionEligible("faiss"));
+        assertEquals("the family is untouched on the calling thread", FullFileState.State.FULL, st.state());
+        assertEquals("one task handed to the executor", 1, deferred.size());
+        assertEquals(0L, mgr.counters().get("demoted").longValue());
+
+        defer.set(false);
+        deferred.get(0).run();
+
+        assertEquals(FullFileState.State.BLOCK, st.state());
+        assertEquals(1L, mgr.counters().get("demoted").longValue());
+        assertBusy(() -> {
+            assertTrue("deferred release ran", st.cleanupDone());
+            assertEquals("budget released", 0L, mgr.reservedBytesPerSegment()[0]);
+        }, 30, TimeUnit.SECONDS);
     }
 
     public void testASecondDemotionAfterARepromotionReleasesAgain() throws Exception {

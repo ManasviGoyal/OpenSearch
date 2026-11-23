@@ -925,15 +925,34 @@ public class WarmFullFileManager {
     }
 
     /**
-     * Applies a new set of eligible extensions: remembers it for the trigger's check and demotes every FULL family
-     * whose extension is no longer in it. A demoted family serves blocks from its next clone or slice; its mapping,
-     * whole file and budget are released once the search scopes reading it end.
+     * Applies a new set of eligible extensions. The set is remembered at once, so the trigger's check sees it on the
+     * calling thread; the families are brought in line with it on the executor, since the caller is the thread that
+     * applies cluster settings and must not wait on them. A demoted family serves blocks from its next clone or
+     * slice; its mapping, whole file and budget are released once the search scopes reading it end.
      *
      * @param extensions the eligible extensions, normalized as {@link WarmFullFileSettings#getExtensions()} returns them
      */
     public void onExtensionsChanged(Set<String> extensions) {
         everEligibleExtensions.addAll(extensions);
         eligibleExtensions = extensions;
+        if (fullFamilies.isEmpty() && demotedFamilies.isEmpty()) {
+            // Nothing to bring in line. A family that turns FULL from here on checks the set itself as it publishes.
+            return;
+        }
+        try {
+            executor.execute(this::applyEligibleExtensions);
+        } catch (RuntimeException e) {
+            // e.g. executor rejected at node shutdown: the families are closed with their shards.
+            logger.debug("whole-file extension change not applied to the promoted families", e);
+        }
+    }
+
+    /**
+     * Demotes every FULL family whose extension is no longer eligible and restores every demoted one whose extension
+     * is eligible again. One run at a time, each against the current set, so the run for the latest change is also
+     * the last to act on a family.
+     */
+    private synchronized void applyEligibleExtensions() {
         for (FullFileState st : fullFamilies) {
             if (st.state() == FullFileState.State.CLOSED) {
                 // Closed; its teardown takes it out when the deferred cleanup runs, or this does if sooner.
