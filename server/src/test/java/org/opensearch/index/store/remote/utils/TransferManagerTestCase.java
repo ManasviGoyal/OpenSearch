@@ -426,6 +426,36 @@ public abstract class TransferManagerTestCase extends OpenSearchTestCase {
         }
     }
 
+    public void testAnEntryIsDownloadingOnlyWhileItsDownloadIsInFlight() throws Exception {
+        // The cache holds a download's entry from the moment the download is asked for, before any file is in place.
+        // Such an entry reports itself as downloading until the download has finished.
+        assertFalse(TransferManager.isDownloading(null));
+        final CountDownLatch latch = new CountDownLatch(1);
+        mockWaitForLatchReader(latch);
+        BlobFetchRequest request = BlobFetchRequest.builder()
+            .fileName("atomic-in-flight")
+            .directory(directory)
+            .blobParts(List.of(new BlobFetchRequest.BlobPart("blocking-blob", 0, EIGHT_MB)))
+            .atomicWrite(true)
+            .build();
+        Path key = request.getFilePath();
+        final CompletableFuture<IndexInput> future;
+        final CachedIndexInput entry;
+        try {
+            future = transferManager.fetchBlobAsync(request);
+            entry = fileCache.get(key);
+            assertNotNull(entry);
+            fileCache.decRef(key);
+            assertTrue("in flight", TransferManager.isDownloading(entry));
+            assertFalse("no file in place yet", Files.exists(key));
+        } finally {
+            latch.countDown();
+        }
+        future.get(30, TimeUnit.SECONDS);
+        assertFalse("finished", TransferManager.isDownloading(entry));
+        assertTrue(Files.exists(key));
+    }
+
     public void testASupersededAtomicDownloadNeitherPublishesNorRemovesTheNewerOne() throws Exception {
         // A download blocks on its read. Its cache entry is removed, and a second download of the same file starts,
         // completes and publishes. When the first one resumes it is stale: it must not rename its bytes over the

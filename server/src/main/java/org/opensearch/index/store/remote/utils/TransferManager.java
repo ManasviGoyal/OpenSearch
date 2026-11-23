@@ -364,6 +364,16 @@ public class TransferManager {
     }
 
     /**
+     * Whether {@code entry} is a download of this class that has not finished: its file is not in place yet.
+     *
+     * @param entry a file cache entry, or null
+     * @return true if the entry is a download still in flight
+     */
+    public static boolean isDownloading(CachedIndexInput entry) {
+        return entry instanceof DelayedCreationCachedIndexInput delayed && delayed.result.isDone() == false;
+    }
+
+    /**
      * Implementation of CachedIndexInput the defers creation of the underlying
      * IndexInput until the first invocation of {@link #getIndexInput()}. This
      * class is thread safe, and concurrent calls to {@link #getIndexInput()} will

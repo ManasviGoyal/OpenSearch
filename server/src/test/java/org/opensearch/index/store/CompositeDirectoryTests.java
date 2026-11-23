@@ -10,6 +10,8 @@ package org.opensearch.index.store;
 
 import com.carrotsearch.randomizedtesting.annotations.ThreadLeakFilters;
 
+import org.apache.logging.log4j.Level;
+import org.apache.logging.log4j.LogManager;
 import org.apache.lucene.store.AlreadyClosedException;
 import org.apache.lucene.store.FSDirectory;
 import org.apache.lucene.store.IOContext;
@@ -23,6 +25,7 @@ import org.opensearch.index.store.remote.filecache.FileCache.RestoredCachedIndex
 import org.opensearch.index.store.remote.filecache.FileCacheFactory;
 import org.opensearch.index.store.remote.filecache.FileCachedIndexInput;
 import org.opensearch.index.store.remote.utils.FileTypeUtils;
+import org.opensearch.test.MockLogAppender;
 import org.junit.Before;
 
 import java.io.IOException;
@@ -99,18 +102,31 @@ public class CompositeDirectoryTests extends BaseRemoteSegmentStoreDirectoryTest
         assertNull(exception);
     }
 
-    public void testFileLengthFallsBackToRemoteWhenTheEntryOutlivesTheLocalFile() throws IOException {
+    public void testFileLengthFallsBackToRemoteAndWarnsWhenTheEntryOutlivesTheLocalFile() throws Exception {
         // A file with a cache entry whose local copy was deleted on the local directory directly (not through the
-        // cache): the length comes from the remote store instead of failing the caller.
+        // cache): the length comes from the remote store instead of failing the caller, and the miss is logged at
+        // WARN, since nothing is downloading the file.
         addFilesToDirectory(new String[] { FILE_PRESENT_IN_REMOTE_ONLY });
         Path key = getFilePath(FILE_PRESENT_IN_REMOTE_ONLY);
         Files.delete(key);
         assertNotNull(fileCache.get(key));
         fileCache.decRef(key);
-        assertEquals(
-            remoteSegmentStoreDirectory.fileLength(FILE_PRESENT_IN_REMOTE_ONLY),
-            compositeDirectory.fileLength(FILE_PRESENT_IN_REMOTE_ONLY)
-        );
+        try (MockLogAppender appender = MockLogAppender.createForLoggers(LogManager.getLogger(CompositeDirectory.class))) {
+            appender.addExpectation(
+                new MockLogAppender.SeenEventExpectation(
+                    "the miss is logged",
+                    CompositeDirectory.class.getCanonicalName(),
+                    Level.WARN,
+                    "*" + FILE_PRESENT_IN_REMOTE_ONLY + " has a cache entry but no local file; using the remote length"
+                )
+            );
+            assertEquals(
+                remoteSegmentStoreDirectory.fileLength(FILE_PRESENT_IN_REMOTE_ONLY),
+                compositeDirectory.fileLength(FILE_PRESENT_IN_REMOTE_ONLY)
+            );
+            appender.assertAllExpectationsMatched();
+        }
+        assertEquals("the lookup's reference was given back", Integer.valueOf(0), fileCache.getRef(key));
     }
 
     public void testFileLength() throws IOException {

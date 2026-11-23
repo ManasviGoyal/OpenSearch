@@ -207,7 +207,8 @@ public class CompositeDirectory extends FilterDirectory implements RemoteSyncLis
         ensureOpen();
         logger.trace("Composite Directory[{}]: fileLength() called {}", this::toString, () -> name);
         Path key = getFilePath(name);
-        if (FileTypeUtils.isTempFile(name) || fileCache.get(key) != null) {
+        final CachedIndexInput entry = FileTypeUtils.isTempFile(name) ? null : fileCache.get(key);
+        if (FileTypeUtils.isTempFile(name) || entry != null) {
             try {
                 final long localLength = localDirectory.fileLength(name);
                 logger.trace(
@@ -218,9 +219,15 @@ public class CompositeDirectory extends FilterDirectory implements RemoteSyncLis
                 );
                 return localLength;
             } catch (NoSuchFileException e) {
-                // The cache entry outlived its file: it was deleted on the local directory directly, not through the
-                // cache. The remote store still has the file, so answer from there rather than fail the caller.
-                logger.debug("Composite Directory[{}]: {} has a cache entry but no local file; using the remote length", this, name);
+                // The remote store still has the file, so answer from there rather than fail the caller.
+                if (TransferManager.isDownloading(entry)) {
+                    // Expected: the download writes elsewhere and puts the file in place when it is complete.
+                    logger.debug("Composite Directory[{}]: {} is still downloading; using the remote length", this, name);
+                } else {
+                    // The cache entry outlived its file: it was deleted on the local directory directly, not through
+                    // the cache.
+                    logger.warn("Composite Directory[{}]: {} has a cache entry but no local file; using the remote length", this, name);
+                }
             } finally {
                 fileCache.decRef(key);
             }
