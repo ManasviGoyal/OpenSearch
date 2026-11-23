@@ -51,6 +51,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executor;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.BooleanSupplier;
 import java.util.function.LongSupplier;
 
 /**
@@ -133,6 +134,8 @@ public class WarmFullFileManager {
 
     private final FileCache fileCache;
     private final Executor executor;
+    // Whether the node is stopping; set once at construction by the node, and never true otherwise.
+    private volatile BooleanSupplier nodeStopping = () -> false;
     private final LongSupplier clock;
     private volatile int maxConcurrentDownloads;
     private final ResizableSemaphore slots;
@@ -200,6 +203,24 @@ public class WarmFullFileManager {
         int maxConcurrentDownloads
     ) {
         this(fileCache, threadContext, executor, clock, maxConcurrentDownloads, DEFAULT_BUDGET_FRACTION, DEFAULT_PART_SIZE);
+    }
+
+    /**
+     * As the constructor above, for a node.
+     *
+     * @param nodeStopping whether the node is stopping. A whole file released from then on is left on disk, for the
+     *                     next start to validate and serve again, as the files of a node that stopped at once are.
+     */
+    public WarmFullFileManager(
+        FileCache fileCache,
+        ThreadContext threadContext,
+        Executor executor,
+        LongSupplier clock,
+        int maxConcurrentDownloads,
+        BooleanSupplier nodeStopping
+    ) {
+        this(fileCache, threadContext, executor, clock, maxConcurrentDownloads);
+        this.nodeStopping = nodeStopping;
     }
 
     /** Package-private constructor for tests (small slot count, budget fraction, and part size). */
@@ -315,6 +336,10 @@ public class WarmFullFileManager {
      */
     public void promote(FullFileState st) {
         requested.inc();
+        // A release that could not delete its file holds its budget; give it another try before admitting more.
+        for (FullFileState waiting : awaitingRelease) {
+            waiting.retryRelease();
+        }
         // The family closed (shard closed, entry evicted or replaced) between the trigger's CAS and this run: nothing
         // to promote, and no slot or budget to spend on a download nobody will use. (A download already running when the
         // family closes is cancelled by closeFamily; its completion handler releases the slot and the budget.)
@@ -406,20 +431,7 @@ public class WarmFullFileManager {
                 CachedIndexInput existing = fileCache.get(path);
                 if (existing != null) {
                     holdsReference = true;
-                    if (existing instanceof PromotedWholeFileEntry earlier) {
-                        // The whole file of an earlier family of this file, left to the cache when that family closed
-                        // (an index reopen on this node): kept when it validates, like a file left on disk. The entry
-                        // becomes a restore placeholder, which fetchBlobAsync replaces without fetching; the earlier
-                        // family's entry is closed here, since a replacement is silent to the removal listener.
-                        reuse = validateExisting(st);
-                        if (reuse) {
-                            fileCache.put(path, new FileCache.RestoredCachedIndexInput(length));
-                            fileCache.decRef(path); // the put's reference; the attempt keeps the one from get()
-                            closeQuietly(earlier);
-                        } else {
-                            dropEntry();
-                        }
-                    } else if (existing instanceof FileCache.RestoredCachedIndexInput) {
+                    if (existing instanceof FileCache.RestoredCachedIndexInput) {
                         // Validated under the reference taken above: a referenced entry is not evictable, so the file
                         // cannot be deleted under the validation. The reference is kept until fetchBlobAsync has replaced
                         // the placeholder (the node keeps its count across the replacement) and released after it.
@@ -614,6 +626,7 @@ public class WarmFullFileManager {
             FullFileState.Completion completion = st.completePromotion(
                 entry,
                 executor,
+                () -> nodeStopping.getAsBoolean(),
                 reservation::close,
                 () -> awaitingRelease.add(st),
                 () -> {
@@ -1140,9 +1153,9 @@ public class WarmFullFileManager {
 
     /**
      * True for live cache entries that are never reused or served from, and so are removed before re-downloading: a
-     * completed whole-file entry of the download's own type or a switchable family entry. A restore placeholder and
-     * an earlier family's promoted entry are handled separately (their file may be reused), and fetchBlobAsync's own
-     * placeholder (a private type), in flight or complete, is joined, not removed.
+     * completed whole-file entry of the download's own type, an earlier family's promoted entry whose release has not
+     * run yet, or a switchable family entry. A restore placeholder is handled separately (its file may be reused), and
+     * fetchBlobAsync's own placeholder (a private type), in flight or complete, is joined, not removed.
      */
     private static boolean isKnownNonReusableEntry(CachedIndexInput entry) {
         return entry instanceof CachedFullFileIndexInput || entry instanceof CachedSwitchableIndexInput;

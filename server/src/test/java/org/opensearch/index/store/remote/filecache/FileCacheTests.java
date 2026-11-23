@@ -32,6 +32,8 @@ import java.nio.file.attribute.PosixFilePermissions;
 import java.util.List;
 import java.util.concurrent.ForkJoinPool;
 import java.util.concurrent.ForkJoinTask;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 
 @ThreadLeakFilters(filters = CleanerDaemonThreadLeakFilter.class)
 public class FileCacheTests extends OpenSearchTestCase {
@@ -319,6 +321,97 @@ public class FileCacheTests extends OpenSearchTestCase {
         assertEquals(expectedActiveCacheUsage, realActiveCacheUsage);
     }
 
+    /** An entry whose owner deletes its file, as {@link CachedIndexInput#isFileReleasedByOwner()} describes. */
+    private static CachedIndexInput ownerReleasedEntry(long length, AtomicBoolean closed) {
+        return ownerReleasedEntry(length, closed, new AtomicReference<>());
+    }
+
+    private static CachedIndexInput ownerReleasedEntry(long length, AtomicBoolean closed, AtomicReference<Path> retired) {
+        return new CachedIndexInput() {
+            @Override
+            public IndexInput getIndexInput() {
+                throw new UnsupportedOperationException();
+            }
+
+            @Override
+            public long length() {
+                return length;
+            }
+
+            @Override
+            public boolean isClosed() {
+                return closed.get();
+            }
+
+            @Override
+            public boolean isFileReleasedByOwner() {
+                return true;
+            }
+
+            @Override
+            public void onFileRetired(Path path) {
+                assertFalse("told before the close", closed.get());
+                retired.set(path);
+            }
+
+            @Override
+            public void close() {
+                closed.set(true);
+            }
+        };
+    }
+
+    public void testAFileItsOwnerDeletesStaysOnDiskAndCountedUntilReleased() throws IOException {
+        // The cache drops the entry of a file that its owner deletes later: the file is renamed out of the way, the
+        // entry is told where and closed, and the bytes stay in the usage until the owner reports them released.
+        FileCache fileCache = FileCacheFactory.createConcurrentLRUFileCache(24 * MEGA_BYTES, 1);
+        Path file = path.resolve("_0.faiss");
+        Files.createFile(file);
+        AtomicBoolean closed = new AtomicBoolean();
+        AtomicReference<Path> retired = new AtomicReference<>();
+        fileCache.put(file, ownerReleasedEntry(16 * MEGA_BYTES, closed, retired));
+        fileCache.decRef(file);
+        assertEquals(16 * MEGA_BYTES, fileCache.usage());
+
+        fileCache.remove(file);
+
+        assertTrue("the entry is closed", closed.get());
+        assertNull(fileCache.get(file));
+        assertFalse("the file's name is free", Files.exists(file));
+        assertNotNull(retired.get());
+        assertTrue("the file is left to its owner", Files.exists(retired.get()));
+        assertEquals(file.getParent(), retired.get().getParent());
+        assertTrue(FileTypeUtils.isRetiredFile(retired.get().getFileName().toString()));
+        assertEquals("still counted", 16 * MEGA_BYTES, fileCache.usage());
+        assertEquals("the statistics count entries only", 0L, fileCache.stats().usage());
+
+        fileCache.releaseOwed(file, 16 * MEGA_BYTES);
+        assertEquals(0L, fileCache.usage());
+        fileCache.releaseOwed(file, 16 * MEGA_BYTES);
+        assertEquals("never below zero", 0L, fileCache.usage());
+    }
+
+    public void testOwedBytesKeepTheirRoomFromNewEntriesUntilReleased() {
+        // An evicted file its owner has not deleted yet still fills the disk, so the cache keeps evicting for the
+        // room it does not have; once the bytes are released a new entry stays.
+        FileCache fileCache = FileCacheFactory.createConcurrentLRUFileCache(24 * MEGA_BYTES, 1);
+        Path owed = createPath("owed");
+        fileCache.put(owed, ownerReleasedEntry(16 * MEGA_BYTES, new AtomicBoolean()));
+        fileCache.decRef(owed);
+
+        putAndDecRef(fileCache, 1, 16 * MEGA_BYTES);
+
+        assertNull("evicted for capacity", fileCache.get(owed));
+        assertNull("no room for the new entry either while the bytes are owed", fileCache.get(createPath("1")));
+        assertEquals(16 * MEGA_BYTES, fileCache.usage());
+
+        fileCache.releaseOwed(owed, 16 * MEGA_BYTES);
+        putAndDecRef(fileCache, 2, 16 * MEGA_BYTES);
+        assertNotNull(fileCache.get(createPath("2")));
+        fileCache.decRef(createPath("2"));
+        assertEquals(16 * MEGA_BYTES, fileCache.usage());
+    }
+
     public void testUsageAtFullActiveCapacity() throws IOException {
         FileCache fileCache = FileCacheFactory.createConcurrentLRUFileCache(16 * MEGA_BYTES, 1);
         // Add some entries to cache
@@ -422,7 +515,9 @@ public class FileCacheTests extends OpenSearchTestCase {
             // Verify initial state
             assertEquals(numEntries, fileCache.size());
             // Close all references
+            assertFalse(fileCache.isClosedForRestart());
             fileCache.closeIndexInputReferences();
+            assertTrue(fileCache.isClosedForRestart());
             // Verify cache is empty
             assertEquals(0, fileCache.size());
             // Verify all entries are removed
@@ -485,6 +580,27 @@ public class FileCacheTests extends OpenSearchTestCase {
         assertNotNull(fileCache.get(indexPath.resolve("_0.faiss").toAbsolutePath()));
         fileCache.decRef(indexPath.resolve("_0.faiss").toAbsolutePath());
         assertEquals("only the complete file is charged", completeSize, fileCache.usage());
+    }
+
+    public void testRestoreDeletesRetiredFilesInsteadOfRegisteringThem() throws IOException {
+        // A file renamed out of the way for its owner to delete, left behind by a node that stopped first: the restore
+        // scan deletes it and registers only the files next to it.
+        String indexName = "test-warm-index";
+        String shardId = "0";
+        String retiredName = "_0.faiss.r4nd0m" + FileTypeUtils.RETIRED_FILE_SUFFIX;
+        createWarmIndexFile(indexName, shardId, "_1.faiss");
+        createWarmIndexFile(indexName, shardId, retiredName);
+        Path shardPath = path.resolve(NodeEnvironment.INDICES_FOLDER).resolve(indexName).resolve(shardId);
+        Path indexPath = shardPath.resolve(FileTypeUtils.INDICES_FOLDER_IDENTIFIER);
+        Path retired = indexPath.resolve(retiredName);
+        long keptSize = Files.size(indexPath.resolve("_1.faiss"));
+
+        FileCache fileCache = createFileCache(MEGA_BYTES);
+        fileCache.restoreFromDirectory(List.of(shardPath));
+
+        assertFalse("the retired file is deleted", Files.exists(retired));
+        assertNull("and not registered", fileCache.get(retired.toAbsolutePath()));
+        assertEquals("only the other file is charged", keptSize, fileCache.usage());
     }
 
     public void testRestoreFromMultipleDirectories() throws IOException {

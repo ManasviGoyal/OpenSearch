@@ -39,6 +39,21 @@ public class FileTypeUtils {
         return name.endsWith(PARTIAL_DOWNLOAD_SUFFIX);
     }
 
+    /**
+     * Suffix of a file whose cache entry is gone and whose owner deletes it once nothing reads it any more: it was
+     * renamed out of the way so that its name is free again. Never served, and deleted when the cache is restored.
+     */
+    public static final String RETIRED_FILE_SUFFIX = ".retired";
+
+    /**
+     * Checks if the file is one that was renamed out of the way for its owner to delete.
+     * @param name the file name
+     * @return true if the name carries {@link #RETIRED_FILE_SUFFIX}
+     */
+    public static boolean isRetiredFile(String name) {
+        return name.endsWith(RETIRED_FILE_SUFFIX);
+    }
+
     public static boolean isBlockFile(String name) {
         return name.contains(BLOCK_FILE_IDENTIFIER);
     }

@@ -60,7 +60,7 @@ public class SegmentedCache<K, V> implements RefCountedCache<K, V> {
         this.perSegmentCapacity = (builder.capacity + (segments - 1)) / segments;
         this.weigher = builder.weigher;
         for (int i = 0; i < table.length; i++) {
-            table[i] = new LRUCache<>(perSegmentCapacity, builder.listener, builder.weigher);
+            table[i] = new LRUCache<>(perSegmentCapacity, builder.listener, builder.weigher, builder.owedWeigher);
         }
         this.capacity = perSegmentCapacity * segments;
     }
@@ -121,6 +121,14 @@ public class SegmentedCache<K, V> implements RefCountedCache<K, V> {
     public void remove(K key) {
         if (key == null) throw new NullPointerException();
         segmentFor(key).remove(key);
+    }
+
+    @Override
+    public void releaseOwed(K key, long weight) {
+        if (key == null) {
+            throw new NullPointerException();
+        }
+        segmentFor(key).releaseOwed(key, weight);
     }
 
     @Override
@@ -197,9 +205,7 @@ public class SegmentedCache<K, V> implements RefCountedCache<K, V> {
     public long usage() {
         long totalUsage = 0L;
         for (RefCountedCache<K, V> cache : table) {
-            IRefCountedCacheStats c = cache.stats();
-            totalUsage += c.usage();
-
+            totalUsage += cache.usage();
         }
         return totalUsage;
     }
@@ -319,6 +325,7 @@ public class SegmentedCache<K, V> implements RefCountedCache<K, V> {
 
         RemovalListener<K, V> listener;
         Weigher<V> weigher;
+        Weigher<V> owedWeigher = value -> 0;
 
         int concurrencyLevel;
 
@@ -386,6 +393,20 @@ public class SegmentedCache<K, V> implements RefCountedCache<K, V> {
         public Builder<K, V> weigher(Weigher<V> weigher) {
             Objects.requireNonNull(weigher);
             this.weigher = weigher;
+            return this;
+        }
+
+        /**
+         * Specifies how many units of capacity a value still consumes after the cache has removed it. That weight
+         * stays in the cache's usage until it is given back with {@link SegmentedCache#releaseOwed}. The default is
+         * zero for every value.
+         *
+         * @param owedWeigher the algorithm to determine the weight a removed value still occupies
+         * @throws NullPointerException if the weigher is null
+         */
+        public Builder<K, V> owedWeigher(Weigher<V> owedWeigher) {
+            Objects.requireNonNull(owedWeigher);
+            this.owedWeigher = owedWeigher;
             return this;
         }
 

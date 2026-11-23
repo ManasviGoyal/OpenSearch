@@ -37,6 +37,7 @@ import static org.opensearch.env.NodeEnvironment.processDirectoryFiles;
 import static org.opensearch.index.store.remote.directory.RemoteSnapshotDirectoryFactory.LOCAL_STORE_LOCATION;
 import static org.opensearch.index.store.remote.utils.FileTypeUtils.INDICES_FOLDER_IDENTIFIER;
 import static org.opensearch.index.store.remote.utils.FileTypeUtils.isPartialDownloadFile;
+import static org.opensearch.index.store.remote.utils.FileTypeUtils.isRetiredFile;
 
 /**
  * File Cache (FC) is introduced to solve the problem that the local disk cannot hold
@@ -60,6 +61,7 @@ import static org.opensearch.index.store.remote.utils.FileTypeUtils.isPartialDow
 public class FileCache implements RefCountedCache<Path, CachedIndexInput> {
     private static final Logger logger = LogManager.getLogger(FileCache.class);
     private final SegmentedCache<Path, CachedIndexInput> theCache;
+    private volatile boolean closedForRestart;
 
     private final CircuitBreaker circuitBreaker = null;
 
@@ -135,6 +137,18 @@ public class FileCache implements RefCountedCache<Path, CachedIndexInput> {
     @Override
     public boolean removeIfEvictable(final Path filePath) {
         return theCache.removeIfEvictable(filePath);
+    }
+
+    /**
+     * Stops counting the bytes of a file whose entry the cache dropped while its owner still had to delete it; see
+     * {@link CachedIndexInput#isFileReleasedByOwner()}. Called by the owner once the file is deleted.
+     *
+     * @param filePath the key the entry was dropped from
+     * @param length   the bytes to stop counting
+     */
+    @Override
+    public void releaseOwed(final Path filePath, long length) {
+        theCache.releaseOwed(filePath, length);
     }
 
     @Override
@@ -227,7 +241,16 @@ public class FileCache implements RefCountedCache<Path, CachedIndexInput> {
 
     // To be used only in testing framework.
     public void closeIndexInputReferences() {
+        closedForRestart = true;
         theCache.closeIndexInputReferences();
+    }
+
+    /**
+     * Whether {@link #closeIndexInputReferences()} has closed this cache's entries as a node restart would. The files
+     * are meant to stay on disk from then on, so the owner of an entry closed that way must not delete its file.
+     */
+    public boolean isClosedForRestart() {
+        return closedForRestart;
     }
 
     /**
@@ -255,6 +278,11 @@ public class FileCache implements RefCountedCache<Path, CachedIndexInput> {
             try {
                 if (isPartialDownloadFile(path.getFileName().toString())) {
                     // A download that never reached its rename: incomplete, so it is dropped rather than registered.
+                    Files.deleteIfExists(path);
+                    return;
+                }
+                if (isRetiredFile(path.getFileName().toString())) {
+                    // A file whose entry the cache had dropped and whose owner had not deleted it yet.
                     Files.deleteIfExists(path);
                     return;
                 }

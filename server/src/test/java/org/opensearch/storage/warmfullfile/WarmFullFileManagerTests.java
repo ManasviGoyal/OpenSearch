@@ -1860,10 +1860,10 @@ public class WarmFullFileManagerTests extends OpenSearchTestCase {
         assertEquals(1L, stats.get("promoted").longValue());
     }
 
-    public void testCompletedEntryOfAnEarlierFamilyIsJoinedAfterItsClose() throws Exception {
-        // The family of a promoted file closes (the index is closed) and its whole-file entry stays in the cache,
-        // unreferenced. A new family for the same file (the index reopened) validates that file and serves it: no
-        // remote read, FULL, unreferenced; counted as a local-copy reuse, with no download started.
+    public void testAFamilyThatClosesReleasesItsWholeFileAndALaterFamilyDownloadsAgain() throws Exception {
+        // The family of a promoted file closes (the index is closed): its whole file is released like an evicted or
+        // demoted one, so nothing of it is left in the cache or on disk. A new family for the same file (the index
+        // reopened) downloads the file again.
         String name = "_reopen.faiss";
         Path path = dir.resolve(name);
         byte[] content = footeredContent(FILE_LENGTH);
@@ -1877,57 +1877,64 @@ public class WarmFullFileManagerTests extends OpenSearchTestCase {
 
         first.closeFamily();
         assertBusy(() -> assertTrue(first.cleanupDone()), 30, TimeUnit.SECONDS);
-        assertNotNull("the whole-file entry outlives the family", fileCache.get(path));
-        fileCache.decRef(path);
-        assertEquals("unreferenced after the close", Integer.valueOf(0), fileCache.getRef(path));
+        assertNull("the whole-file entry went with the family", fileCache.get(path));
+        assertFalse(Files.exists(path));
+        assertEquals(List.of(), retiredFiles());
+        assertEquals(0L, fileCache.usage());
         assertEquals(0L, mgr.reservedBytesPerSegment()[0]);
 
         FullFileState second = newStateWithChecksum(tm, fileCache, name, content.length, footerChecksum(content));
         startPromotion(mgr, second);
         awaitState(second, FullFileState.State.FULL);
 
-        assertEquals("no remote read for the joined entry", parts, reader.readCount());
+        assertEquals("downloaded again", 2 * parts, reader.readCount());
         assertServedUnreferenced(second, fileCache, path, content);
         Map<String, Long> stats = mgr.counters();
-        assertEquals("the earlier family's whole file is a local copy", 1L, stats.get("reused").longValue());
-        assertEquals(1L, stats.get("started").longValue());
+        assertEquals(0L, stats.get("reused").longValue());
+        assertEquals(2L, stats.get("started").longValue());
         assertEquals(2L, stats.get("promoted").longValue());
-        assertEquals("nothing was fetched for the join", (long) content.length, stats.get("downloadedBytes").longValue());
         assertEquals(content.length, mgr.reservedBytesPerSegment()[0]);
     }
 
-    public void testCompletedEntryWhoseFileWasDeletedBehindTheCacheIsDroppedAndRedownloaded() throws Exception {
-        // The whole-file entry of a closed family stays in the cache, and the file is then deleted on the local
-        // directory directly (not through the cache), as a recovery cleanup does. A new family for the same file
-        // finds the entry, fails to validate its missing file, drops the entry and downloads the file again, ending
-        // FULL on a file that exists.
-        String name = "_stale.faiss";
+    public void testANewFamilyPromotesWhileAnEarlierFamilysReleaseWaitsForItsScope() throws Exception {
+        // A family closes while a scope still reads its whole file, so its release waits and its entry is still in the
+        // cache. A new family for the same file drops that entry, which moves the earlier file aside, and downloads
+        // its own. When the scope ends, the earlier family's release deletes its own file and leaves the new family's
+        // entry and file alone.
+        String name = "_overlap.faiss";
         Path path = dir.resolve(name);
         byte[] content = footeredContent(FILE_LENGTH);
         FixedContentStreamReader reader = new FixedContentStreamReader(content);
         FileCache fileCache = newFileCache();
         TransferManager tm = new TransferManager(reader, fileCache, threadPool);
-        AtomicLong clock = new AtomicLong(1_000);
-        WarmFullFileManager mgr = newManager(fileCache, clock::get, 4, 0.5);
+        WarmFullFileManager mgr = newManager(fileCache, 4, 0.5);
         FullFileState first = promoteToFull(mgr, fileCache, name, content, tm);
         int parts = partsFor(name, content.length);
-        assertEquals(parts, reader.readCount());
+        assertTrue(first.acquireView());
+        IndexInput firstMapping = first.localMaster();
 
         first.closeFamily();
-        assertBusy(() -> assertTrue(first.cleanupDone()), 30, TimeUnit.SECONDS);
-        Files.delete(path);
-        assertNotNull("the entry outlives the file", fileCache.get(path));
-        fileCache.decRef(path);
+        assertFalse("the release waits for the scope", first.cleanupDone());
 
         FullFileState second = newStateWithChecksum(tm, fileCache, name, content.length, footerChecksum(content));
         startPromotion(mgr, second);
         awaitState(second, FullFileState.State.FULL);
-        assertEquals("the file was downloaded again", 2 * parts, reader.readCount());
-        assertEquals("no decline: the stale entry was dropped at admission", 0L, mgr.counters().get("declined").longValue());
-        assertEquals("one file's worth of budget: the closed family's is back", content.length, mgr.reservedBytesPerSegment()[0]);
-        assertTrue(Files.exists(path));
+
+        assertEquals("downloaded again", 2 * parts, reader.readCount());
+        assertEquals("the earlier file was moved aside", 1, retiredFiles().size());
+        assertArrayEquals("and is still read by its scope", content, readAll(firstMapping, content.length));
+        assertEquals("both files are on disk and counted", 2L * content.length, fileCache.usage());
+        assertEquals("and both hold budget", 2L * content.length, mgr.reservedBytesPerSegment()[0]);
+
+        first.releaseView();
+        assertBusy(() -> assertTrue(first.cleanupDone()), 30, TimeUnit.SECONDS);
+
+        assertEquals("the earlier file is deleted", List.of(), retiredFiles());
+        assertEquals(FullFileState.State.FULL, second.state());
+        assertTrue("the new family's file is untouched", Files.exists(path));
         assertServedUnreferenced(second, fileCache, path, content);
-        assertEquals(2L, mgr.counters().get("promoted").longValue());
+        assertEquals((long) content.length, fileCache.usage());
+        assertEquals(content.length, mgr.reservedBytesPerSegment()[0]);
     }
 
     public void testTruncatedLeftoverIsDeletedAndRedownloaded() throws Exception {
@@ -2353,8 +2360,9 @@ public class WarmFullFileManagerTests extends OpenSearchTestCase {
     }
 
     public void testAnExplicitRemovalUnderAScopeDemotesAtOnceAndUnmapsWhenTheScopeEnds() throws Exception {
-        // An explicit remove ignores references: the family is demoted and its budget released at once, but the
-        // mapping stays readable until the scope ends, and only then is it closed.
+        // An explicit remove ignores references: the family is demoted at once, but the mapping stays readable until
+        // the scope ends. Until then the file, moved aside, still occupies the disk, so the cache keeps counting its
+        // bytes and the budget stays held; the release closes the mapping, deletes the file and gives both back.
         String name = "_remove.faiss";
         Path path = dir.resolve(name);
         byte[] content = footeredContent(FILE_LENGTH);
@@ -2371,11 +2379,14 @@ public class WarmFullFileManagerTests extends OpenSearchTestCase {
         assertEquals("demoted at once: new reads go to blocks", FullFileState.State.BLOCK, st.state());
         Map<String, Long> stats = mgr.counters();
         assertEquals(1L, stats.get("evicted").longValue());
-        assertEquals("the budget goes back with the file", 0L, stats.get("reservedBytes").longValue());
+        assertEquals("the budget is held", (long) content.length, stats.get("reservedBytes").longValue());
+        assertNull("the entry is gone", fileCache.get(path));
+        assertEquals("the cache still counts the file", (long) content.length, fileCache.usage());
+        assertEquals("the file was moved aside", 1, retiredFiles().size());
         assertEquals("the scope keeps the mapping", 1L, stats.get("familiesAwaitingRelease").longValue());
         assertEquals((long) content.length, stats.get("bytesAwaitingRelease").longValue());
         assertFalse(st.cleanupDone());
-        assertFalse("the file is gone from disk", Files.exists(path));
+        assertFalse("the file's own name is free", Files.exists(path));
         assertArrayEquals("the mapping still reads under the scope", content, readAll(st.localMaster(), content.length));
 
         st.releaseView();
@@ -2383,6 +2394,16 @@ public class WarmFullFileManagerTests extends OpenSearchTestCase {
         assertNull(st.localMaster());
         assertEquals(0L, mgr.counters().get("familiesAwaitingRelease").longValue());
         assertFalse(st.isMappingReleasePending());
+        assertEquals("the file is deleted", List.of(), retiredFiles());
+        assertEquals("the cache counts it no longer", 0L, fileCache.usage());
+        assertEquals("the budget is back", 0L, mgr.counters().get("reservedBytes").longValue());
+    }
+
+    /** The whole files the cache moved aside for their release, in the test directory. */
+    private List<String> retiredFiles() throws IOException {
+        try (Stream<Path> files = Files.list(dir)) {
+            return files.map(file -> file.getFileName().toString()).filter(FileTypeUtils::isRetiredFile).sorted().toList();
+        }
     }
 
     public void testABudgetDeclineIsAnOrdinaryDeclineAndEvictsNothing() throws Exception {

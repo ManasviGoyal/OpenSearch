@@ -208,7 +208,10 @@ public class SwitchableIndexInputWrapperWholeFileTests extends TieredStorageBase
     private void publish(FullFileState st, IndexInput master) {
         Path path = st.fullFilePath();
         PromotedWholeFileEntry entry = new PromotedWholeFileEntry(fileCache, path, master, st);
-        assertEquals(FullFileState.Completion.FULL, st.completePromotion(entry, Runnable::run, () -> {}, () -> {}, () -> {}, () -> {}));
+        assertEquals(
+            FullFileState.Completion.FULL,
+            st.completePromotion(entry, Runnable::run, () -> false, () -> {}, () -> {}, () -> {}, () -> {})
+        );
         fileCache.put(path, entry);
         fileCache.decRef(path);
     }
@@ -1190,14 +1193,9 @@ public class SwitchableIndexInputWrapperWholeFileTests extends TieredStorageBase
         exitScope();
         assertBusy(() -> assertTrue(st.cleanupDone()), 30, TimeUnit.SECONDS);
         assertNull("master released", st.localMaster());
-        assertEquals(Integer.valueOf(0), fileCache.getRef(fullPath));
-        // The family's master is closed. (Whether a stale view then throws is up to Lucene: since 10.x, MMapDirectory
-        // groups a segment's files into one ref-counted shared Arena, so the memory is unmapped only after every input
-        // in the group closes. Not asserted here; it is not part of the wrapper's contract.)
         expectThrows(AlreadyClosedException.class, master::readByte);
 
-        // The whole file is now evictable: prune removes the entry and deletes the file.
-        fileCache.prune();
+        // The closed family's whole file went with it: no cache entry, no file, no bytes counted.
         assertNull(fileCache.getRef(fullPath));
         assertFalse(Files.exists(fullPath));
         view.close();

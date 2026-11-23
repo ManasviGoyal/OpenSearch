@@ -18,6 +18,7 @@ import org.opensearch.index.store.remote.filecache.FileCache;
 import org.opensearch.index.store.remote.filecache.FileCacheFactory;
 import org.opensearch.test.OpenSearchTestCase;
 
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
@@ -30,6 +31,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Consumer;
+import java.util.stream.Stream;
 
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
@@ -86,6 +88,7 @@ public class FullFileStateTests extends OpenSearchTestCase {
         return st.completePromotion(
             new PromotedWholeFileEntry(null, st.fullFilePath(), mapping, st),
             null,
+            () -> false,
             () -> {},
             () -> {},
             () -> {},
@@ -176,7 +179,7 @@ public class FullFileStateTests extends OpenSearchTestCase {
 
     // ---------------- removal by the cache ----------------
 
-    public void testTheCacheDroppingAFullFileDemotesItReleasesTheBudgetAndUnmapsOffThread() throws Exception {
+    public void testTheCacheDroppingAFullFileDemotesItAndReleasesItOffThread() throws Exception {
         Fixture f = new Fixture();
         f.goFull();
 
@@ -184,8 +187,8 @@ public class FullFileStateTests extends OpenSearchTestCase {
 
         assertEquals(FullFileState.State.BLOCK, f.st.state());
         assertEquals("counted as an eviction", 1, f.evictions.get());
-        assertEquals("the budget goes back with the file", 1, f.budgetReleases.get());
-        assertEquals("no scope: the unmap is scheduled at once", 1, f.executor.tasks.size());
+        assertEquals("the budget is held until the file is deleted", 0, f.budgetReleases.get());
+        assertEquals("no scope: the release is scheduled at once", 1, f.executor.tasks.size());
         verify(f.master, never()).close();
         assertTrue("until it runs, the family cannot be promoted again", f.st.isMappingReleasePending());
 
@@ -208,7 +211,7 @@ public class FullFileStateTests extends OpenSearchTestCase {
 
         assertEquals("demoted at once: new reads go to blocks", FullFileState.State.BLOCK, f.st.state());
         assertEquals(1, f.evictions.get());
-        assertEquals("the budget goes back at once", 1, f.budgetReleases.get());
+        assertEquals("the budget is held: the mapped file still occupies the disk", 0, f.budgetReleases.get());
         assertEquals("reported: scopes still read the mapping", 1, f.awaitingReports.get());
         assertTrue("the scope keeps the mapping", f.executor.tasks.isEmpty());
         assertSame(f.master, f.st.localMaster());
@@ -219,7 +222,45 @@ public class FullFileStateTests extends OpenSearchTestCase {
         verify(f.master).close();
         assertNull(f.st.localMaster());
         assertEquals("the key is not touched again: the cache dropped it", null, f.fileCache.get(f.path));
+        assertEquals("the budget goes back with the release", 1, f.budgetReleases.get());
+    }
+
+    public void testAFailedDeleteKeepsTheBudgetUntilTheReleaseIsRunAgain() throws Exception {
+        // The release cannot delete the file the cache moved aside: the budget stays held, the family is reported, and
+        // nothing is retried by itself. Run again once the delete can succeed, the release completes.
+        Fixture f = new Fixture();
+        f.goFull();
+        PromotedWholeFileEntry entry = f.st.entry();
+        f.fileCache.remove(f.path);
+        Path undeletable = Files.createDirectory(tempDir.resolve("_5.faiss.x.retired"));
+        Files.createFile(undeletable.resolve("blocker"));
+        entry.onFileRetired(undeletable); // a non-empty directory cannot be deleted as a file
+
+        f.runCleanupOnce();
+
+        verify(f.master).close();
+        assertEquals("the budget is held", 0, f.budgetReleases.get());
+        assertFalse(f.st.cleanupDone());
+        assertEquals(0, f.cleanupsDone.get());
+        assertEquals("reported as awaiting its release", 1, f.awaitingReports.get());
+        assertTrue("nothing is rescheduled by itself", f.executor.tasks.isEmpty());
+        assertTrue("no promotion while the release is pending", f.st.isMappingReleasePending());
+
+        // Empty the directory, whatever the test file system has put in it besides the blocker.
+        try (Stream<Path> files = Files.list(undeletable)) {
+            for (Path file : files.toList()) {
+                Files.delete(file);
+            }
+        }
+        f.st.retryRelease();
+        f.runCleanupOnce();
+
+        assertFalse(Files.exists(undeletable));
         assertEquals(1, f.budgetReleases.get());
+        assertTrue(f.st.cleanupDone());
+        assertEquals(1, f.cleanupsDone.get());
+        f.st.retryRelease();
+        assertTrue("a completed release is not run again", f.executor.tasks.isEmpty());
     }
 
     public void testAnEntryOfAnEarlierPeriodOrOfADemotedFamilyChangesNothing() throws Exception {
@@ -270,6 +311,7 @@ public class FullFileStateTests extends OpenSearchTestCase {
         final AtomicInteger awaitingReports = new AtomicInteger();
         final AtomicInteger cleanupsDone = new AtomicInteger();
         final AtomicInteger evictions = new AtomicInteger();
+        final AtomicBoolean nodeStopping = new AtomicBoolean();
         final FullFileState st;
 
         Fixture() {
@@ -285,7 +327,7 @@ public class FullFileStateTests extends OpenSearchTestCase {
         FullFileState.Completion complete(IndexInput mapping) {
             PromotedWholeFileEntry entry = new PromotedWholeFileEntry(fileCache, path, mapping, st);
             AtomicBoolean released = new AtomicBoolean(false);
-            FullFileState.Completion completion = st.completePromotion(entry, executor, () -> {
+            FullFileState.Completion completion = st.completePromotion(entry, executor, nodeStopping::get, () -> {
                 if (released.compareAndSet(false, true)) {
                     budgetReleases.incrementAndGet();
                 }
@@ -335,9 +377,7 @@ public class FullFileStateTests extends OpenSearchTestCase {
         assertEquals("cleanup-done hook ran once", 1, f.cleanupsDone.get());
         assertNull(f.st.localMaster());
         assertEquals("no report without scopes", 0, f.awaitingReports.get());
-        assertNotNull("a closed family leaves its entry to the cache", f.fileCache.get(f.path));
-        f.fileCache.decRef(f.path);
-        assertEquals("unreferenced and evictable", Integer.valueOf(0), f.fileCache.getRef(f.path));
+        assertNull("a closed family's whole file is released with it", f.fileCache.get(f.path));
     }
 
     public void testCloseWhileFullWaitsForTheLastScope() throws Exception {
@@ -511,7 +551,7 @@ public class FullFileStateTests extends OpenSearchTestCase {
         f.runCleanupOnce();
         assertSecondPeriodReleased(f, second);
         assertEquals(FullFileState.State.CLOSED, f.st.state());
-        assertEquals("a closed family leaves the entry, unreferenced, to the cache", Integer.valueOf(0), f.fileCache.getRef(f.path));
+        assertNull("a closed family's whole file leaves the cache with it", f.fileCache.getRef(f.path));
     }
 
     private static void assertFirstPeriodReleased(Fixture f) throws Exception {
@@ -596,9 +636,29 @@ public class FullFileStateTests extends OpenSearchTestCase {
         }
     }
 
-    public void testTheReleaseDoesNothingOnceItsExecutorIsShutDown() throws Exception {
-        // The node is stopping when the queued release runs: the mapping, the file and the budget are left as they
-        // are, for the process exit and the next start.
+    public void testAReleaseOnAStoppingNodeClosesTheMappingAndLeavesTheFile() throws Exception {
+        // The node is stopping when a family closes with its shard: the release closes the mapping and nothing else.
+        // The entry and the file stay, for the next start to validate and serve again, and nothing is given back.
+        Fixture f = new Fixture();
+        f.goFull();
+        PromotedWholeFileEntry entry = f.st.entry();
+        f.nodeStopping.set(true);
+
+        f.st.closeFamily();
+        f.runCleanupOnce();
+
+        verify(f.master).close();
+        assertNull(f.st.localMaster());
+        assertSame("the entry stays in the cache", entry, f.fileCache.get(f.path));
+        f.fileCache.decRef(f.path);
+        assertFalse("nothing was moved aside or owed", entry.owedToCache());
+        assertEquals(0, f.budgetReleases.get());
+        assertFalse(f.st.cleanupDone());
+        assertEquals(0, f.cleanupsDone.get());
+    }
+
+    public void testAReleaseAfterItsExecutorShutDownLeavesTheFileToo() throws Exception {
+        // The pool the release runs on is shut down by the time a queued release runs: treated like a stopping node.
         Fixture f = new Fixture();
         List<Runnable> queued = new ArrayList<>();
         AtomicBoolean shutdown = new AtomicBoolean();
@@ -638,16 +698,27 @@ public class FullFileStateTests extends OpenSearchTestCase {
         PromotedWholeFileEntry entry = new PromotedWholeFileEntry(f.fileCache, f.path, f.master, f.st);
         assertEquals(
             FullFileState.Completion.FULL,
-            f.st.completePromotion(entry, pool, f.budgetReleases::incrementAndGet, () -> {}, f.cleanupsDone::incrementAndGet, () -> {})
+            f.st.completePromotion(
+                entry,
+                pool,
+                () -> false,
+                f.budgetReleases::incrementAndGet,
+                () -> {},
+                f.cleanupsDone::incrementAndGet,
+                () -> {}
+            )
         );
+        f.fileCache.put(f.path, entry);
+        f.fileCache.decRef(f.path);
 
         assertTrue(f.st.demote());
         assertEquals("the release is queued", 1, queued.size());
         pool.shutdown();
         queued.get(0).run();
 
-        verify(f.master, never()).close();
-        assertSame(f.master, f.st.localMaster());
+        verify(f.master).close();
+        assertSame("the entry stays in the cache", entry, f.fileCache.get(f.path));
+        f.fileCache.decRef(f.path);
         assertFalse(f.st.cleanupDone());
         assertEquals(0, f.cleanupsDone.get());
         assertEquals(0, f.budgetReleases.get());

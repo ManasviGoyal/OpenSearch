@@ -11,8 +11,6 @@ package org.opensearch.storage.warmfullfile;
 import org.apache.lucene.store.AlreadyClosedException;
 import org.opensearch.action.NoShardAvailableActionException;
 import org.opensearch.action.admin.cluster.health.ClusterHealthResponse;
-import org.opensearch.action.admin.indices.close.CloseIndexResponse;
-import org.opensearch.action.admin.indices.open.OpenIndexResponse;
 import org.opensearch.action.search.SearchPhaseExecutionException;
 import org.opensearch.action.search.SearchResponse;
 import org.opensearch.action.search.ShardSearchFailure;
@@ -180,9 +178,10 @@ public class WarmFullFileIT extends WarmFullFileBaseIT {
         deleteIndex(INDEX_NAME);
     }
 
-    public void testCloseAndOpenPromotesAgainFromTheWholeFileLeftInTheCache() throws Exception {
-        // After a close and open on the same node the whole file is still on disk and in the cache: the next search
-        // promotes the new family from it without fetching any bytes, and returns the same results.
+    public void testCloseAndOpenReleasesTheWholeFileAndPromotesAgainByDownload() throws Exception {
+        // A close releases the whole file with its family, like an eviction: nothing of it is left on disk. After the
+        // open on the same node the next searches promote the new family by downloading the file again, and return
+        // the same results.
         String warmNode = startCluster();
         WarmShard warmShard = prepareEligibleIndex(INDEX_NAME, warmNode);
         String fdt = eligibleFdt(warmShard);
@@ -192,17 +191,23 @@ public class WarmFullFileIT extends WarmFullFileBaseIT {
         Path wholeFilePath = warmShard.directory.getFilePath(fdt);
 
         reopenIndex(INDEX_NAME);
-        assertTrue("the whole file survives the close", Files.exists(wholeFilePath));
+        assertBusy(
+            () -> assertFalse("the whole file is released with the close", Files.exists(wholeFilePath)),
+            WAIT_TIMEOUT.seconds(),
+            TimeUnit.SECONDS
+        );
         WarmShard reopened = warmShard(INDEX_NAME, warmNode);
         searchUntilPromoted(INDEX_NAME, reopened, fdt);
 
-        Map<String, Long> stats = reopened.manager.counters();
-        assertEquals(2L, stats.get("promoted").longValue());
-        assertEquals(
-            "the second promotion is handed the finished download and fetches nothing",
-            downloadedBefore,
-            stats.get("downloadedBytes").longValue()
+        // The promotion is counted just after the family turns FULL.
+        assertBusy(
+            () -> assertEquals(2L, reopened.manager.counters().get("promoted").longValue()),
+            WAIT_TIMEOUT.seconds(),
+            TimeUnit.SECONDS
         );
+        Map<String, Long> stats = reopened.manager.counters();
+        assertEquals(0L, stats.get("reused").longValue());
+        assertTrue("the second promotion downloads the file again", stats.get("downloadedBytes").longValue() > downloadedBefore);
         assertEquals(fingerprint, queryFingerprint(INDEX_NAME));
 
         deleteIndex(INDEX_NAME);
@@ -412,7 +417,8 @@ public class WarmFullFileIT extends WarmFullFileBaseIT {
         // clear it once more before the reopen below.
         setFullFileExtensions(FDT_EXTENSION);
         searchUntilPromoted(INDEX_NAME, first, firstFdt);
-        assertEquals(2L, first.manager.counters().get("promoted").longValue());
+        // The promotion is counted just after the family turns FULL.
+        assertBusy(() -> assertEquals(2L, first.manager.counters().get("promoted").longValue()), WAIT_TIMEOUT.seconds(), TimeUnit.SECONDS);
         assertEquals(firstFingerprint, queryFingerprint(INDEX_NAME));
         clearFullFileExtensions();
         assertBusy(() -> assertEquals(FullFileState.State.BLOCK, stateOf(first, firstFdt)), WAIT_TIMEOUT.seconds(), TimeUnit.SECONDS);
@@ -549,7 +555,12 @@ public class WarmFullFileIT extends WarmFullFileBaseIT {
             assertHitCount(client().prepareSearch(INDEX_NAME).setQuery(QueryBuilders.matchAllQuery()).setSize(10).get(), 2 * NUM_DOCS);
             assertTrue("merged segment not promoted yet, family state " + stateOf(warmShard, mergedFdt), isPromoted(warmShard, mergedFdt));
         }, DOWNLOAD_TIMEOUT.seconds(), TimeUnit.SECONDS);
-        assertEquals(promotedBefore + 1, warmShard.manager.counters().get("promoted").longValue());
+        // The promotion is counted just after the family turns FULL.
+        assertBusy(
+            () -> assertEquals(promotedBefore + 1, warmShard.manager.counters().get("promoted").longValue()),
+            WAIT_TIMEOUT.seconds(),
+            TimeUnit.SECONDS
+        );
         assertEquals(FullFileState.State.FULL, stateOf(warmShard, mergedFdt));
 
         deleteIndex(INDEX_NAME);
@@ -629,7 +640,12 @@ public class WarmFullFileIT extends WarmFullFileBaseIT {
             assertHitCount(client().prepareSearch(INDEX_NAME).setQuery(QueryBuilders.matchAllQuery()).setSize(10).get(), 2 * NUM_DOCS);
             assertTrue("merged segment not promoted yet, family state " + stateOf(warmShard, mergedFdt), isPromoted(warmShard, mergedFdt));
         }, DOWNLOAD_TIMEOUT.seconds(), TimeUnit.SECONDS);
-        assertEquals(promotedBefore + 1, warmShard.manager.counters().get("promoted").longValue());
+        // The promotion is counted just after the family turns FULL.
+        assertBusy(
+            () -> assertEquals(promotedBefore + 1, warmShard.manager.counters().get("promoted").longValue()),
+            WAIT_TIMEOUT.seconds(),
+            TimeUnit.SECONDS
+        );
     }
 
     public void testDeleteIndexWhileDownloadHeld() throws Exception {
@@ -783,9 +799,10 @@ public class WarmFullFileIT extends WarmFullFileBaseIT {
         Path wholeFilePath = warmShard.directory.getFilePath(fdt);
         long wholeFileLength = Files.size(wholeFilePath);
 
-        // Close the index so its last commit is synced to the remote store, restart the node and open the index again.
-        // The whole file stays in the shard directory across the restart, untouched.
-        assertShardsAcknowledged(client().admin().indices().prepareClose(INDEX_NAME).get());
+        // Restart the node with the index open, after a flush so that its last commit is in the remote store. A shard
+        // that closes because its node stops leaves its whole file in the shard directory, untouched, unlike a shard
+        // that closes on a running node.
+        client().admin().indices().prepareFlush(INDEX_NAME).setForce(true).setWaitIfOngoing(true).get();
         AtomicBoolean leftoverIntact = new AtomicBoolean(false);
         internalCluster().restartNode(warmNode, new InternalTestCluster.RestartCallback() {
             @Override
@@ -795,7 +812,6 @@ public class WarmFullFileIT extends WarmFullFileBaseIT {
             }
         });
         assertTrue("the whole file should have survived the shutdown intact", leftoverIntact.get());
-        assertShardsAcknowledged(client().admin().indices().prepareOpen(INDEX_NAME).get());
         ensureGreen(ENSURE_GREEN_TIMEOUT, INDEX_NAME);
 
         // The restarted node has a fresh manager: the first searches promote by validating and reusing the leftover.
@@ -905,12 +921,10 @@ public class WarmFullFileIT extends WarmFullFileBaseIT {
         List<String> beforeRestart = queryFingerprint(INDEX_NAME);
         Path wholeFilePath = warmShard.directory.getFilePath(fdt);
 
-        // Close the index before the restart so its last commit is flushed and synced to the remote store, and open it
-        // again afterwards. The whole file stays in the shard directory across the restart. While the node is down,
-        // overwrite that leftover with zeros: if it were ever served, searches would no longer return the original
-        // documents.
-        CloseIndexResponse close = client().admin().indices().prepareClose(INDEX_NAME).get();
-        assertShardsAcknowledged(close);
+        // Restart the node with the index open, after a flush so that its last commit is in the remote store: the
+        // whole file stays in the shard directory across the restart. While the node is down, overwrite that leftover
+        // with zeros: if it were ever served, searches would no longer return the original documents.
+        client().admin().indices().prepareFlush(INDEX_NAME).setForce(true).setWaitIfOngoing(true).get();
         AtomicBoolean leftoverSeen = new AtomicBoolean(false);
         internalCluster().restartNode(warmNode, new InternalTestCluster.RestartCallback() {
             @Override
@@ -923,8 +937,6 @@ public class WarmFullFileIT extends WarmFullFileBaseIT {
             }
         });
         assertTrue("the whole file should have survived the shutdown", leftoverSeen.get());
-        OpenIndexResponse open = client().admin().indices().prepareOpen(INDEX_NAME).get();
-        assertShardsAcknowledged(open);
         ensureGreen(ENSURE_GREEN_TIMEOUT, INDEX_NAME);
 
         WarmShard restarted = warmShard(INDEX_NAME, warmNode);

@@ -103,9 +103,10 @@ public class TieredDirectory extends CompositeDirectory {
         }
 
         // An in-flight whole-file download is this directory's own file, not Lucene's: a listed but unreferenced
-        // `.download` file would be deleted by IndexFileDeleter or a store cleanup under the running download.
+        // `.download` file would be deleted by IndexFileDeleter or a store cleanup under the running download. A
+        // whole file moved aside for its release is the same.
         return Stream.concat(Arrays.stream(localFiles), Arrays.stream(remoteFiles))
-            .filter(file -> FileTypeUtils.isPartialDownloadFile(file) == false)
+            .filter(file -> FileTypeUtils.isPartialDownloadFile(file) == false && FileTypeUtils.isRetiredFile(file) == false)
             .map(s -> s.contains(BLOCK_FILE_IDENTIFIER) ? s.substring(0, s.indexOf(BLOCK_FILE_IDENTIFIER)) : s)
             .distinct()
             .sorted()

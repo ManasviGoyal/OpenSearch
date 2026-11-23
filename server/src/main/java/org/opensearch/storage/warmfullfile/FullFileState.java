@@ -9,11 +9,13 @@ package org.opensearch.storage.warmfullfile;
 
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
+import org.apache.logging.log4j.message.ParameterizedMessage;
 import org.apache.lucene.store.FSDirectory;
 import org.apache.lucene.store.IndexInput;
 import org.opensearch.common.annotation.ExperimentalApi;
 import org.opensearch.common.util.CancellableThreads;
 import org.opensearch.index.store.RemoteSegmentStoreDirectory;
+import org.opensearch.index.store.remote.filecache.CachedIndexInput;
 import org.opensearch.index.store.remote.filecache.FileCache;
 import org.opensearch.index.store.remote.utils.TransferManager;
 
@@ -23,6 +25,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.BooleanSupplier;
 
 /**
  * Per-file (family) whole-file promotion state, shared by every handle of the file: the original opened by
@@ -42,8 +45,10 @@ import java.util.concurrent.atomic.AtomicReference;
  * {@link #closeFamily}. The mapping is published and the family moves to {@link State#FULL} in one step, so a reader
  * that sees FULL sees the mapping. The three ways out share one path: the family stops handing out views, the release
  * is owed, and it runs once no scope holds a view, exactly once per FULL period, on the cleanup executor and never on
- * the cache listener thread. Nothing takes a family back to FULL but a new promotion, which starts only after the
- * release has run, so a file is never mapped twice.
+ * the cache listener thread. The release drops the cache entry, closes the mapping, deletes the file, and only then
+ * gives back the bytes the cache still counted for it and the budget, so neither says the disk is free before it is.
+ * Nothing takes a family back to FULL but a new promotion, which starts only after the release has run, so a file is
+ * never mapped twice.
  *
  * <p>Lock order: a file cache segment's lock, then this family's lock. The cache calls {@link #onEntryRemoved} under
  * its segment lock, so no cache call is made while this family's lock is held.
@@ -99,6 +104,7 @@ public final class FullFileState {
 
     // Teardown wiring, set by completePromotion together with the mapping.
     private volatile Executor cleanupExecutor;
+    private volatile BooleanSupplier nodeStopping;
     private volatile Runnable budgetRelease;
     private volatile Runnable onAwaitingRelease;
     private volatile Runnable onCleanupDone;
@@ -106,8 +112,8 @@ public final class FullFileState {
     // Set when the family left FULL (closed, demoted or evicted by the cache) with a mapping still published: the
     // deferred unmap is owed exactly in that case.
     private volatile boolean mappingReleaseOwed;
-    // Set once the cache has dropped this period's entry; the release then leaves the key alone.
-    private volatile boolean entryRemoved;
+    // Set when the release could not delete the file; it is then run again by retryRelease().
+    private volatile boolean releaseRetryNeeded;
     // Orders the transitions out of FULL (close, demote, eviction), the scheduling of the release and the start of a
     // new FULL period against each other; never held across cache calls.
     private final Object releaseLock = new Object();
@@ -266,8 +272,8 @@ public final class FullFileState {
      * @param entry             the cache entry that owns the family's whole-file mapping; the caller puts it in the
      *                          cache right after
      * @param cleanupExecutor   pool the unmap runs on (never the FileCache listener thread)
-     * @param budgetRelease     returns this file's reserved per-segment budget bytes; may run more than once, and
-     *                          gives the bytes back the first time: when the cache drops the file, or at the unmap
+     * @param nodeStopping      whether the node is stopping; a release that runs then leaves the file where it is
+     * @param budgetRelease     returns this file's reserved per-segment budget bytes, once the file is deleted
      * @param onAwaitingRelease called if the family leaves FULL while scopes still hold views
      * @param onCleanupDone     called once the deferred unmap has run
      * @param onEvictedByCache  called when the cache drops the entry of a FULL family
@@ -276,6 +282,7 @@ public final class FullFileState {
     Completion completePromotion(
         PromotedWholeFileEntry entry,
         Executor cleanupExecutor,
+        BooleanSupplier nodeStopping,
         Runnable budgetRelease,
         Runnable onAwaitingRelease,
         Runnable onCleanupDone,
@@ -289,12 +296,13 @@ public final class FullFileState {
                 return Completion.NOT_PROMOTING;
             }
             this.cleanupExecutor = cleanupExecutor;
+            this.nodeStopping = nodeStopping;
             this.budgetRelease = budgetRelease;
             this.onAwaitingRelease = onAwaitingRelease;
             this.onCleanupDone = onCleanupDone;
             this.onEvictedByCache = onEvictedByCache;
             mappingReleaseOwed = false;
-            entryRemoved = false;
+            releaseRetryNeeded = false;
             cleanupScheduled.set(false);
             cleanupDone = false;
             this.entry = entry;
@@ -363,24 +371,18 @@ public final class FullFileState {
     /**
      * Called by {@link PromotedWholeFileEntry#close()} when the cache drops the entry, by eviction, prune, clear or an
      * explicit remove, inside the FileCache removal listener under a segment lock, so nothing here touches the cache.
-     * A FULL family leaves FULL for BLOCK. The budget goes back now, since the file no longer occupies its segment.
-     * An entry of an earlier period changes nothing.
+     * A FULL family leaves FULL for BLOCK. The budget stays held: the file still occupies the disk until the release
+     * has closed the mapping and deleted it. An entry of an earlier period changes nothing.
      *
      * @param removed the entry the cache dropped
      */
     void onEntryRemoved(PromotedWholeFileEntry removed) {
         boolean wasFull;
-        Runnable budget;
         synchronized (releaseLock) {
             if (removed != entry) {
                 return;
             }
-            entryRemoved = true;
             wasFull = leaveFull(State.BLOCK);
-            budget = budgetRelease;
-        }
-        if (budget != null) {
-            budget.run();
         }
         if (wasFull) {
             Runnable evicted = onEvictedByCache;
@@ -395,9 +397,9 @@ public final class FullFileState {
      * The family-close routine. Called from {@code PromotableCachedSwitchableIndexInput.close()}, which runs
      * inside the FileCache removal listener under a segment lock, so this must not touch the FileCache inline.
      *
-     * <p>Marks the state CLOSED and cancels a download in flight. A FULL family leaves FULL; the whole-file entry is
-     * left to the cache, unreferenced and evictable. If it was PROMOTING, the cancelled download fails and the
-     * manager's completion handler unwinds; if BLOCK with nothing owed, there is nothing to release.
+     * <p>Marks the state CLOSED and cancels a download in flight. A FULL family leaves FULL, and its whole file is
+     * released like a demoted or evicted one. If it was PROMOTING, the cancelled download fails and the manager's
+     * completion handler unwinds; if BLOCK with nothing owed, there is nothing to release.
      */
     public void closeFamily() {
         synchronized (releaseLock) {
@@ -497,30 +499,49 @@ public final class FullFileState {
         }
     }
 
+    /**
+     * The release. In order: the cache entry is dropped, if the cache still holds it; the mapping is closed; the file
+     * is deleted; the bytes the cache kept counting and the budget are given back. A failed delete keeps both and the
+     * release is run again by {@link #retryRelease()}. Once the node is stopping only the mapping is closed: the entry
+     * and the file stay where they are, and the next start validates the file or deletes it.
+     */
     private void runCleanup() {
-        if (cleanupExecutor instanceof ExecutorService pool && pool.isShutdown()) {
-            // The node is stopping. The mapping goes with the process, and the file is left for the next start, which
-            // validates it or deletes it.
-            return;
+        final boolean stopping = isStopping();
+        releaseRetryNeeded = false;
+        final PromotedWholeFileEntry current = entry;
+        if (stopping == false) {
+            try {
+                // By value: a newer entry at the key belongs to a later family of the file and is left alone. Dropping
+                // the entry moves the file aside and runs onEntryRemoved, which finds nothing more to do.
+                CachedIndexInput other = fileCache.compute(fullFilePath, (key, existing) -> existing == current ? null : existing);
+                if (other != null) {
+                    fileCache.decRef(fullFilePath); // compute took a reference on the entry it kept
+                }
+            } catch (RuntimeException e) {
+                logger.warn(() -> new ParameterizedMessage("failed to remove whole file {} from the cache", fullFilePath), e);
+            }
         }
         localMaster.set(null);
-        PromotedWholeFileEntry current = entry;
-        if (current != null) {
-            try {
-                current.closeMapping(); // munmap: safe now, no scope holds a view
-            } catch (Exception e) {
-                logger.warn("failed to close whole-file mapping for {}", fullFilePath, e);
-            }
+        try {
+            current.closeMapping(); // munmap: safe now, no scope holds a view
+        } catch (Exception e) {
+            logger.warn(() -> new ParameterizedMessage("failed to close whole-file mapping for {}", fullFilePath), e);
         }
-        if (entryRemoved == false && state.get() != State.CLOSED) {
-            // Demoted, not closed: the file is no longer served, so drop it from the cache now rather than leave it
-            // to eviction. The key is still this family's: a new family for the file exists only after this one
-            // closes. A closing family leaves its entry to the cache, unreferenced and evictable.
-            try {
-                fileCache.remove(fullFilePath); // runs onEntryRemoved, which finds nothing more to do
-            } catch (RuntimeException e) {
-                logger.warn("failed to remove whole file {} from the cache", fullFilePath, e);
+        if (stopping || isStopping()) {
+            return;
+        }
+        if (current.deleteFile() == false) {
+            // The file still occupies the disk, so the cache's bytes and the budget stay held.
+            releaseRetryNeeded = true;
+            cleanupScheduled.set(false);
+            Runnable report = onAwaitingRelease;
+            if (report != null) {
+                report.run();
             }
+            return;
+        }
+        if (current.owedToCache()) {
+            fileCache.releaseOwed(fullFilePath, current.length());
         }
         Runnable release = budgetRelease;
         if (release != null) {
@@ -531,6 +552,20 @@ public final class FullFileState {
         if (done != null) {
             done.run();
         }
+    }
+
+    /** Runs the release again if its last run could not delete the file. */
+    void retryRelease() {
+        if (releaseRetryNeeded) {
+            maybeScheduleCleanup();
+        }
+    }
+
+    /** Whether the whole file is to be left on disk: the node is stopping, or its cache was closed as for a restart. */
+    private boolean isStopping() {
+        return nodeStopping.getAsBoolean()
+            || fileCache.isClosedForRestart()
+            || (cleanupExecutor instanceof ExecutorService pool && pool.isShutdown());
     }
 
     /** @return true once the deferred unmap has run */

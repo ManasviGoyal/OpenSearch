@@ -60,6 +60,12 @@ class LRUCache<K, V> implements RefCountedCache<K, V> {
 
     private final Weigher<V> weigher;
 
+    /** The weight a removed value still occupies, counted in the usage until {@link #releaseOwed}; zero for most. */
+    private final Weigher<V> owedWeigher;
+
+    /** The weight of removed values that is still counted. Guarded by {@link #lock}. */
+    private long owed;
+
     private final StatsCounter<K, V> statsCounter;
 
     private final ReentrantLock lock;
@@ -89,9 +95,18 @@ class LRUCache<K, V> implements RefCountedCache<K, V> {
     }
 
     public LRUCache(long capacity, RemovalListener<K, V> listener, Weigher<V> weigher) {
+        this(capacity, listener, weigher, value -> 0);
+    }
+
+    /**
+     * @param owedWeigher the weight a value still occupies after the cache has removed it, which stays in the usage
+     *                    until it is given back with {@link #releaseOwed}
+     */
+    public LRUCache(long capacity, RemovalListener<K, V> listener, Weigher<V> weigher, Weigher<V> owedWeigher) {
         this.capacity = capacity;
         this.listener = listener;
         this.weigher = weigher;
+        this.owedWeigher = owedWeigher;
         this.data = new HashMap<>();
         this.lru = new LinkedHashMap<>();
         this.lock = new ReentrantLock();
@@ -228,6 +243,7 @@ class LRUCache<K, V> implements RefCountedCache<K, V> {
                 Node<K, V> node = iterator.next();
                 iterator.remove();
                 statsCounter.recordRemoval(node.value, node.pinned, node.weight);
+                owed += owedWeigher.weightOf(node.value);
                 listener.onRemoval(new RemovalNotification<>(node.key, node.value, RemovalReason.EXPLICIT));
             }
             statsCounter.resetUsage();
@@ -380,6 +396,7 @@ class LRUCache<K, V> implements RefCountedCache<K, V> {
                 data.remove(node.key, node);
                 sum += node.weight;
                 statsCounter.recordRemoval(node.value, node.pinned, node.weight);
+                owed += owedWeigher.weightOf(node.value);
                 listener.onRemoval(new RemovalNotification<>(node.key, node.value, RemovalReason.EXPLICIT));
             }
         } finally {
@@ -392,7 +409,17 @@ class LRUCache<K, V> implements RefCountedCache<K, V> {
     public long usage() {
         lock.lock();
         try {
-            return statsCounter.usage();
+            return statsCounter.usage() + owed;
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    @Override
+    public void releaseOwed(K key, long weight) {
+        lock.lock();
+        try {
+            owed = Math.max(0, owed - weight);
         } finally {
             lock.unlock();
         }
@@ -497,12 +524,13 @@ class LRUCache<K, V> implements RefCountedCache<K, V> {
             }
 
             statsCounter.recordRemoval(node.value, node.pinned, node.weight);
+            owed += owedWeigher.weightOf(node.value);
             listener.onRemoval(new RemovalNotification<>(node.key, node.value, RemovalReason.EXPLICIT));
         }
     }
 
     private boolean hasOverflowed() {
-        return statsCounter.usage() >= capacity;
+        return statsCounter.usage() + owed >= capacity;
     }
 
     private void evict() {
@@ -515,6 +543,7 @@ class LRUCache<K, V> implements RefCountedCache<K, V> {
             // Notify the listener only if the entry was evicted
             data.remove(node.key, node);
             statsCounter.recordEviction(node.value, node.weight);
+            owed += owedWeigher.weightOf(node.value);
             listener.onRemoval(new RemovalNotification<>(node.key, node.value, RemovalReason.CAPACITY));
         }
     }

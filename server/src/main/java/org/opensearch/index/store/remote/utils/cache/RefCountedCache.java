@@ -122,9 +122,18 @@ public interface RefCountedCache<K, V> {
     /**
      * Returns the weighted usage of this cache.
      *
-     * @return the combined weight of the values in this cache
+     * @return the combined weight of the values in this cache, and of the removed values whose weight is still owed
      */
     long usage();
+
+    /**
+     * Stops counting weight that the cache kept in its usage for a value it removed, because what the value stood for
+     * outlived it; called by the value's owner once that is gone. A cache that keeps no such weight does nothing.
+     *
+     * @param key    the key the value was removed from
+     * @param weight the weight to stop counting
+     */
+    default void releaseOwed(K key, long weight) {}
 
     /**
      * Returns the active usage of this cache.

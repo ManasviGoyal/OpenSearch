@@ -143,7 +143,8 @@ public class WarmFullFileEvictionIT extends WarmFullFileBaseIT {
 
         // A's next searches promote it again.
         searchUntilPromoted(INDEX_A, a, dvdA);
-        assertEquals(2L, manager.counters().get("promoted").longValue());
+        // The promotion is counted just after the family turns FULL.
+        assertBusy(() -> assertEquals(2L, manager.counters().get("promoted").longValue()), WAIT_TIMEOUT.seconds(), TimeUnit.SECONDS);
         assertEquals(fingerprintA, fingerprint(INDEX_A));
         assertEquals(FullFileState.State.FULL, familyA.state());
 

@@ -1003,7 +1003,8 @@ public class Node implements Closeable {
                         threadPool.getThreadContext(),
                         threadPool.executor(ThreadPool.Names.GENERIC),
                         threadPool::relativeTimeInMillis,
-                        warmFullFileSettings.getMaxConcurrentDownloads()
+                        warmFullFileSettings.getMaxConcurrentDownloads(),
+                        lifecycle::stoppedOrClosed
                     );
                 if (warmFullFileManager != null) {
                     warmFullFileSettings.addListener(warmFullFileManager::onExtensionsChanged);

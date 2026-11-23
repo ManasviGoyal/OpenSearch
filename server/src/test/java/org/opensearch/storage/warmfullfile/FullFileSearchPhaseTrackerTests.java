@@ -137,7 +137,10 @@ public class FullFileSearchPhaseTrackerTests extends OpenSearchTestCase {
         Promoted() {
             assertTrue(st.onAccess(0));
             PromotedWholeFileEntry entry = new PromotedWholeFileEntry(fileCache, path, mock(IndexInput.class), st);
-            assertEquals(FullFileState.Completion.FULL, st.completePromotion(entry, Runnable::run, () -> {}, () -> {}, () -> {}, () -> {}));
+            assertEquals(
+                FullFileState.Completion.FULL,
+                st.completePromotion(entry, Runnable::run, () -> false, () -> {}, () -> {}, () -> {}, () -> {})
+            );
             fileCache.put(path, entry);
             fileCache.decRef(path);
         }
