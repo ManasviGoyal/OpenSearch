@@ -214,6 +214,24 @@ public class TieredDirectoryTests extends TieredStorageBaseTestCase {
         assertArrayEquals(expectedFileNames, actualFileNames);
     }
 
+    public void testListAllHidesPartialDownloads() throws IOException {
+        // An in-flight whole-file download is this directory's own file: Lucene must not see it, or an
+        // IndexFileDeleter refresh or a store cleanup would delete it under the download.
+        addFilesToDirectory(new String[] { "_3.faiss.r4nd0m.download" });
+        assertTrue(Arrays.asList(localDirectory.listAll()).contains("_3.faiss.r4nd0m.download"));
+        String[] actualFileNames = tieredDirectory.listAll();
+        String[] expectedFileNames = new String[] {
+            "_0.cfe",
+            "_0.cfs",
+            "_0.si",
+            "_1.cfe",
+            "_2.cfe",
+            "_x.abc",
+            "segments_1",
+            "temp_file.tmp" };
+        assertArrayEquals(expectedFileNames, actualFileNames);
+    }
+
     public void testDeleteFile() throws IOException {
         assertTrue(existsInTieredDirectory(TEMP_FILE));
         tieredDirectory.deleteFile(TEMP_FILE);
