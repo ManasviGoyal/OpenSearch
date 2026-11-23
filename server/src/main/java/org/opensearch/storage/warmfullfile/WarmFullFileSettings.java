@@ -20,6 +20,7 @@ import java.util.function.Consumer;
 import java.util.function.DoubleConsumer;
 import java.util.function.Function;
 import java.util.function.IntConsumer;
+import java.util.function.IntSupplier;
 import java.util.stream.Collectors;
 
 /**
@@ -59,8 +60,9 @@ public class WarmFullFileSettings {
      * Node-level, dynamic setting for how many whole-file downloads may run at once on this node. Each download holds
      * one {@code remote_recovery} thread for a serial multi-GB read, so this is a node-wide cap, separate from
      * {@code indices.recovery.max_concurrent_remote_store_streams}, which bounds the files one shard recovery downloads
-     * at a time. Defaults to one per eight allocated processors, at least one (4 on a 32 vCPU node). Lowering it does
-     * not stop a download in flight; no new one is admitted until enough have finished.
+     * at a time. Defaults to one per eight allocated processors, at least one (4 on a 32 vCPU node). A value above the
+     * size of the {@code remote_recovery} pool is applied as that size, since no more downloads than that can run.
+     * Lowering it does not stop a download in flight; no new one is admitted until enough have finished.
      */
     public static final Setting<Integer> MAX_CONCURRENT_DOWNLOADS = new Setting<>(
         "tiering.service.full_file.max_concurrent_downloads",
@@ -87,16 +89,28 @@ public class WarmFullFileSettings {
 
     private volatile Set<String> extensions;
     private final List<Consumer<Set<String>>> listeners = new CopyOnWriteArrayList<>();
+    private final IntSupplier downloadPoolSize;
     private volatile int maxConcurrentDownloads;
     private final List<IntConsumer> maxConcurrentDownloadsListeners = new CopyOnWriteArrayList<>();
     private volatile double budgetFraction;
     private final List<DoubleConsumer> budgetFractionListeners = new CopyOnWriteArrayList<>();
 
     /**
-     * Creates a new WarmFullFileSettings instance and registers the dynamic update consumers.
+     * Creates a new WarmFullFileSettings instance and registers the dynamic update consumers. The download cap is not
+     * bounded by a pool size.
      * @param clusterSettings the cluster settings
      */
     public WarmFullFileSettings(ClusterSettings clusterSettings) {
+        this(clusterSettings, () -> Integer.MAX_VALUE);
+    }
+
+    /**
+     * Creates a new WarmFullFileSettings instance and registers the dynamic update consumers.
+     * @param clusterSettings  the cluster settings
+     * @param downloadPoolSize the size of the pool whole-file downloads run on, which bounds the download cap
+     */
+    public WarmFullFileSettings(ClusterSettings clusterSettings, IntSupplier downloadPoolSize) {
+        this.downloadPoolSize = downloadPoolSize;
         setExtensions(clusterSettings.get(EXTENSIONS));
         clusterSettings.addSettingsUpdateConsumer(EXTENSIONS, this::setExtensions);
         setMaxConcurrentDownloads(clusterSettings.get(MAX_CONCURRENT_DOWNLOADS));
@@ -137,13 +151,14 @@ public class WarmFullFileSettings {
     }
 
     /**
-     * Stores the download cap and tells every listener.
+     * Stores the download cap, bounded by the size of the download pool, and tells every listener.
      * @param value the configured cap, at least one
      */
     public void setMaxConcurrentDownloads(int value) {
-        this.maxConcurrentDownloads = value;
+        final int cap = Math.min(value, Math.max(1, downloadPoolSize.getAsInt()));
+        this.maxConcurrentDownloads = cap;
         for (IntConsumer listener : maxConcurrentDownloadsListeners) {
-            listener.accept(value);
+            listener.accept(cap);
         }
     }
 
@@ -157,7 +172,8 @@ public class WarmFullFileSettings {
     }
 
     /**
-     * @return how many whole-file downloads may run at once on this node
+     * @return how many whole-file downloads may run at once on this node: the configured cap, or the size of the
+     *         download pool if that is smaller
      */
     public int getMaxConcurrentDownloads() {
         return maxConcurrentDownloads;

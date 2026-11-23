@@ -99,6 +99,23 @@ public class WarmFullFileSettingsTests extends OpenSearchTestCase {
         assertEquals("clearing the setting reverts to the default", initial, settings.getMaxConcurrentDownloads());
     }
 
+    public void testMaxConcurrentDownloadsIsCappedAtTheDownloadPoolSize() {
+        // A cap above the pool's size cannot run, so the pool's size is what the listeners and the getter see. A cap
+        // at or below it is applied as configured.
+        String key = WarmFullFileSettings.MAX_CONCURRENT_DOWNLOADS.getKey();
+        clusterService.getClusterSettings().applySettings(Settings.builder().put(key, 50).build());
+        WarmFullFileSettings settings = new WarmFullFileSettings(clusterService.getClusterSettings(), () -> 6);
+        assertEquals("capped at construction", 6, settings.getMaxConcurrentDownloads());
+        List<Integer> seen = new ArrayList<>();
+        settings.addMaxConcurrentDownloadsListener(seen::add);
+
+        clusterService.getClusterSettings().applySettings(Settings.builder().put(key, 3).build());
+        clusterService.getClusterSettings().applySettings(Settings.builder().put(key, 6).build());
+        clusterService.getClusterSettings().applySettings(Settings.builder().put(key, 7).build());
+        assertEquals(List.of(6, 3, 6, 6), seen);
+        assertEquals(6, settings.getMaxConcurrentDownloads());
+    }
+
     public void testDynamicUpdateApplies() {
         WarmFullFileSettings settings = new WarmFullFileSettings(clusterService.getClusterSettings());
         assertEquals(Set.of("faiss", "veq"), settings.getExtensions());

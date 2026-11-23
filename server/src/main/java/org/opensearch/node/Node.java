@@ -988,7 +988,10 @@ public class Node implements Closeable {
             if (FeatureFlags.isEnabled(FeatureFlags.WRITABLE_WARM_INDEX_EXPERIMENTAL_FLAG)) {
                 tieredStoragePrefetchSettings = new TieredStoragePrefetchSettings(clusterService.getClusterSettings());
                 tieredStoragePrefetchSettingsSupplier = () -> tieredStoragePrefetchSettings;
-                final WarmFullFileSettings warmFullFileSettings = new WarmFullFileSettings(clusterService.getClusterSettings());
+                final WarmFullFileSettings warmFullFileSettings = new WarmFullFileSettings(
+                    clusterService.getClusterSettings(),
+                    () -> threadPool.info(ThreadPool.Names.REMOTE_RECOVERY).getMax()
+                );
                 // Only warm nodes have a FileCache (fileCache() is null otherwise, e.g. cluster-manager-only or data-only
                 // nodes). Without one there is nothing to promote into; TieredDirectory and the wrapper treat a null
                 // manager as "feature off".
