@@ -73,7 +73,7 @@ public class WarmFullFileIT extends WarmFullFileBaseIT {
     }
 
     private SearchResponse searchWithSource(String index) {
-        SearchResponse response = client().prepareSearch(index).setQuery(QueryBuilders.matchAllQuery()).setSize(10).get();
+        SearchResponse response = client().prepareSearch(index).setQuery(sourceReadingQuery()).setSize(10).get();
         assertHitCount(response, NUM_DOCS);
         return response;
     }
@@ -187,7 +187,6 @@ public class WarmFullFileIT extends WarmFullFileBaseIT {
         String fdt = eligibleFdt(warmShard);
         searchUntilPromoted(INDEX_NAME, warmShard, fdt);
         List<String> fingerprint = queryFingerprint(INDEX_NAME);
-        long downloadedBefore = warmShard.manager.counters().get("downloadedBytes").longValue();
         Path wholeFilePath = warmShard.directory.getFilePath(fdt);
 
         reopenIndex(INDEX_NAME);
@@ -207,7 +206,9 @@ public class WarmFullFileIT extends WarmFullFileBaseIT {
         );
         Map<String, Long> stats = reopened.manager.counters();
         assertEquals(0L, stats.get("reused").longValue());
-        assertTrue("the second promotion downloads the file again", stats.get("downloadedBytes").longValue() > downloadedBefore);
+        // Built again, not handed over: a second download ran, whether its parts came from the remote store or from
+        // blocks the searches above had already made local.
+        assertEquals("the second promotion builds the file again", 2L, stats.get("started").longValue());
         assertEquals(fingerprint, queryFingerprint(INDEX_NAME));
 
         deleteIndex(INDEX_NAME);
@@ -515,7 +516,7 @@ public class WarmFullFileIT extends WarmFullFileBaseIT {
         // Writes and a flush while the segment is served whole: a second segment appears and the promoted one keeps serving.
         indexDocs(INDEX_NAME, NUM_DOCS, 2 * NUM_DOCS);
         flushAndRefresh(INDEX_NAME);
-        assertHitCount(client().prepareSearch(INDEX_NAME).setQuery(QueryBuilders.matchAllQuery()).setSize(0).get(), 2 * NUM_DOCS);
+        assertHitCount(client().prepareSearch(INDEX_NAME).setQuery(sourceReadingQuery()).setSize(0).get(), 2 * NUM_DOCS);
         assertEquals(FullFileState.State.FULL, promotedFamily.state());
         assertThat(fdts(warmShard.shard).size(), greaterThan(1));
 
@@ -552,7 +553,7 @@ public class WarmFullFileIT extends WarmFullFileBaseIT {
         assertAdmissibleLength(mergedFdt, warmShard.directory.fileLength(mergedFdt), perSegmentBudget(warmShard));
         assertFalse(isPromoted(warmShard, mergedFdt));
         assertBusy(() -> {
-            assertHitCount(client().prepareSearch(INDEX_NAME).setQuery(QueryBuilders.matchAllQuery()).setSize(10).get(), 2 * NUM_DOCS);
+            assertHitCount(client().prepareSearch(INDEX_NAME).setQuery(sourceReadingQuery()).setSize(10).get(), 2 * NUM_DOCS);
             assertTrue("merged segment not promoted yet, family state " + stateOf(warmShard, mergedFdt), isPromoted(warmShard, mergedFdt));
         }, DOWNLOAD_TIMEOUT.seconds(), TimeUnit.SECONDS);
         // The promotion is counted just after the family turns FULL.
@@ -589,7 +590,7 @@ public class WarmFullFileIT extends WarmFullFileBaseIT {
 
             indexDocs(INDEX_NAME, NUM_DOCS, 2 * NUM_DOCS);
             flushAndRefresh(INDEX_NAME);
-            assertHitCount(client().prepareSearch(INDEX_NAME).setQuery(QueryBuilders.matchAllQuery()).setSize(0).get(), 2 * NUM_DOCS);
+            assertHitCount(client().prepareSearch(INDEX_NAME).setQuery(sourceReadingQuery()).setSize(0).get(), 2 * NUM_DOCS);
             assertEquals("still downloading while the second segment is written", FullFileState.State.PROMOTING, promotingFamily.state());
 
             assertNoFailures(client().admin().indices().prepareForceMerge(INDEX_NAME).setMaxNumSegments(1).get());
@@ -637,7 +638,7 @@ public class WarmFullFileIT extends WarmFullFileBaseIT {
         }, BLOCK_MODE_TIMEOUT.seconds(), TimeUnit.SECONDS);
         assertAdmissibleLength(mergedFdt, warmShard.directory.fileLength(mergedFdt), perSegmentBudget(warmShard));
         assertBusy(() -> {
-            assertHitCount(client().prepareSearch(INDEX_NAME).setQuery(QueryBuilders.matchAllQuery()).setSize(10).get(), 2 * NUM_DOCS);
+            assertHitCount(client().prepareSearch(INDEX_NAME).setQuery(sourceReadingQuery()).setSize(10).get(), 2 * NUM_DOCS);
             assertTrue("merged segment not promoted yet, family state " + stateOf(warmShard, mergedFdt), isPromoted(warmShard, mergedFdt));
         }, DOWNLOAD_TIMEOUT.seconds(), TimeUnit.SECONDS);
         // The promotion is counted just after the family turns FULL.
@@ -696,7 +697,7 @@ public class WarmFullFileIT extends WarmFullFileBaseIT {
             Thread thread = new Thread(() -> {
                 while (stop.get() == false) {
                     try {
-                        client().prepareSearch(INDEX_NAME).setQuery(QueryBuilders.matchAllQuery()).setSize(20).get();
+                        client().prepareSearch(INDEX_NAME).setQuery(sourceReadingQuery()).setSize(20).get();
                         completedSearches.incrementAndGet();
                     } catch (Exception e) {
                         if (isIndexGoneException(e) == false) {
@@ -742,7 +743,7 @@ public class WarmFullFileIT extends WarmFullFileBaseIT {
                 .get();
         }
         refresh(SECOND_INDEX_NAME);
-        assertHitCount(client().prepareSearch(SECOND_INDEX_NAME).setQuery(QueryBuilders.matchAllQuery()).get(), 10);
+        assertHitCount(client().prepareSearch(SECOND_INDEX_NAME).setQuery(sourceReadingQuery()).get(), 10);
         deleteIndex(SECOND_INDEX_NAME);
     }
 
@@ -846,7 +847,7 @@ public class WarmFullFileIT extends WarmFullFileBaseIT {
             Thread thread = new Thread(() -> {
                 while (stop.get() == false) {
                     try {
-                        client().prepareSearch(INDEX_NAME).setQuery(QueryBuilders.matchAllQuery()).setSize(20).get();
+                        client().prepareSearch(INDEX_NAME).setQuery(sourceReadingQuery()).setSize(20).get();
                         completedSearches.incrementAndGet();
                     } catch (Exception e) {
                         if (isIndexGoneException(e) == false) {

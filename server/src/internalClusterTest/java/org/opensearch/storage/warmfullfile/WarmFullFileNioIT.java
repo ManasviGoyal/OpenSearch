@@ -292,7 +292,7 @@ public class WarmFullFileNioIT extends WarmFullFileBaseIT {
     /** Closes and reopens the index so the searcher's file handles are opened on remote-mode files, and checks the hit count. */
     private WarmShard reopenAndVerify(String index, String warmNode) {
         reopenIndex(index);
-        assertHitCount(client().prepareSearch(index).setSize(0).setQuery(QueryBuilders.matchAllQuery()).get(), NUM_DOCS);
+        assertHitCount(client().prepareSearch(index).setSize(0).setQuery(sourceReadingQuery()).get(), NUM_DOCS);
         return warmShard(index, warmNode);
     }
 
@@ -315,7 +315,7 @@ public class WarmFullFileNioIT extends WarmFullFileBaseIT {
 
     /** Searches with _source: the total hit count and the known document's body must match what was indexed. */
     private void assertSearchCorrect(String index, String knownBody) {
-        SearchResponse all = client().prepareSearch(index).setQuery(QueryBuilders.matchAllQuery()).setSize(10).get();
+        SearchResponse all = client().prepareSearch(index).setQuery(sourceReadingQuery()).setSize(10).get();
         assertHitCount(all, NUM_DOCS);
         assertEquals(10, all.getHits().getHits().length);
         for (int i = 0; i < all.getHits().getHits().length; i++) {

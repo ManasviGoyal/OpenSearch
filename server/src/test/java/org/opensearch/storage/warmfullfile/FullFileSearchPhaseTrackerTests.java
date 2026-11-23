@@ -11,6 +11,7 @@ package org.opensearch.storage.warmfullfile;
 import com.carrotsearch.randomizedtesting.annotations.ThreadLeakFilters;
 
 import org.apache.lucene.store.IndexInput;
+import org.opensearch.common.lease.Releasable;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.common.util.concurrent.OpenSearchExecutors;
 import org.opensearch.common.util.concurrent.OpenSearchThreadPoolExecutor;
@@ -24,7 +25,12 @@ import org.opensearch.test.OpenSearchTestCase;
 import java.nio.file.Path;
 import java.util.concurrent.TimeUnit;
 
+import org.mockito.ArgumentCaptor;
+
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.verify;
 
 @ThreadLeakFilters(filters = CleanerDaemonThreadLeakFilter.class)
 public class FullFileSearchPhaseTrackerTests extends OpenSearchTestCase {
@@ -103,25 +109,58 @@ public class FullFileSearchPhaseTrackerTests extends OpenSearchTestCase {
         assertFalse(tracker.inPhase());
     }
 
-    public void testListenerHooksEnterAndExitAPhase() {
+    public void testOnlyTheQueryPhaseHooksEnterAndExitAPhase() {
         SearchContext context = mock(SearchContext.class);
 
         tracker.onPreQueryPhase(context);
         assertTrue(tracker.inPhase());
-        tracker.onPreSliceExecution(context);
-        tracker.onSliceExecution(context);
-        assertTrue(tracker.inPhase());
         tracker.onQueryPhase(context, 1L);
         assertFalse(tracker.inPhase());
 
-        tracker.onPreFetchPhase(context);
+        tracker.onPreQueryPhase(context);
         assertTrue(tracker.inPhase());
-        tracker.onFailedFetchPhase(context);
+        tracker.onFailedQueryPhase(context);
         assertFalse(tracker.inPhase());
 
+        // A fetch or a slice of a concurrent segment search opens no phase of its own.
+        tracker.onPreFetchPhase(context);
+        assertFalse(tracker.inPhase());
+        tracker.onFetchPhase(context, 1L);
         tracker.onPreSliceExecution(context);
-        tracker.onFailedSliceExecution(context);
+        assertFalse(tracker.inPhase());
+        tracker.onSliceExecution(context);
+        assertFalse(tracker.inPhase());
+    }
+
+    public void testAQueryPhaseWhosePostHookNeverRanIsClosedWithItsSearchContext() {
+        // The phase registers its cleanup on the search context too, so a phase that ends without its post hook is
+        // closed when the context is. Run a second time by the post hook, or by the context, it does nothing.
+        SearchContext context = mock(SearchContext.class);
+        ArgumentCaptor<Releasable> registered = ArgumentCaptor.forClass(Releasable.class);
+
         tracker.onPreQueryPhase(context);
+        verify(context).addReleasable(registered.capture());
+        assertTrue(tracker.inPhase());
+
+        registered.getValue().close();
+        assertFalse(tracker.inPhase());
+
+        tracker.onQueryPhase(context, 1L);
+        registered.getValue().close();
+        assertFalse(tracker.inPhase());
+
+        tracker.onPreQueryPhase(context);
+        assertTrue("a later phase on the same context is its own", tracker.inPhase());
+        tracker.onQueryPhase(context, 1L);
+        assertFalse(tracker.inPhase());
+    }
+
+    public void testAFailureRegisteringTheCleanupLeavesNoPhaseOpen() {
+        SearchContext context = mock(SearchContext.class);
+        doThrow(new IllegalStateException("simulated")).when(context).addReleasable(any());
+
+        expectThrows(IllegalStateException.class, () -> tracker.onPreQueryPhase(context));
+        assertFalse(tracker.inPhase());
         tracker.onFailedQueryPhase(context);
         assertFalse(tracker.inPhase());
     }

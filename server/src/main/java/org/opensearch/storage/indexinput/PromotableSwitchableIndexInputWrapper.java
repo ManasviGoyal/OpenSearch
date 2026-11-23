@@ -15,6 +15,7 @@ import org.apache.lucene.store.IndexInput;
 import org.opensearch.common.annotation.ExperimentalApi;
 import org.opensearch.storage.warmfullfile.FullFileState;
 import org.opensearch.storage.warmfullfile.WarmFullFileManager;
+import org.opensearch.threadpool.ThreadPool;
 
 import java.io.IOException;
 
@@ -34,6 +35,13 @@ public class PromotableSwitchableIndexInputWrapper extends SwitchableIndexInputW
     private final FullFileState fullFileState;
     private final WarmFullFileManager manager;
     private static final Logger logger = LogManager.getLogger(PromotableSwitchableIndexInputWrapper.class);
+    // Whether this thread belongs to a pool that runs queries. Pool threads are named like
+    // opensearch[node][index_searcher][T#3], so a pool such as search_throttled does not match. Any other thread reads
+    // blocks, whatever its context carries.
+    private static final ThreadLocal<Boolean> QUERY_THREAD = ThreadLocal.withInitial(() -> {
+        final String name = Thread.currentThread().getName();
+        return name.contains("[" + ThreadPool.Names.SEARCH + "]") || name.contains("[" + ThreadPool.Names.INDEX_SEARCHER + "]");
+    });
 
     /**
      * @param resourceDescription a human-readable description
@@ -100,12 +108,15 @@ public class PromotableSwitchableIndexInputWrapper extends SwitchableIndexInputW
     }
 
     /**
-     * A view of the family's whole-file mapping, or null when the handle must keep reading blocks: the family is not
-     * FULL, the mapping is not published, this thread is outside a search scope, the scope found the file dropped
-     * from the cache, or the mapping was closed under this read. Blocks are always valid, so every fallback is silent
+     * A view of the family's whole-file mapping, or null when the handle must keep reading blocks: this thread is not
+     * one of a query pool, the family is not FULL, the mapping is not published, this thread is outside a query
+     * phase, the scope found the file dropped from the cache, or the mapping was closed under this read. Blocks are always valid, so every fallback is silent
      * except an unexpected I/O error, which is logged at DEBUG.
      */
     private IndexInput viewOrNull(String what, ViewCutter cutter) {
+        if (QUERY_THREAD.get() == false) {
+            return null;
+        }
         IndexInput master = fullFileState.localMaster(); // read the volatile once
         if (fullFileState.state() != FullFileState.State.FULL || master == null) {
             return null;
@@ -142,9 +153,12 @@ public class PromotableSwitchableIndexInputWrapper extends SwitchableIndexInputW
         }
     }
 
-    /** The manager decides whether this access starts a promotion; without a manager the feature is off. */
+    /**
+     * The manager decides whether this access starts a promotion; without a manager the feature is off. A read on a
+     * thread that is not one of a query pool asks for nothing.
+     */
     private void requestPromotion() {
-        if (manager != null) {
+        if (manager != null && QUERY_THREAD.get()) {
             manager.requestPromotion(fullFileState);
         }
     }

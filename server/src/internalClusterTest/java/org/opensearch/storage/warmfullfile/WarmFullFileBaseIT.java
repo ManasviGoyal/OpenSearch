@@ -27,6 +27,8 @@ import org.opensearch.index.IndexModule;
 import org.opensearch.index.TieredMergePolicyProvider;
 import org.opensearch.index.engine.Engine;
 import org.opensearch.index.engine.EngineConfig;
+import org.opensearch.index.query.QueryBuilder;
+import org.opensearch.index.query.QueryBuilders;
 import org.opensearch.index.shard.IndexShard;
 import org.opensearch.index.store.remote.file.AbstractBlockIndexInput;
 import org.opensearch.index.store.remote.file.CleanerDaemonThreadLeakFilter;
@@ -35,7 +37,11 @@ import org.opensearch.index.store.remote.filecache.FileCache;
 import org.opensearch.index.store.remote.utils.FileTypeUtils;
 import org.opensearch.indices.IndicesService;
 import org.opensearch.node.Node;
+import org.opensearch.plugins.Plugin;
 import org.opensearch.remotestore.RemoteStoreBaseIntegTestCase;
+import org.opensearch.script.MockScriptPlugin;
+import org.opensearch.script.Script;
+import org.opensearch.script.ScriptType;
 import org.opensearch.storage.directory.TieredDirectory;
 import org.opensearch.storage.indexinput.PromotableCachedSwitchableIndexInput;
 import org.opensearch.storage.utils.DirectoryUtils;
@@ -47,11 +53,15 @@ import java.nio.file.Files;
 import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
 import java.util.Arrays;
+import java.util.Collection;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.TimeUnit;
+import java.util.function.Function;
 import java.util.stream.Collectors;
+import java.util.stream.Stream;
 
 import static org.opensearch.test.hamcrest.OpenSearchAssertions.assertAcked;
 import static org.opensearch.test.hamcrest.OpenSearchAssertions.assertNoFailures;
@@ -199,6 +209,39 @@ public abstract class WarmFullFileBaseIT extends RemoteStoreBaseIntegTestCase {
                 .prepareUpdateSettings()
                 .setPersistentSettings(Settings.builder().putNull(WarmFullFileSettings.EXTENSIONS.getKey()))
                 .get()
+        );
+    }
+
+    /**
+     * The mock scripts of these tests. Whole files are served to query phases only, and stored fields are otherwise
+     * read by the fetch phase, so the tests that promote a stored-fields file read it from a script that runs in the
+     * query phase.
+     */
+    public static class SourceReadingScriptPlugin extends MockScriptPlugin {
+        static final String READ_SOURCE = "read_source";
+
+        @Override
+        protected Map<String, Function<Map<String, Object>, Object>> pluginScripts() {
+            return Map.of(READ_SOURCE, vars -> {
+                ((Map<?, ?>) vars.get("_source")).get(BODY_FIELD); // loads the document's stored source
+                return 1.0;
+            });
+        }
+    }
+
+    @Override
+    protected Collection<Class<? extends Plugin>> nodePlugins() {
+        return Stream.concat(super.nodePlugins().stream(), Stream.of(SourceReadingScriptPlugin.class)).collect(Collectors.toList());
+    }
+
+    /**
+     * A match-all query that reads every matching document's stored source in the query phase, with a constant score:
+     * a query that reads the stored-fields file, as a k-NN query reads its graph and code files.
+     */
+    protected static QueryBuilder sourceReadingQuery() {
+        return QueryBuilders.scriptScoreQuery(
+            QueryBuilders.matchAllQuery(),
+            new Script(ScriptType.INLINE, MockScriptPlugin.NAME, SourceReadingScriptPlugin.READ_SOURCE, Map.of())
         );
     }
 

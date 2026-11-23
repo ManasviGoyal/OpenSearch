@@ -9,6 +9,8 @@
 package org.opensearch.storage.warmfullfile;
 
 import org.opensearch.common.annotation.ExperimentalApi;
+import org.opensearch.common.lease.Releasable;
+import org.opensearch.common.lease.Releasables;
 import org.opensearch.common.util.concurrent.ThreadContext;
 import org.opensearch.index.shard.SearchOperationListener;
 import org.opensearch.search.internal.SearchContext;
@@ -17,19 +19,20 @@ import java.util.Deque;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedDeque;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
- * Tracks the search phases running on this node's warm shards as scopes, so a promoted whole file is referenced
- * exactly while a search reads it. A query phase, a fetch phase or one slice of a concurrent segment search is a
- * phase, reported by the {@link SearchOperationListener} hooks. The phases a request is inside form its
- * {@link Scope}, stored as a transient of the {@link ThreadContext}: the thread pools copy the context onto every
- * task they run, so a task forked from a phase (a concurrent segment search slice, or the per-leaf tasks k-NN
- * submits through the searcher's task executor) shares the scope and is inside the phase too. A thread whose context
- * has no scope, such as a merge thread or a recovery thread, is outside every phase and reads blocks.
+ * Tracks the query phases running on this node's warm shards as scopes, so a promoted whole file is referenced
+ * exactly while a query reads it. The {@link SearchOperationListener} hooks of the query phase open and close a
+ * scope; no other phase does, so a fetch, a merge or a recovery is outside every scope and reads blocks. The phases
+ * a request is inside form its {@link Scope}, stored as a transient of the {@link ThreadContext}: the thread pools
+ * copy the context onto every task they run, so a task forked from a query phase (a concurrent segment search slice,
+ * or the per-leaf tasks k-NN submits through the searcher's task executor) shares the scope and is inside the phase
+ * too.
  *
  * <p>A whole-file view is cut only through {@link #holdsView}: the first view of a family in a scope takes one
  * reference on the whole-file cache entry and one in-flight count on the family, and the scope's end gives both
- * back. Between searches a promoted file is therefore an unreferenced cache entry, evicted like a block, and a
+ * back. Between queries a promoted file is therefore an unreferenced cache entry, evicted like a block, and a
  * family demoted while a scope reads it unmaps only once that scope ends.
  *
  * @opensearch.experimental
@@ -52,6 +55,9 @@ public final class FullFileSearchPhaseTracker implements SearchOperationListener
     }
 
     private final ThreadContext threadContext;
+    // The cleanup of every query phase that is open, by its search context. The phase's post hook runs it; the search
+    // context runs it too when it closes, which covers a phase whose post hook never ran.
+    private final Map<SearchContext, Releasable> openPhases = new ConcurrentHashMap<>();
 
     public FullFileSearchPhaseTracker(ThreadContext threadContext) {
         this.threadContext = threadContext;
@@ -59,63 +65,69 @@ public final class FullFileSearchPhaseTracker implements SearchOperationListener
 
     @Override
     public void onPreQueryPhase(SearchContext searchContext) {
-        enter();
+        final Scope scope = scope();
+        final AtomicBoolean entered = new AtomicBoolean();
+        final Releasable cleanup = Releasables.releaseOnce(() -> {
+            openPhases.remove(searchContext);
+            if (entered.get()) {
+                exit(scope);
+            }
+        });
+        openPhases.put(searchContext, cleanup);
+        try {
+            searchContext.addReleasable(cleanup);
+            // Entered last, so that a failure above never leaves the scope open.
+            scope.tokens.addLast(new Object());
+            entered.set(true);
+        } catch (RuntimeException e) {
+            openPhases.remove(searchContext);
+            throw e;
+        }
     }
 
     @Override
     public void onQueryPhase(SearchContext searchContext, long tookInNanos) {
-        exit();
+        closePhase(searchContext);
     }
 
     @Override
     public void onFailedQueryPhase(SearchContext searchContext) {
-        exit();
+        closePhase(searchContext);
     }
 
-    @Override
-    public void onPreFetchPhase(SearchContext searchContext) {
-        enter();
+    private void closePhase(SearchContext searchContext) {
+        Releasable cleanup = openPhases.get(searchContext);
+        if (cleanup != null) {
+            cleanup.close();
+        }
     }
 
-    @Override
-    public void onFetchPhase(SearchContext searchContext, long tookInNanos) {
-        exit();
-    }
-
-    @Override
-    public void onFailedFetchPhase(SearchContext searchContext) {
-        exit();
-    }
-
-    @Override
-    public void onPreSliceExecution(SearchContext searchContext) {
-        enter();
-    }
-
-    @Override
-    public void onSliceExecution(SearchContext searchContext) {
-        exit();
-    }
-
-    @Override
-    public void onFailedSliceExecution(SearchContext searchContext) {
-        exit();
-    }
-
-    /** Records that the current context has started a phase. */
-    void enter() {
+    /** The scope of the request this thread serves, created on first use. */
+    private Scope scope() {
         Scope scope = threadContext.getTransient(SCOPE_TRANSIENT);
         if (scope == null) {
             scope = new Scope();
             threadContext.putTransient(SCOPE_TRANSIENT, scope);
         }
-        scope.tokens.addLast(new Object());
+        return scope;
     }
 
-    /** Records that the current context has ended a phase; the end of its last phase gives back every view it holds. */
+    /** Enters a phase on this thread's request. */
+    void enter() {
+        scope().tokens.addLast(new Object());
+    }
+
+    /** Leaves a phase of this thread's request; a no-op outside every phase. */
     void exit() {
         Scope scope = threadContext.getTransient(SCOPE_TRANSIENT);
-        if (scope == null || scope.tokens.pollLast() == null) {
+        if (scope != null) {
+            exit(scope);
+        }
+    }
+
+    /** Leaves a phase of {@code scope}; the last one out gives back every whole file the scope holds. */
+    private void exit(Scope scope) {
+        if (scope.tokens.pollLast() == null) {
             return;
         }
         if (scope.tokens.isEmpty()) {

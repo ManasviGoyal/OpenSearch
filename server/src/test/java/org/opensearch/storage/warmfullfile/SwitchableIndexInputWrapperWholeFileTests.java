@@ -13,16 +13,7 @@ import org.apache.logging.log4j.Level;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.core.LogEvent;
 import org.apache.lucene.codecs.CodecUtil;
-import org.apache.lucene.document.Document;
-import org.apache.lucene.index.ConcurrentMergeScheduler;
-import org.apache.lucene.index.IndexWriter;
-import org.apache.lucene.index.IndexWriterConfig;
-import org.apache.lucene.index.MergePolicy;
-import org.apache.lucene.index.MergeScheduler;
-import org.apache.lucene.index.SegmentCommitInfo;
-import org.apache.lucene.index.SegmentInfos;
 import org.apache.lucene.store.AlreadyClosedException;
-import org.apache.lucene.store.ByteBuffersDirectory;
 import org.apache.lucene.store.FSDirectory;
 import org.apache.lucene.store.IOContext;
 import org.apache.lucene.store.IndexInput;
@@ -104,8 +95,14 @@ public class SwitchableIndexInputWrapperWholeFileTests extends TieredStorageBase
     private FileCache fileCache;
     private TransferManager transferManager;
 
+    // A thread of the search pool, as the node names them: the wrapper gives whole-file views to such threads only.
+    private static final String QUERY_THREAD_NAME = "opensearch[test][" + ThreadPool.Names.SEARCH + "][T#1]";
+    private String testThreadName;
+
     @Before
     public void setup() throws IOException {
+        testThreadName = Thread.currentThread().getName();
+        Thread.currentThread().setName(QUERY_THREAD_NAME);
         setupRemoteSegmentStoreDirectory();
         populateMetadata();
         remoteSegmentStoreDirectory.init();
@@ -126,6 +123,7 @@ public class SwitchableIndexInputWrapperWholeFileTests extends TieredStorageBase
 
     @After
     public void closeLocalDirectory() throws IOException {
+        Thread.currentThread().setName(testThreadName);
         IOUtils.close(localDirectory);
     }
 
@@ -224,10 +222,14 @@ public class SwitchableIndexInputWrapperWholeFileTests extends TieredStorageBase
         RecordingExecutor exec = new RecordingExecutor();
         SwitchableIndexInputWrapper handle = new PromotableSwitchableIndexInputWrapper("h", in, st, manager(exec, new AtomicLong()));
 
+        enterScope();
         IndexInput c1 = handle.clone();
+        exitScope();
         assertEquals(FullFileState.State.PROMOTING, st.state());
         assertEquals(1, exec.submitted.get());
+        enterScope();
         IndexInput c2 = handle.clone();
+        exitScope();
         assertEquals("no second request while PROMOTING", 1, exec.submitted.get());
         assertTrue("block clones returned while not FULL", c1 instanceof SwitchableIndexInputWrapper);
         assertTrue(c2 instanceof SwitchableIndexInputWrapper);
@@ -240,7 +242,9 @@ public class SwitchableIndexInputWrapperWholeFileTests extends TieredStorageBase
         RecordingExecutor exec = new RecordingExecutor();
         SwitchableIndexInputWrapper handle = new PromotableSwitchableIndexInputWrapper("h", in, st, manager(exec, new AtomicLong()));
 
+        enterScope();
         IndexInput s = handle.slice("s", 0, Math.min(16, in.length()));
+        exitScope();
         assertEquals(1, exec.submitted.get());
         assertTrue(s instanceof SwitchableIndexInputWrapper);
         IOUtils.close(s, handle);
@@ -260,11 +264,13 @@ public class SwitchableIndexInputWrapperWholeFileTests extends TieredStorageBase
             Thread t = new Thread(() -> {
                 try {
                     start.await();
+                    enterScope();
                     clones.add(handle.clone());
+                    exitScope();
                 } catch (InterruptedException e) {
                     Thread.currentThread().interrupt();
                 }
-            });
+            }, QUERY_THREAD_NAME);
             workers.add(t);
             t.start();
         }
@@ -292,13 +298,17 @@ public class SwitchableIndexInputWrapperWholeFileTests extends TieredStorageBase
             WarmFullFileManager mgr = manager(Runnable::run, clock);
             SwitchableIndexInputWrapper handle = new PromotableSwitchableIndexInputWrapper("h", in, st, mgr);
 
+            enterScope();
             IndexInput first = handle.clone(); // triggers the one and only attempt
+            exitScope();
             assertBusy(() -> assertEquals(Long.MAX_VALUE, st.retryAt()), 30, TimeUnit.SECONDS);
             assertEquals(FullFileState.State.BLOCK, st.state());
             assertEquals("nothing downloaded", 0, reads.get());
 
             clock.set(TimeUnit.DAYS.toMillis(365)); // far past any 60 s retry window
+            enterScope();
             IndexInput again = handle.clone();
+            exitScope();
             assertTrue("still served by blocks", again instanceof SwitchableIndexInputWrapper);
             assertEquals("never retried", FullFileState.State.BLOCK, st.state());
             assertEquals("still nothing downloaded", 0, reads.get());
@@ -349,14 +359,18 @@ public class SwitchableIndexInputWrapperWholeFileTests extends TieredStorageBase
         RecordingExecutor exec = new RecordingExecutor();
         SwitchableIndexInputWrapper handle = new PromotableSwitchableIndexInputWrapper("h", in, st, manager(exec, new AtomicLong()));
 
+        enterScope();
         IndexInput localClone = handle.clone();
         IndexInput localSlice = handle.slice("s", 0, Math.min(16, in.length()));
+        exitScope();
         assertEquals("no request while the file is local", 0, exec.submitted.get());
         assertEquals(FullFileState.State.BLOCK, st.state());
 
         in.switchToRemote();
         assertTrue(in.hasSwitchedToRemote());
+        enterScope();
         IndexInput switchedClone = handle.clone();
+        exitScope();
         assertEquals(
             "the input's own flag is not enough: the family is not marked remote until the switch has finished",
             0,
@@ -365,7 +379,9 @@ public class SwitchableIndexInputWrapperWholeFileTests extends TieredStorageBase
         assertEquals(FullFileState.State.BLOCK, st.state());
 
         st.markRemoteMode(null); // what TieredDirectory.afterSyncToRemote does once switchFileToRemote has returned
+        enterScope();
         IndexInput remoteClone = handle.clone();
+        exitScope();
         assertEquals("the first clone after the family is marked remote requests promotion", 1, exec.submitted.get());
         assertEquals(FullFileState.State.PROMOTING, st.state());
         IOUtils.close(localClone, localSlice, switchedClone, remoteClone, handle);
@@ -401,9 +417,11 @@ public class SwitchableIndexInputWrapperWholeFileTests extends TieredStorageBase
                     assertEquals("one request line for one promotion attempt", 1, seen.get());
                 }
             });
+            enterScope();
             IndexInput c1 = handle.clone(); // wins the CAS: logged
             IndexInput c2 = handle.clone(); // PROMOTING: no CAS, no line
             IndexInput s = handle.slice("s", 0, Math.min(16, in.length()));
+            exitScope();
             assertEquals(1, exec.submitted.get());
             appender.assertAllExpectationsMatched();
             IOUtils.close(c1, c2, s);
@@ -411,54 +429,40 @@ public class SwitchableIndexInputWrapperWholeFileTests extends TieredStorageBase
         handle.close();
     }
 
-    public void testMergeThreadNeverRequestsPromotion() throws Exception {
+    public void testAReadOutsideAQueryPhaseOrOffAQueryThreadNeverRequestsPromotion() throws Exception {
         syncLocalAndRemoteForFile(localDirectory, FILE_NAME);
         SwitchableIndexInput in = newInput(true, transferManager);
         FullFileState st = stateFor(in);
         RecordingExecutor exec = new RecordingExecutor();
         SwitchableIndexInputWrapper handle = new PromotableSwitchableIndexInputWrapper("h", in, st, manager(exec, new AtomicLong()));
 
-        // The same clone and slice calls a merge makes, on the kind of thread Lucene runs merges on.
-        Queue<IndexInput> mergeInputs = new ConcurrentLinkedQueue<>();
-        Thread merge = mergeThread(() -> {
-            mergeInputs.add(handle.clone());
-            mergeInputs.add(handle.slice("s", 0, Math.min(16, in.length())));
-        });
-        merge.start();
-        merge.join();
-        assertEquals("a merge thread never requests promotion", 0, exec.submitted.get());
+        // The clone and slice a fetch, a merge or a recovery makes: on a query thread, but outside a query phase.
+        IndexInput outsideClone = handle.clone();
+        IndexInput outsideSlice = handle.slice("s", 0, Math.min(16, in.length()));
+        assertEquals("a read outside a query phase never requests promotion", 0, exec.submitted.get());
         assertEquals(FullFileState.State.BLOCK, st.state());
 
-        // A search thread does.
+        // The same inside a query phase, on a thread that is not one of a query pool.
+        Queue<IndexInput> otherInputs = new ConcurrentLinkedQueue<>();
+        Thread other = new Thread(() -> {
+            enterScope();
+            otherInputs.add(handle.clone());
+            otherInputs.add(handle.slice("s", 0, Math.min(16, in.length())));
+            exitScope();
+        }, "opensearch[test][generic][T#1]");
+        other.start();
+        other.join();
+        assertEquals("a thread of another pool never requests promotion", 0, exec.submitted.get());
+        assertEquals(FullFileState.State.BLOCK, st.state());
+
+        // A query phase on a query thread does.
+        enterScope();
         IndexInput searchClone = handle.clone();
+        exitScope();
         assertEquals(1, exec.submitted.get());
         assertEquals(FullFileState.State.PROMOTING, st.state());
-        IOUtils.close(mergeInputs);
-        IOUtils.close(searchClone, handle);
-    }
-
-    /** A real {@code ConcurrentMergeScheduler.MergeThread}, as Lucene runs merges on, that runs {@code body} instead of a merge. */
-    private static Thread mergeThread(Runnable body) throws IOException {
-        try (ByteBuffersDirectory segments = new ByteBuffersDirectory()) {
-            try (IndexWriter writer = new IndexWriter(segments, new IndexWriterConfig())) {
-                writer.addDocument(new Document());
-                writer.commit();
-            }
-            SegmentCommitInfo segment = SegmentInfos.readLatestCommit(segments).asList().get(0);
-            return new MergeThreadFactory().newMergeThread(new MergePolicy.OneMerge(List.of(segment)), body);
-        }
-    }
-
-    /** {@code MergeThread} is a protected member type of the scheduler, so only a subclass can construct one. */
-    private static final class MergeThreadFactory extends ConcurrentMergeScheduler {
-        Thread newMergeThread(MergePolicy.OneMerge merge, Runnable body) {
-            return new MergeThread(mock(MergeScheduler.MergeSource.class), merge) {
-                @Override
-                public void run() {
-                    body.run();
-                }
-            };
-        }
+        IOUtils.close(otherInputs);
+        IOUtils.close(outsideClone, outsideSlice, searchClone, handle);
     }
 
     public void testNoRequestBeforeRetryAt() throws IOException {
@@ -470,10 +474,14 @@ public class SwitchableIndexInputWrapperWholeFileTests extends TieredStorageBase
         RecordingExecutor exec = new RecordingExecutor();
         SwitchableIndexInputWrapper handle = new PromotableSwitchableIndexInputWrapper("h", in, st, manager(exec, clock));
 
+        enterScope();
         IndexInput early = handle.clone();
+        exitScope();
         assertEquals("before retryAt", 0, exec.submitted.get());
         clock.set(5_000);
+        enterScope();
         IndexInput due = handle.clone();
+        exitScope();
         assertEquals("at retryAt", 1, exec.submitted.get());
         IOUtils.close(early, due, handle);
     }
@@ -587,7 +595,9 @@ public class SwitchableIndexInputWrapperWholeFileTests extends TieredStorageBase
             manager(new RecordingExecutor(), new AtomicLong())
         );
 
+        enterScope();
         IndexInput before = handle.clone();
+        exitScope();
         IndexInput master = openMaster(len);
         publish(st, master);
         enterScope();
@@ -787,7 +797,9 @@ public class SwitchableIndexInputWrapperWholeFileTests extends TieredStorageBase
         );
 
         // Take a block slice BEFORE FULL (a wrapper over a 16-byte sub-window), then go FULL.
+        enterScope();
         IndexInput window = handle.slice("w", 8, 16);
+        exitScope();
         assertTrue(window instanceof SwitchableIndexInputWrapper);
         IndexInput master = openMaster(len);
         publish(st, master); // the slice above moved the family to PROMOTING
@@ -822,7 +834,9 @@ public class SwitchableIndexInputWrapperWholeFileTests extends TieredStorageBase
         SwitchableIndexInputWrapper handle = new PromotableSwitchableIndexInputWrapper("h", in, st, realManager);
 
         // First clone: still blocks, and it starts the real promotion.
+        enterScope();
         IndexInput first = handle.clone();
+        exitScope();
         assertTrue("first clone is a block input", first instanceof SwitchableIndexInputWrapper);
 
         assertBusy(() -> assertEquals(FullFileState.State.FULL, st.state()), 30, TimeUnit.SECONDS);
@@ -891,12 +905,16 @@ public class SwitchableIndexInputWrapperWholeFileTests extends TieredStorageBase
         SwitchableIndexInputWrapper handle = new PromotableSwitchableIndexInputWrapper("h", in, st, manager);
 
         manager.onExtensionsChanged(Set.of());
+        enterScope();
         IndexInput off = handle.clone();
+        exitScope();
         assertEquals("no request while the extension is not configured", 0, exec.submitted.get());
         assertEquals(FullFileState.State.BLOCK, st.state());
 
         manager.onExtensionsChanged(Set.of(WarmFullFileSettings.extensionOf(FILE_NAME)));
+        enterScope();
         IndexInput on = handle.clone();
+        exitScope();
         assertEquals("requested once the extension is configured again", 1, exec.submitted.get());
         assertEquals(FullFileState.State.PROMOTING, st.state());
         IOUtils.close(off, on, handle);
@@ -937,7 +955,9 @@ public class SwitchableIndexInputWrapperWholeFileTests extends TieredStorageBase
             st,
             realManager
         );
+        enterScope();
         handle.clone(); // trigger
+        exitScope();
         assertBusy(() -> assertEquals(FullFileState.State.FULL, st.state()), 30, TimeUnit.SECONDS);
         enterScope();
         IndexInput view = handle.clone();
@@ -976,7 +996,9 @@ public class SwitchableIndexInputWrapperWholeFileTests extends TieredStorageBase
             st,
             realManager
         );
+        enterScope();
         again.clone(); // trigger
+        exitScope();
         assertBusy(() -> assertEquals(FullFileState.State.FULL, st.state()), 30, TimeUnit.SECONDS);
         assertEquals(2L, realManager.counters().get("promoted").longValue());
         enterScope();
@@ -1041,7 +1063,8 @@ public class SwitchableIndexInputWrapperWholeFileTests extends TieredStorageBase
             "fork",
             1,
             10,
-            OpenSearchExecutors.daemonThreadFactory("fork"),
+            // named as the pool k-NN and concurrent segment search fork their leaf tasks to
+            OpenSearchExecutors.daemonThreadFactory("test", ThreadPool.Names.INDEX_SEARCHER),
             threadContext
         );
         IndexInput inside;
@@ -1108,7 +1131,9 @@ public class SwitchableIndexInputWrapperWholeFileTests extends TieredStorageBase
             st,
             realManager
         );
+        enterScope();
         handle.clone(); // trigger
+        exitScope();
         assertBusy(() -> assertEquals(FullFileState.State.FULL, st.state()), 30, TimeUnit.SECONDS);
         IndexInput master = st.localMaster();
         enterScope();
@@ -1172,7 +1197,9 @@ public class SwitchableIndexInputWrapperWholeFileTests extends TieredStorageBase
             realManager
         );
 
+        enterScope();
         handle.clone(); // trigger
+        exitScope();
         assertBusy(() -> assertEquals(FullFileState.State.FULL, st.state()), 30, TimeUnit.SECONDS);
         assertEquals("after FULL the whole-file entry is unreferenced", Integer.valueOf(0), fileCache.getRef(fullPath));
         enterScope();
@@ -1236,7 +1263,9 @@ public class SwitchableIndexInputWrapperWholeFileTests extends TieredStorageBase
             st,
             realManager
         );
+        enterScope();
         handle.clone();
+        exitScope();
         assertBusy(() -> assertEquals(FullFileState.State.FULL, st.state()), 30, TimeUnit.SECONDS);
         handle.close(); // no handles left; the family is still open
         holdCleanup.set(true);
@@ -1355,7 +1384,7 @@ public class SwitchableIndexInputWrapperWholeFileTests extends TieredStorageBase
                     } catch (Throwable e) {
                         failures.add(e);
                     }
-                });
+                }, QUERY_THREAD_NAME);
                 workers.add(worker);
                 worker.start();
             }
