@@ -16,6 +16,7 @@ import org.apache.lucene.store.IOContext;
 import org.apache.lucene.store.IndexInput;
 import org.apache.lucene.store.MMapDirectory;
 import org.apache.lucene.store.MemorySegmentAccessInput;
+import org.opensearch.ExceptionsHelper;
 import org.opensearch.common.annotation.ExperimentalApi;
 import org.opensearch.common.lease.Releasable;
 import org.opensearch.common.metrics.CounterMetric;
@@ -326,6 +327,14 @@ public class WarmFullFileManager {
     }
 
     /**
+     * Rethrows an {@link Error} on a thread of its own, where nothing catches it and the uncaught exception handler
+     * sees it. Overridden in tests.
+     */
+    void onFatalError(Error error) {
+        ExceptionsHelper.maybeDieOnAnotherThread(error);
+    }
+
+    /**
      * One promotion of one family, from admission to FULL or to its decline. What the attempt has taken so far are its
      * fields: the download slot, the reserved budget bytes, a reference on the whole-file cache entry and the mapping.
      * {@link #close()} gives back whatever is still held, so every failure is a close() plus an
@@ -581,9 +590,12 @@ public class WarmFullFileManager {
                 close();
                 abandonPromotion(DeclineReason.ERROR, "exception publishing FULL: " + e.getMessage());
             } catch (Error e) {
-                // Unwind before the error propagates, or the family would stay PROMOTING with its slot and budget.
+                // Unwind first, or the family would stay PROMOTING with its slot and budget.
                 close();
                 abandonPromotion(DeclineReason.ERROR, "error completing download: " + e);
+                // This runs as a completion callback of the download's future, which keeps whatever the callback throws
+                // in a future nothing reads. The error is handed on so that it still reaches the node.
+                onFatalError(e);
                 throw e;
             }
         }

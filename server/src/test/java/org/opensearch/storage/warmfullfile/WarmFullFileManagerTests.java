@@ -676,6 +676,62 @@ public class WarmFullFileManagerTests extends OpenSearchTestCase {
         awaitState(ok, FullFileState.State.FULL);
     }
 
+    public void testAnErrorCompletingADownloadUnwindsAndIsHandedOn() throws Exception {
+        // The completion callback throws an Error once the file is in place. The download's future would keep it where
+        // nothing reads it, so the manager unwinds the attempt and hands the error on.
+        String name = "_fatal.faiss";
+        Path path = dir.resolve(name);
+        FileCache fileCache = newFileCache();
+        TransferManager tm = new TransferManager(new PositionDependentStreamReader(), fileCache, threadPool);
+        Error fatal = new Error("simulated");
+        AtomicReference<Error> handedOn = new AtomicReference<>();
+        WarmFullFileManager mgr = withFaissEligible(
+            new WarmFullFileManager(
+                fileCache,
+                new ThreadContext(Settings.EMPTY),
+                Runnable::run,
+                threadPool::relativeTimeInMillis,
+                1,
+                0.5,
+                PART_SIZE
+            ) {
+                @Override
+                void onFatalError(Error error) {
+                    handedOn.set(error);
+                }
+            }
+        );
+
+        try (MMapDirectory mmap = new MMapDirectory(dir); FSDirectory failing = new FSDirectory(dir, FSLockFactory.getDefault()) {
+            @Override
+            public IndexInput openInput(String fileName, IOContext context) throws IOException {
+                return mmap.openInput(fileName, context);
+            }
+
+            @Override
+            public long fileLength(String fileName) throws IOException {
+                if (Files.exists(path)) {
+                    throw fatal;
+                }
+                return super.fileLength(fileName);
+            }
+        }) {
+            FullFileState st = new FullFileState(tm, failing, fileCache, name, FILE_LENGTH, path);
+            startPromotion(mgr, st);
+
+            assertBusy(() -> assertSame("the error is handed on", fatal, handedOn.get()), 10, TimeUnit.SECONDS);
+            awaitState(st, FullFileState.State.BLOCK);
+            assertNull("nothing published", st.localMaster());
+            assertBusy(() -> {
+                Map<String, Long> stats = mgr.counters();
+                assertEquals(1L, stats.get("declined.ERROR").longValue());
+                assertEquals("reserved bytes given back", 0L, stats.get("reservedBytes").longValue());
+                assertEquals("slot given back", 0L, stats.get("activeDownloads").longValue());
+            }, 10, TimeUnit.SECONDS);
+        }
+        fileCache.remove(path);
+    }
+
     public void testNioDeclineWarnsOncePerExtensionThenDebug() throws Exception {
         // One operator mistake (an NIO-served extension) must not produce one WARN per segment per shard: the first
         // file of each extension is a WARN, later files of that extension are DEBUG. Other extensions get their own WARN.
