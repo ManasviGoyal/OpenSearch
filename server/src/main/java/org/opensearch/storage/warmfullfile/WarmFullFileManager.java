@@ -1089,7 +1089,9 @@ public class WarmFullFileManager {
     /** Builds the download request by hand: ceil(length / partSize) parts at absolute offsets, last clipped, no zero tail. */
     /**
      * The whole-file download: block-sized, block-aligned parts written atomically, each copied from the block the
-     * file cache already holds for it when there is one, unless such a copy has failed this family's checksum before.
+     * file cache already holds for it when there is one. Blocks carry no checksum of their own, so they are used only
+     * when the assembled file can be checked against the remote store's checksum, and not once such a file has failed
+     * that check for this family; otherwise every part is read from the remote store.
      */
     private BlobFetchRequest buildRequest(FullFileState st, long length, BlobFetchRequest.PartListener partListener) {
         List<BlobFetchRequest.BlobPart> parts = buildParts(st.fileName(), length, partSize);
@@ -1099,7 +1101,7 @@ public class WarmFullFileManager {
             .blobParts(parts)
             .atomicWrite(true)
             .partListener(partListener);
-        if (st.localBlocksSuspect() == false) {
+        if (st.expectedChecksum() != null && st.localBlocksSuspect() == false) {
             request.reuseLocalBlocks(partSize);
         }
         return request.build();

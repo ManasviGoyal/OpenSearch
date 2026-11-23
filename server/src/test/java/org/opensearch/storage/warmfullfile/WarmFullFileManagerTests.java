@@ -2195,6 +2195,32 @@ public class WarmFullFileManagerTests extends OpenSearchTestCase {
         assertNull("idle, so removed by the sweep that follows the promotion", fileCache.get(block3));
     }
 
+    public void testLocalBlocksAreNotUsedWhenTheRemoteChecksumIsUnknown() throws Exception {
+        // The remote store recorded no checksum for the file, so a file assembled from blocks could not be checked.
+        // Every part is read from the remote store, and a block holding the wrong bytes does no harm.
+        String name = "_nochecksum.faiss";
+        byte[] content = footeredContent(FILE_LENGTH);
+        FixedContentStreamReader reader = new FixedContentStreamReader(content);
+        FileCache fileCache = newFileCache();
+        TransferManager tm = new TransferManager(reader, fileCache, threadPool);
+        WarmFullFileManager mgr = newManager(fileCache, 4, 0.5);
+        int part = (int) PART_SIZE;
+        putLocalBlock(fileCache, name, 0, wrongBytes(part), true);
+        putLocalBlock(fileCache, name, 2, slice(content, 2 * part, 3 * part), true);
+
+        FullFileState st = newState(tm, fileCache, name, content.length);
+        st.markRemoteMode(null);
+        startPromotion(mgr, st);
+        awaitState(st, FullFileState.State.FULL);
+
+        assertEquals("every part read remotely", partsFor(name, content.length), reader.readCount());
+        Map<String, Long> stats = mgr.counters();
+        assertEquals(0L, stats.get("partsFromLocalBlocks").longValue());
+        assertEquals(0L, stats.get("bytesFromLocalBlocks").longValue());
+        assertEquals((long) content.length, stats.get("downloadedBytes").longValue());
+        assertServedUnreferenced(st, fileCache, dir.resolve(name), content);
+    }
+
     public void testACorruptLocalBlockFailsTheChecksumAndTheRetryReadsEveryPartRemotely() throws Exception {
         // Block 0 holds the wrong bytes. The assembled file fails the footer checksum, the family remembers that its
         // local blocks are suspect, and the retry reads every part from the remote store and reaches FULL.
