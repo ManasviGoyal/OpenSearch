@@ -23,7 +23,7 @@ import java.nio.file.Path;
 import java.util.concurrent.Executor;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BooleanSupplier;
 
@@ -33,25 +33,26 @@ import java.util.function.BooleanSupplier;
  * {@code PromotableCachedSwitchableIndexInput}, so a file is downloaded and mapped at most once however many readers
  * open it.
  *
- * <p>A promoted whole file is an ordinary file cache entry ({@link PromotedWholeFileEntry}): the family holds no
- * reference on it while FULL. A search scope takes one reference and one in-flight count on its first view of the
- * file ({@link #acquireView}) and gives both back when it ends ({@link #releaseView}), so between searches the file is
- * unreferenced and the cache evicts it under pressure like a block. When the cache drops the entry, for any reason,
- * {@link #onEntryRemoved} demotes the family to blocks and owes the unmap, which runs once the in-flight count is
- * zero; a scope that holds a view never has the mapping closed under it. A thread outside a scope reads blocks.
+ * <p>A promoted whole file is an ordinary file cache entry ({@link PromotedWholeFileEntry}) that nothing holds a
+ * reference on, so the cache evicts it under pressure like a block, also while a query reads it. When the cache drops
+ * the entry, for any reason, {@link #onEntryRemoved} demotes the family to blocks and owes the unmap. "In use" is
+ * counted per shard, not per file: the unmap waits for every query phase that was open on the family's shard when the
+ * family left FULL ({@link ShardUseTracker#whenDrained}), so a query that holds a view never has the mapping closed
+ * under it. A read outside a query phase gets blocks.
  *
  * <p>Every transition is a named method of this class, taken under one lock: {@link #onAccess}, {@link #abandonPromotion},
  * {@link #completePromotion}, and the three ways out of FULL, {@link #onEntryRemoved}, {@link #demote} and
  * {@link #closeFamily}. The mapping is published and the family moves to {@link State#FULL} in one step, so a reader
  * that sees FULL sees the mapping. The three ways out share one path: the family stops handing out views, the release
- * is owed, and it runs once no scope holds a view, exactly once per FULL period, on the cleanup executor and never on
- * the cache listener thread. The release drops the cache entry, closes the mapping, deletes the file, and only then
+ * is owed, and it runs once the shard's open query phases have ended, exactly once per FULL period, on the cleanup
+ * executor and never on the cache listener thread. The release drops the cache entry, closes the mapping, deletes the file, and only then
  * gives back the bytes the cache still counted for it and the budget, so neither says the disk is free before it is.
  * Nothing takes a family back to FULL but a new promotion, which starts only after the release has run, so a file is
  * never mapped twice.
  *
- * <p>Lock order: a file cache segment's lock, then this family's lock. The cache calls {@link #onEntryRemoved} under
- * its segment lock, so no cache call is made while this family's lock is held.
+ * <p>Lock order: a file cache segment's lock, then this family's lock, then the shard tracker's lock. The cache calls
+ * {@link #onEntryRemoved} under its segment lock, so no cache call is made while this family's lock is held, and the
+ * tracker calls out to nothing while it holds its own.
  *
  * @opensearch.experimental
  */
@@ -99,8 +100,12 @@ public final class FullFileState {
     // Set when a whole file assembled partly from this family's local blocks failed its checksum: the next download
     // reads every part from the remote store, since one of those blocks is corrupt and nothing says which.
     private volatile boolean localBlocksSuspect;
-    // Search scopes holding a view of the mapping; the unmap waits for zero.
-    private final AtomicInteger inFlightScopes = new AtomicInteger(0);
+    // The query phases open on the family's shard; the unmap waits for the ones open when the family left FULL.
+    private final ShardUseTracker tracker;
+    // Set once this FULL period has asked the tracker to run its release; re-armed by completePromotion.
+    private final AtomicBoolean drainRequested = new AtomicBoolean(false);
+    // When the cache entry's position was last refreshed for a view (monotonic millis).
+    private final AtomicLong lastTouchMillis = new AtomicLong(Long.MIN_VALUE);
 
     // Teardown wiring, set by completePromotion together with the mapping.
     private volatile Executor cleanupExecutor;
@@ -146,6 +151,24 @@ public final class FullFileState {
         long fileLength,
         Path fullFilePath
     ) {
+        this(transferManager, localDirectory, fileCache, fileName, fileLength, fullFilePath, new ShardUseTracker());
+    }
+
+    /**
+     * As the constructor above, for a family of a shard.
+     *
+     * @param tracker the tracker of the shard the file belongs to
+     */
+    public FullFileState(
+        TransferManager transferManager,
+        FSDirectory localDirectory,
+        FileCache fileCache,
+        String fileName,
+        long fileLength,
+        Path fullFilePath,
+        ShardUseTracker tracker
+    ) {
+        this.tracker = tracker;
         this.transferManager = transferManager;
         this.localDirectory = localDirectory;
         this.fileCache = fileCache;
@@ -303,6 +326,7 @@ public final class FullFileState {
             this.onEvictedByCache = onEvictedByCache;
             mappingReleaseOwed = false;
             releaseRetryNeeded = false;
+            drainRequested.set(false);
             cleanupScheduled.set(false);
             cleanupDone = false;
             this.entry = entry;
@@ -317,45 +341,26 @@ public final class FullFileState {
         return retryAt;
     }
 
+    /** @return the tracker of the shard the file belongs to */
+    public ShardUseTracker tracker() {
+        return tracker;
+    }
+
     /**
-     * Takes a search scope's hold on the whole file: one reference on the cache entry, so the cache does not evict
-     * it while the scope reads, and one in-flight count, so a demotion does not unmap under the scope. The reference
-     * is taken before the state is checked, so a family seen FULL under it cannot lose its entry to eviction in
-     * between; an explicit removal can still demote it, and then waits for this scope.
+     * Refreshes the position of the whole file's cache entry, at most once a second, for a view that is about to be
+     * cut. Nothing holds a reference on the entry, so this is what keeps a file in use from looking cold to the cache;
+     * a file read less than once a second ages like any other entry.
      *
-     * @return true if the scope now holds the file and may cut views of {@link #localMaster()}; false when the family
-     *         is not FULL or the cache has dropped the file, in which case the scope reads blocks
+     * @param nowMillis the current monotonic time
      */
-    boolean acquireView() {
-        if (state.get() != State.FULL) {
-            return false;
+    public void touch(long nowMillis) {
+        long last = lastTouchMillis.get();
+        if (nowMillis - last < 1000 && last != Long.MIN_VALUE) {
+            return;
         }
-        if (fileCache.get(fullFilePath) == null) {
-            return false;
+        if (lastTouchMillis.compareAndSet(last, nowMillis) && fileCache.get(fullFilePath) != null) {
+            fileCache.decRef(fullFilePath);
         }
-        synchronized (releaseLock) {
-            if (state.get() == State.FULL && mappingReleaseOwed == false) {
-                inFlightScopes.incrementAndGet();
-                return true;
-            }
-        }
-        fileCache.decRef(fullFilePath);
-        return false;
-    }
-
-    /** Gives a scope's hold back; the last one out of a family that owes its release schedules the unmap. */
-    void releaseView() {
-        fileCache.decRef(fullFilePath);
-        synchronized (releaseLock) {
-            if (inFlightScopes.decrementAndGet() == 0) {
-                maybeScheduleCleanup();
-            }
-        }
-    }
-
-    /** @return the number of search scopes holding a view of the mapping */
-    int inFlightScopes() {
-        return inFlightScopes.get();
     }
 
     /**
@@ -450,20 +455,23 @@ public final class FullFileState {
     }
 
     /**
-     * Schedules the release a family owes, and reports the family while scopes still hold views of its mapping; the
-     * last of them to end schedules the release then. A no-op for a family that owes nothing.
+     * Asks the shard's tracker to run the release a family owes once the query phases open now have ended, and
+     * reports the family if any is open. Once per FULL period; a no-op for a family that owes nothing.
      */
     private void scheduleRelease() {
         if (mappingReleaseOwed == false || cleanupDone) {
             return;
         }
-        if (inFlightScopes.get() > 0) {
+        if (drainRequested.compareAndSet(false, true) == false) {
+            return;
+        }
+        if (tracker.openHolds() > 0) {
             Runnable report = onAwaitingRelease;
             if (report != null) {
                 report.run();
             }
         }
-        maybeScheduleCleanup();
+        tracker.whenDrained(this::maybeScheduleCleanup);
     }
 
     /**
@@ -475,13 +483,12 @@ public final class FullFileState {
     }
 
     /**
-     * Schedules the cleanup exactly once per FULL period, and only when the family left FULL with a mapping and no
-     * scope holds a view. {@link #scheduleRelease()} and {@link #releaseView()} call this after their own write, so
-     * whichever runs second sees both conditions true.
+     * Hands the cleanup to the executor, exactly once per FULL period. Called by the shard's tracker once the query
+     * phases that were open when the family left FULL have ended, and by {@link #retryRelease()}.
      */
     private void maybeScheduleCleanup() {
         synchronized (releaseLock) {
-            if (mappingReleaseOwed == false || inFlightScopes.get() != 0) {
+            if (mappingReleaseOwed == false) {
                 return;
             }
             Executor executor = cleanupExecutor;
@@ -491,10 +498,11 @@ public final class FullFileState {
             try {
                 executor.execute(this::runCleanup);
             } catch (RuntimeException e) {
-                // Nothing was queued, so a later releaseView(), demote() or closeFamily() may schedule it again. Never
-                // run inline: this may be the FileCache listener thread.
+                // Nothing was queued. Never run inline: this may be the FileCache listener thread. The release is run
+                // again by retryRelease().
                 cleanupScheduled.set(false);
-                logger.warn("could not schedule whole-file cleanup for {}; will retry on the next scope end or close", fullFilePath, e);
+                releaseRetryNeeded = true;
+                logger.warn("could not schedule whole-file cleanup for {}; it is tried again later", fullFilePath, e);
             }
         }
     }

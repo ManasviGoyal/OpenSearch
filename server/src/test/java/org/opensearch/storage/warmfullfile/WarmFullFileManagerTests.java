@@ -48,10 +48,13 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Deque;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentLinkedDeque;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executor;
 import java.util.concurrent.ThreadPoolExecutor;
@@ -272,6 +275,19 @@ public class WarmFullFileManagerTests extends OpenSearchTestCase {
 
     private FullFileState newState(TransferManager tm, FileCache fileCache, String name, long length) {
         return new FullFileState(tm, localDirectory, fileCache, name, length, localDirectory.getDirectory().resolve(name));
+    }
+
+    // The query phases the tests have open, by the family whose shard they are on; newest first.
+    private final Map<FullFileState, Deque<PhaseHold>> openQueries = new ConcurrentHashMap<>();
+
+    /** Opens a query phase on the family's shard, as the warm search listener does. */
+    private void openQuery(FullFileState st) {
+        openQueries.computeIfAbsent(st, key -> new ConcurrentLinkedDeque<>()).push(st.tracker().acquire());
+    }
+
+    /** Ends the query phase opened last on the family's shard. */
+    private void closeQuery(FullFileState st) {
+        openQueries.get(st).pop().close();
     }
 
     /** What the trigger does: move the family BLOCK -> PROMOTING and hand it to the manager. */
@@ -1296,7 +1312,7 @@ public class WarmFullFileManagerTests extends OpenSearchTestCase {
         startPromotion(mgr, st);
         awaitState(st, FullFileState.State.FULL);
         assertEquals(0, mgr.counters().get("familiesAwaitingRelease").longValue());
-        assertTrue(st.acquireView());
+        openQuery(st);
 
         st.closeFamily();
         Map<String, Long> closed = mgr.counters();
@@ -1304,7 +1320,7 @@ public class WarmFullFileManagerTests extends OpenSearchTestCase {
         assertEquals("holding the whole file's bytes", FILE_LENGTH, closed.get("bytesAwaitingRelease").longValue());
         assertFalse(st.cleanupDone());
 
-        st.releaseView(); // the last scope ends: the deferred cleanup runs on the (inline) executor
+        closeQuery(st); // the last scope ends: the deferred cleanup runs on the (inline) executor
         assertBusy(() -> assertTrue(st.cleanupDone()), 10, TimeUnit.SECONDS);
         Map<String, Long> released = mgr.counters();
         assertEquals("released once the scope ended", 0, released.get("familiesAwaitingRelease").longValue());
@@ -1609,7 +1625,7 @@ public class WarmFullFileManagerTests extends OpenSearchTestCase {
         WarmFullFileManager mgr = newManager(fileCache, 4, 0.5);
         mgr.onExtensionsChanged(Set.of("faiss"));
         FullFileState st = promoteToFull(mgr, fileCache, name, content, tm);
-        assertTrue(st.acquireView());
+        openQuery(st);
 
         mgr.onExtensionsChanged(Set.of());
 
@@ -1621,7 +1637,7 @@ public class WarmFullFileManagerTests extends OpenSearchTestCase {
         fileCache.decRef(path);
         assertFalse(st.cleanupDone());
 
-        st.releaseView();
+        closeQuery(st);
         assertBusy(() -> {
             assertTrue(st.cleanupDone());
             assertNull(st.localMaster());
@@ -1694,7 +1710,7 @@ public class WarmFullFileManagerTests extends OpenSearchTestCase {
         FullFileState st = promoteToFull(mgr, fileCache, name, content, tm);
         int parts = partsFor(name, content.length);
         IndexInput master = st.localMaster();
-        assertTrue(st.acquireView());
+        openQuery(st);
 
         mgr.onExtensionsChanged(Set.of());
         assertEquals(FullFileState.State.BLOCK, st.state());
@@ -1710,7 +1726,7 @@ public class WarmFullFileManagerTests extends OpenSearchTestCase {
         assertEquals(1L, mgr.counters().get("promoted").longValue());
         assertEquals("no remote read", parts, reader.readCount());
 
-        st.releaseView();
+        closeQuery(st);
         assertBusy(() -> {
             assertTrue(st.cleanupDone());
             assertNull(st.localMaster());
@@ -1910,7 +1926,7 @@ public class WarmFullFileManagerTests extends OpenSearchTestCase {
         WarmFullFileManager mgr = newManager(fileCache, 4, 0.5);
         FullFileState first = promoteToFull(mgr, fileCache, name, content, tm);
         int parts = partsFor(name, content.length);
-        assertTrue(first.acquireView());
+        openQuery(first);
         IndexInput firstMapping = first.localMaster();
 
         first.closeFamily();
@@ -1926,7 +1942,7 @@ public class WarmFullFileManagerTests extends OpenSearchTestCase {
         assertEquals("both files are on disk and counted", 2L * content.length, fileCache.usage());
         assertEquals("and both hold budget", 2L * content.length, mgr.reservedBytesPerSegment()[0]);
 
-        first.releaseView();
+        closeQuery(first);
         assertBusy(() -> assertTrue(first.cleanupDone()), 30, TimeUnit.SECONDS);
 
         assertEquals("the earlier file is deleted", List.of(), retiredFiles());
@@ -2355,9 +2371,10 @@ public class WarmFullFileManagerTests extends OpenSearchTestCase {
         assertServedUnreferenced(st, fileCache, path, content);
     }
 
-    public void testPruneDropsAnIdleWholeFileAndSkipsOneAScopeReads() throws Exception {
-        // _cache/clear prunes the unreferenced entries under a shard: a whole file a search reads is referenced and
-        // kept, an idle one is dropped and its family demoted.
+    public void testPruneDropsAWholeFileUnderAQueryAndTheQueryKeepsItsMapping() throws Exception {
+        // _cache/clear prunes the unreferenced entries under a shard. A whole file is never referenced, so it is
+        // dropped even while a query phase is open on its shard: the family goes back to blocks at once, and the
+        // mapping the query may be reading stays until that phase has ended.
         String name = "_prune.faiss";
         Path path = dir.resolve(name);
         byte[] content = footeredContent(FILE_LENGTH);
@@ -2367,21 +2384,23 @@ public class WarmFullFileManagerTests extends OpenSearchTestCase {
         FullFileState st = newStateFor(tm, fileCache, name, content);
         startPromotion(mgr, st);
         awaitState(st, FullFileState.State.FULL);
-        assertTrue(st.acquireView());
+        openQuery(st);
+        IndexInput mapping = st.localMaster();
 
         fileCache.prune();
-        assertEquals("referenced by the scope: kept", FullFileState.State.FULL, st.state());
-        assertNotNull(fileCache.get(path));
-        fileCache.decRef(path);
-        assertEquals(0L, mgr.counters().get("evicted").longValue());
 
-        st.releaseView();
-        fileCache.prune();
-        assertEquals("unreferenced: dropped", FullFileState.State.BLOCK, st.state());
+        assertEquals("dropped under the query", FullFileState.State.BLOCK, st.state());
         assertNull(fileCache.get(path));
         assertEquals(1L, mgr.counters().get("evicted").longValue());
+        assertFalse("the release waits for the query", st.cleanupDone());
+        assertArrayEquals("the query's mapping still reads", content, readAll(mapping, content.length));
+        assertEquals("the budget is held until the release", (long) content.length, mgr.reservedBytesPerSegment()[0]);
+
+        closeQuery(st);
         assertBusy(() -> assertTrue(st.cleanupDone()), 10, TimeUnit.SECONDS);
+        assertNull(st.localMaster());
         assertFalse(Files.exists(path));
+        assertEquals(List.of(), retiredFiles());
         assertEquals(0L, mgr.reservedBytesPerSegment()[0]);
     }
 
@@ -2398,7 +2417,7 @@ public class WarmFullFileManagerTests extends OpenSearchTestCase {
         FullFileState st = newStateFor(tm, fileCache, name, content);
         startPromotion(mgr, st);
         awaitState(st, FullFileState.State.FULL);
-        assertTrue(st.acquireView());
+        openQuery(st);
 
         fileCache.remove(path);
 
@@ -2415,7 +2434,7 @@ public class WarmFullFileManagerTests extends OpenSearchTestCase {
         assertFalse("the file's own name is free", Files.exists(path));
         assertArrayEquals("the mapping still reads under the scope", content, readAll(st.localMaster(), content.length));
 
-        st.releaseView();
+        closeQuery(st);
         assertBusy(() -> assertTrue(st.cleanupDone()), 10, TimeUnit.SECONDS);
         assertNull(st.localMaster());
         assertEquals(0L, mgr.counters().get("familiesAwaitingRelease").longValue());

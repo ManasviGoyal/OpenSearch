@@ -20,7 +20,9 @@ import org.opensearch.test.OpenSearchTestCase;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Deque;
 import java.util.List;
 import java.util.concurrent.AbstractExecutorService;
 import java.util.concurrent.CopyOnWriteArrayList;
@@ -58,7 +60,7 @@ public class FullFileStateTests extends OpenSearchTestCase {
         assertEquals(FullFileState.State.BLOCK, st.state());
         assertNull(st.localMaster());
         assertNull(st.entry());
-        assertEquals(0, st.inFlightScopes());
+        assertEquals(0, st.tracker().openHolds());
         assertEquals(0L, st.retryAt());
     }
 
@@ -131,12 +133,12 @@ public class FullFileStateTests extends OpenSearchTestCase {
         // A demoted family still holding its mapping must not be promoted again, or the file would be mapped twice.
         Fixture f = new Fixture();
         f.goFull();
-        assertTrue(f.st.acquireView());
+        f.openQuery();
         assertTrue(f.st.demote());
         assertFalse("release pending", f.st.onAccess(Long.MAX_VALUE));
         assertEquals(FullFileState.State.BLOCK, f.st.state());
 
-        f.st.releaseView();
+        f.closeQuery();
         f.runCleanupOnce();
         assertTrue("release done", f.st.onAccess(Long.MAX_VALUE));
         assertEquals(FullFileState.State.PROMOTING, f.st.state());
@@ -147,34 +149,39 @@ public class FullFileStateTests extends OpenSearchTestCase {
         assertEquals(1_700_000_000L, st.fileLength());
     }
 
-    // ---------------- scope holds ----------------
+    // ---------------- use of the whole file ----------------
 
-    public void testAScopeHoldTakesAReferenceAndAnInFlightCountAndGivesBothBack() {
+    public void testAQueryPhaseTakesNoCacheReferenceOnTheWholeFile() {
+        // "In use" is counted on the shard's tracker, not on the file: a query phase open on the shard leaves the
+        // whole file unreferenced in the cache, so the cache can evict it like a block.
         Fixture f = new Fixture();
-        assertFalse("not FULL: nothing to hold", f.st.acquireView());
-        assertEquals(0, f.st.inFlightScopes());
-
         f.goFull();
-        assertEquals("the family holds no reference of its own", Integer.valueOf(0), f.fileCache.getRef(f.path));
-        assertTrue(f.st.acquireView());
-        assertTrue(f.st.acquireView());
-        assertEquals(2, f.st.inFlightScopes());
-        assertEquals("one reference per scope", Integer.valueOf(2), f.fileCache.getRef(f.path));
+        f.openQuery();
+        f.openQuery();
+        assertEquals(2, f.st.tracker().openHolds());
+        assertEquals("no reference per query", Integer.valueOf(0), f.fileCache.getRef(f.path));
 
-        f.st.releaseView();
-        f.st.releaseView();
-        assertEquals(0, f.st.inFlightScopes());
-        assertEquals("unreferenced between searches", Integer.valueOf(0), f.fileCache.getRef(f.path));
+        f.closeQuery();
+        f.closeQuery();
+        assertEquals(0, f.st.tracker().openHolds());
         assertTrue("nothing owed, nothing scheduled", f.executor.tasks.isEmpty());
     }
 
-    public void testAScopeHoldIsRefusedOnceTheCacheDroppedTheFile() {
+    public void testTouchRefreshesTheCacheEntryAtMostOncePerSecond() {
+        // A view refreshes the position of the whole file's cache entry, since nothing holds a reference on it; at
+        // most once a second, and without leaving a reference behind.
         Fixture f = new Fixture();
         f.goFull();
-        f.fileCache.remove(f.path); // the removal listener demotes the family
-        assertEquals(FullFileState.State.BLOCK, f.st.state());
-        assertFalse(f.st.acquireView());
-        assertEquals(0, f.st.inFlightScopes());
+        long hitsBefore = f.fileCache.stats().hitCount();
+
+        f.st.touch(10_000);
+        f.st.touch(10_500);
+        f.st.touch(10_999);
+        assertEquals("one refresh within a second", hitsBefore + 1, f.fileCache.stats().hitCount());
+
+        f.st.touch(11_000);
+        assertEquals("another once a second has passed", hitsBefore + 2, f.fileCache.stats().hitCount());
+        assertEquals("no reference is left behind", Integer.valueOf(0), f.fileCache.getRef(f.path));
     }
 
     // ---------------- removal by the cache ----------------
@@ -205,7 +212,7 @@ public class FullFileStateTests extends OpenSearchTestCase {
     public void testTheCacheDroppingAFileUnderAScopeWaitsForTheScopeToUnmap() throws Exception {
         Fixture f = new Fixture();
         f.goFull();
-        assertTrue(f.st.acquireView());
+        f.openQuery();
 
         f.fileCache.remove(f.path);
 
@@ -216,7 +223,7 @@ public class FullFileStateTests extends OpenSearchTestCase {
         assertTrue("the scope keeps the mapping", f.executor.tasks.isEmpty());
         assertSame(f.master, f.st.localMaster());
 
-        f.st.releaseView();
+        f.closeQuery();
         assertEquals("the last scope out schedules the unmap", 1, f.executor.tasks.size());
         f.runCleanupOnce();
         verify(f.master).close();
@@ -340,6 +347,19 @@ public class FullFileStateTests extends OpenSearchTestCase {
             return completion;
         }
 
+        // The query phases this fixture has open on the family's shard, newest first.
+        final Deque<PhaseHold> queries = new ArrayDeque<>();
+
+        /** Opens a query phase on the family's shard, as the warm search listener does. */
+        void openQuery() {
+            queries.push(st.tracker().acquire());
+        }
+
+        /** Ends the query phase opened last. */
+        void closeQuery() {
+            queries.pop().close();
+        }
+
         /** Runs the one cleanup task scheduled since the last call, as the pool would. */
         void runCleanupOnce() {
             assertEquals("exactly one cleanup scheduled", 1, executor.tasks.size());
@@ -383,8 +403,8 @@ public class FullFileStateTests extends OpenSearchTestCase {
     public void testCloseWhileFullWaitsForTheLastScope() throws Exception {
         Fixture f = new Fixture();
         f.goFull();
-        assertTrue(f.st.acquireView());
-        assertTrue(f.st.acquireView());
+        f.openQuery();
+        f.openQuery();
 
         f.st.closeFamily();
         assertEquals("budget held while scopes read", 0, f.budgetReleases.get());
@@ -392,10 +412,10 @@ public class FullFileStateTests extends OpenSearchTestCase {
         assertEquals("cleanup-done hook not yet run", 0, f.cleanupsDone.get());
         assertTrue("no cleanup while scopes read", f.executor.tasks.isEmpty());
 
-        f.st.releaseView();
+        f.closeQuery();
         assertTrue("one scope still reads", f.executor.tasks.isEmpty());
 
-        f.st.releaseView();
+        f.closeQuery();
         assertEquals("the last scope out schedules the cleanup", 1, f.executor.tasks.size());
         f.executor.runAll();
         verify(f.master).close();
@@ -403,22 +423,22 @@ public class FullFileStateTests extends OpenSearchTestCase {
     }
 
     public void testCloseOfADemotedFamilyWithScopesReportsAndReleasesOnTheLastOne() throws Exception {
-        // Demoted with a scope reading: the mapping and the budget are still held, so the demotion reports the scope,
-        // a close reports it again like a FULL close does, and the last scope out releases everything.
+        // Demoted with a query phase open on the shard: the mapping and the budget are still held, the demotion reports
+        // the family once, a close that follows changes nothing about that, and the last query out releases everything.
         Fixture f = new Fixture();
         f.goFull();
-        assertTrue(f.st.acquireView());
+        f.openQuery();
         assertTrue(f.st.demote());
         assertEquals("reported: demoted with scopes reading", 1, f.awaitingReports.get());
         assertTrue(f.executor.tasks.isEmpty());
 
         f.st.closeFamily();
         assertEquals(FullFileState.State.CLOSED, f.st.state());
-        assertEquals("reported: closed with scopes reading", 2, f.awaitingReports.get());
+        assertEquals("reported once for the release it waits for", 1, f.awaitingReports.get());
         assertTrue("no cleanup while the scope reads", f.executor.tasks.isEmpty());
         assertEquals(0, f.budgetReleases.get());
 
-        f.st.releaseView();
+        f.closeQuery();
         f.runCleanupOnce();
         verify(f.master).close();
         assertEquals(1, f.budgetReleases.get());
@@ -459,7 +479,7 @@ public class FullFileStateTests extends OpenSearchTestCase {
         for (int i = 0; i < 300; i++) {
             Fixture f = new Fixture();
             f.goFull();
-            assertTrue(f.st.acquireView());
+            f.openQuery();
             CyclicBarrier barrier = new CyclicBarrier(2);
             Thread closer = new Thread(() -> {
                 await(barrier);
@@ -467,7 +487,7 @@ public class FullFileStateTests extends OpenSearchTestCase {
             });
             Thread lastScope = new Thread(() -> {
                 await(barrier);
-                f.st.releaseView();
+                f.closeQuery();
             });
             closer.start();
             lastScope.start();
@@ -485,7 +505,7 @@ public class FullFileStateTests extends OpenSearchTestCase {
         for (int i = 0; i < 20_000; i++) {
             Fixture f = new Fixture();
             f.goFull();
-            assertTrue(f.st.acquireView());
+            f.openQuery();
             CyclicBarrier barrier = new CyclicBarrier(2);
             boolean[] exposed = new boolean[1];
             Thread demoter = new Thread(() -> {
@@ -512,7 +532,7 @@ public class FullFileStateTests extends OpenSearchTestCase {
         assertFalse(f.st.demote());
         assertFalse("a family that never held a mapping owes no release", f.st.isMappingReleasePending());
         f.goFull();
-        assertTrue(f.st.acquireView());
+        f.openQuery();
         assertTrue(f.st.demote());
         assertFalse("already demoted", f.st.demote());
         assertTrue("the first demotion's release is still owed", f.st.isMappingReleasePending());
@@ -581,7 +601,7 @@ public class FullFileStateTests extends OpenSearchTestCase {
         for (int i = 0; i < iterations; i++) {
             Fixture f = new Fixture();
             f.goFull();
-            assertTrue(f.st.acquireView());
+            f.openQuery();
             CyclicBarrier barrier = new CyclicBarrier(2);
             Thread demoter = new Thread(() -> {
                 await(barrier);
@@ -597,7 +617,7 @@ public class FullFileStateTests extends OpenSearchTestCase {
             closer.join();
             assertEquals(FullFileState.State.CLOSED, f.st.state());
             assertTrue("the scope keeps the mapping", f.executor.tasks.isEmpty());
-            f.st.releaseView();
+            f.closeQuery();
             if (f.executor.tasks.size() != 1) {
                 wrong++;
             }
@@ -612,18 +632,17 @@ public class FullFileStateTests extends OpenSearchTestCase {
         for (Consumer<Fixture> wayOut : waysOut) {
             Fixture f = new Fixture();
             f.goFull();
-            assertTrue(f.st.acquireView());
+            f.openQuery();
 
             wayOut.accept(f);
 
             assertNotEquals(FullFileState.State.FULL, f.st.state());
-            assertFalse("no new view", f.st.acquireView());
             assertEquals("reported: a scope still reads the mapping", 1, f.awaitingReports.get());
             assertTrue("the scope keeps the mapping", f.executor.tasks.isEmpty());
             assertSame(f.master, f.st.localMaster());
             verify(f.master, never()).close();
 
-            f.st.releaseView();
+            f.closeQuery();
             f.runCleanupOnce();
 
             verify(f.master).close();

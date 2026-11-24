@@ -32,6 +32,7 @@ import org.opensearch.storage.indexinput.SwitchableIndexInputWrapper;
 import org.opensearch.storage.prefetch.TieredStoragePrefetchSettings;
 import org.opensearch.storage.utils.DirectoryUtils;
 import org.opensearch.storage.warmfullfile.FullFileState;
+import org.opensearch.storage.warmfullfile.ShardUseTracker;
 import org.opensearch.storage.warmfullfile.WarmFullFileManager;
 import org.opensearch.storage.warmfullfile.WarmFullFileSettings;
 import org.opensearch.threadpool.ThreadPool;
@@ -65,6 +66,8 @@ public class TieredDirectory extends CompositeDirectory {
 
     private final Supplier<TieredStoragePrefetchSettings> tieredStoragePrefetchSettingsSupplier;
     private final WarmFullFileManager warmFullFileManager;
+    // The query phases open on this shard; a whole file of the shard is unmapped only once they have ended.
+    private final ShardUseTracker shardUseTracker = new ShardUseTracker();
 
     public TieredDirectory(
         Directory localDirectory,
@@ -77,6 +80,11 @@ public class TieredDirectory extends CompositeDirectory {
         super(localDirectory, remoteDirectory, fileCache, threadPool);
         this.tieredStoragePrefetchSettingsSupplier = tieredStoragePrefetchSettingsSupplier;
         this.warmFullFileManager = warmFullFileManager;
+    }
+
+    /** @return the tracker of the query phases open on this shard */
+    public ShardUseTracker shardUseTracker() {
+        return shardUseTracker;
     }
 
     @Override
@@ -346,7 +354,8 @@ public class TieredDirectory extends CompositeDirectory {
                 transferManager,
                 cacheFromRemote,
                 threadPool,
-                tieredStoragePrefetchSettingsSupplier
+                tieredStoragePrefetchSettingsSupplier,
+                shardUseTracker
             );
         }
         return new CachedSwitchableIndexInput(

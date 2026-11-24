@@ -18,6 +18,7 @@ import org.apache.lucene.store.MMapDirectory;
 import org.apache.lucene.store.MemorySegmentAccessInput;
 import org.apache.lucene.store.NoLockFactory;
 import org.opensearch.ExceptionsHelper;
+import org.opensearch.common.Nullable;
 import org.opensearch.common.annotation.ExperimentalApi;
 import org.opensearch.common.lease.Releasable;
 import org.opensearch.common.metrics.CounterMetric;
@@ -155,9 +156,8 @@ public class WarmFullFileManager {
     private final CounterMetric notMmapAfterDownload = new CounterMetric();
     // The families currently FULL on this node, so a settings change can find the ones to demote.
     private final Set<FullFileState> fullFamilies = ConcurrentHashMap.newKeySet();
-    // The search scopes running on this node's warm shards: a family hands views only inside one, and the scope holds
-    // the whole file until it ends.
-    private final FullFileSearchPhaseTracker searchPhases;
+    // The node's thread context, which carries the marker of the query phase a thread's request is inside.
+    private final ThreadContext threadContext;
     // The capacity of one file cache segment; the budget cap is the configured fraction of it.
     private final long perSegmentCapacity;
     private final CounterMetric evicted = new CounterMetric();
@@ -187,7 +187,8 @@ public class WarmFullFileManager {
      * Production constructor.
      *
      * @param fileCache              the node file cache
-     * @param threadContext          the node thread context, which carries a search's scope to the threads it forks to
+     * @param threadContext          the node thread context, which carries a query phase's marker to the threads it
+     *                               forks to
      * @param executor               the pool to run promote(), the completion handler, and the deferred cleanup on
      *                               (never the search thread, never the FileCache listener thread)
      * @param clock                  a monotonic millis clock (e.g. {@code threadPool::relativeTimeInMillis})
@@ -252,7 +253,7 @@ public class WarmFullFileManager {
         Runnable beforeDownloadHook
     ) {
         this.fileCache = fileCache;
-        this.searchPhases = new FullFileSearchPhaseTracker(threadContext);
+        this.threadContext = threadContext;
         this.beforeDownloadHook = beforeDownloadHook;
         this.executor = executor;
         this.clock = clock;
@@ -301,7 +302,7 @@ public class WarmFullFileManager {
     public void requestPromotion(FullFileState st) {
         // Only a query reads a whole file, so only a query asks for one. A fetch, a merge or a recovery reads blocks
         // and promotes nothing: a merge, for one, reads a source segment once and then deletes it.
-        if (searchPhases.inPhase() == false) {
+        if (holdFor(st) == null) {
             return;
         }
         // Checked on every access, not at open: a handle opened before the upload becomes promotable once the family
@@ -838,9 +839,14 @@ public class WarmFullFileManager {
         return false;
     }
 
-    /** @return the tracker of the search phases running on this node's warm shards, registered with every warm index */
-    public FullFileSearchPhaseTracker searchPhases() {
-        return searchPhases;
+    /**
+     * The hold of the query phase the calling thread's request is inside, if that phase is on the family's shard.
+     *
+     * @return the hold, or null outside such a phase; a read is served from the whole file only under one
+     */
+    @Nullable
+    public PhaseHold holdFor(FullFileState st) {
+        return WarmQueryPhaseListener.holdOf(threadContext, st.tracker());
     }
 
     /**
@@ -853,9 +859,9 @@ public class WarmFullFileManager {
         evicted.inc();
         evictedBytes.inc(st.fileLength());
         logger.info(
-            "the file cache dropped the whole file of [{}]; it is served from blocks and its mapping is released once {} search scope(s) end",
+            "the file cache dropped the whole file of [{}]; it is served from blocks and its mapping is released once the {} query phase(s) open on its shard end",
             st.fullFilePath(),
-            st.inFlightScopes()
+            st.tracker().openHolds()
         );
     }
 
@@ -979,10 +985,10 @@ public class WarmFullFileManager {
         fullFamilies.remove(st);
         demoted.inc();
         logger.info(
-            "demoted [{}] back to blocks: extension [{}] is no longer configured; its mapping is released once {} search scope(s) end",
+            "demoted [{}] back to blocks: extension [{}] is no longer configured; its mapping is released once the {} query phase(s) open on its shard end",
             st.fullFilePath(),
             extension,
-            st.inFlightScopes()
+            st.tracker().openHolds()
         );
     }
 

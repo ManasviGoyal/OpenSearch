@@ -50,7 +50,9 @@ import java.lang.reflect.Method;
 import java.nio.ByteBuffer;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Deque;
 import java.util.List;
 import java.util.Queue;
 import java.util.Random;
@@ -158,7 +160,15 @@ public class SwitchableIndexInputWrapperWholeFileTests extends TieredStorageBase
      * remote mode, as CachedSwitchableIndexInput does for a family created from remote.
      */
     private FullFileState stateFor(SwitchableIndexInput in, TransferManager tm, FSDirectory dir) {
-        FullFileState state = new FullFileState(tm, dir, fileCache, FILE_NAME, in.length(), getFilePath(localDirectory, FILE_NAME));
+        FullFileState state = new FullFileState(
+            tm,
+            dir,
+            fileCache,
+            FILE_NAME,
+            in.length(),
+            getFilePath(localDirectory, FILE_NAME),
+            shardTracker
+        );
         if (in.hasSwitchedToRemote()) {
             state.markRemoteMode(null);
         }
@@ -172,14 +182,34 @@ public class SwitchableIndexInputWrapperWholeFileTests extends TieredStorageBase
         return manager;
     }
 
-    /** Opens a search scope on the calling thread's context, which every manager of this class reads. */
+    // The tracker of the shard every family of this class belongs to, and the query phases each thread has open on it.
+    private final ShardUseTracker shardTracker = new ShardUseTracker();
+    private final ThreadLocal<Deque<PhaseHold>> openPhases = ThreadLocal.withInitial(ArrayDeque::new);
+
+    /**
+     * Opens a query phase on the calling thread, as the warm search listener does: a hold on the shard's tracker and
+     * the marker switched on in the thread's context, which every manager of this class reads.
+     */
     private void enterScope() {
-        new FullFileSearchPhaseTracker(threadContext).enter();
+        PhaseHold hold = shardTracker.acquire();
+        WarmPhaseMarker marker = threadContext.getTransient(WarmQueryPhaseListener.MARKER);
+        if (marker == null) {
+            marker = new WarmPhaseMarker();
+            threadContext.putTransient(WarmQueryPhaseListener.MARKER, marker);
+        }
+        marker.switchOn(hold);
+        openPhases.get().push(hold);
     }
 
-    /** Ends the scope opened by {@link #enterScope()} on this thread, giving back the whole files it holds. */
+    /** Ends the query phase opened by {@link #enterScope()} on this thread. */
     private void exitScope() {
-        new FullFileSearchPhaseTracker(threadContext).exit();
+        PhaseHold hold = openPhases.get().poll();
+        if (hold == null) {
+            return;
+        }
+        WarmPhaseMarker marker = threadContext.getTransient(WarmQueryPhaseListener.MARKER);
+        marker.switchOff(hold);
+        hold.close();
     }
 
     /** Writes a local whole-file copy whose byte at position p is p mod 251, and opens it as the family master. */
@@ -935,7 +965,8 @@ public class SwitchableIndexInputWrapperWholeFileTests extends TieredStorageBase
             downloadTransferManager(content),
             true,
             threadPool,
-            PREFETCH
+            PREFETCH,
+            shardTracker
         );
         fileCache.put(switchKey, entry);
         fileCache.decRef(switchKey);
@@ -977,7 +1008,7 @@ public class SwitchableIndexInputWrapperWholeFileTests extends TieredStorageBase
             realManager.counters().get("requested").longValue()
         );
         assertEquals("the open view keeps reading", 0, view.readByte());
-        assertEquals("the scope holds the whole file", Integer.valueOf(1), fileCache.getRef(fullPath));
+        assertEquals("the query phase holds the shard, not the file", Integer.valueOf(0), fileCache.getRef(fullPath));
         assertEquals(content.length, realManager.counters().get("reservedBytes").longValue());
 
         block.close();
@@ -1011,15 +1042,15 @@ public class SwitchableIndexInputWrapperWholeFileTests extends TieredStorageBase
     }
 
     public void testAFamilyHandsViewsOnlyInsideASearchScope() throws Exception {
-        // A clone outside a search scope reads blocks; one inside is a view, and the scope holds the whole file for
-        // the search, on the thread that opened it and on the threads it forks to.
+        // A clone outside a query phase reads blocks; one inside is a view, on the thread that opened the phase and on
+        // the threads it forks to. The phase holds the shard, not the file: no cache reference is taken.
         String name = "_gate.faiss";
         byte[] content = footeredContent();
         try (IndexOutput out = localDirectory.createOutput(name, IOContext.DEFAULT)) {
             out.writeBytes(content, content.length);
         }
         Path fullPath = getFilePath(localDirectory, name);
-        FullFileState st = new FullFileState(null, localDirectory, fileCache, name, content.length, fullPath);
+        FullFileState st = new FullFileState(null, localDirectory, fileCache, name, content.length, fullPath, shardTracker);
         AtomicLong clock = new AtomicLong(1_000);
         WarmFullFileManager realManager = new WarmFullFileManager(
             fileCache,
@@ -1043,7 +1074,8 @@ public class SwitchableIndexInputWrapperWholeFileTests extends TieredStorageBase
             downloadTransferManager(content),
             true,
             threadPool,
-            PREFETCH
+            PREFETCH,
+            shardTracker
         );
         fileCache.put(switchKey, entry);
         fileCache.decRef(switchKey);
@@ -1071,13 +1103,13 @@ public class SwitchableIndexInputWrapperWholeFileTests extends TieredStorageBase
         IndexInput forked;
         IndexInput forkedOutside;
         try {
-            realManager.searchPhases().enter();
+            enterScope();
             try {
                 inside = handle.clone();
                 // A task forked from the phase, as k-NN forks its per-leaf searches, shares the phase.
                 forked = forkPool.submit(handle::clone).get();
             } finally {
-                realManager.searchPhases().exit();
+                exitScope();
             }
             forkedOutside = forkPool.submit(handle::clone).get();
         } finally {
@@ -1087,12 +1119,12 @@ public class SwitchableIndexInputWrapperWholeFileTests extends TieredStorageBase
         assertTrue("inside a search scope: a view", inside instanceof MemorySegmentAccessInput);
         assertTrue("forked from the scope: a view", forked instanceof MemorySegmentAccessInput);
         assertTrue("forked outside a scope: blocks", forkedOutside instanceof SwitchableIndexInputWrapper);
-        assertEquals("the scope gave the whole file back", Integer.valueOf(0), fileCache.getRef(fullPath));
+        assertEquals("no reference was ever taken", Integer.valueOf(0), fileCache.getRef(fullPath));
         assertEquals("the view reads the file", content[0], inside.readByte());
 
         IOUtils.close(inside, outside, forked, forkedOutside, handle);
         st.closeFamily();
-        assertTrue("state " + st.state() + ", scopes " + st.inFlightScopes(), st.cleanupDone());
+        assertTrue("state " + st.state() + ", scopes " + st.tracker().openHolds(), st.cleanupDone());
         assertNull(st.localMaster());
         fileCache.remove(switchKey);
     }
@@ -1111,7 +1143,8 @@ public class SwitchableIndexInputWrapperWholeFileTests extends TieredStorageBase
             downloadTransferManager(content),
             true,
             threadPool,
-            PREFETCH
+            PREFETCH,
+            shardTracker
         );
         fileCache.put(switchKey, entry);
         fileCache.decRef(switchKey);
@@ -1175,7 +1208,8 @@ public class SwitchableIndexInputWrapperWholeFileTests extends TieredStorageBase
             downloadTransferManager(content),
             true,
             threadPool,
-            PREFETCH
+            PREFETCH,
+            shardTracker
         );
         fileCache.put(switchKey, entry);
         fileCache.decRef(switchKey);
@@ -1205,14 +1239,14 @@ public class SwitchableIndexInputWrapperWholeFileTests extends TieredStorageBase
         enterScope();
         IndexInput view = handle.clone();
         assertTrue(view instanceof MemorySegmentAccessInput);
-        assertEquals("the scope holds it", Integer.valueOf(1), fileCache.getRef(fullPath));
+        assertEquals("the query phase holds the shard, not the file", Integer.valueOf(0), fileCache.getRef(fullPath));
 
         // fileCache.remove ignores refcounts and closes the family (the deleteFile/prune/close path) while a view is open.
         fileCache.remove(switchKey);
         assertEquals(FullFileState.State.CLOSED, st.state());
         assertFalse("not unmapped while a scope reads", st.cleanupDone());
         assertEquals("the view keeps reading", 0, view.readByte());
-        assertEquals(Integer.valueOf(1), fileCache.getRef(fullPath));
+        assertEquals(Integer.valueOf(0), fileCache.getRef(fullPath));
 
         // The scope ends: the deferred cleanup closes the family's master.
         IndexInput master = st.localMaster();
@@ -1239,7 +1273,8 @@ public class SwitchableIndexInputWrapperWholeFileTests extends TieredStorageBase
             downloadTransferManager(content),
             true,
             threadPool,
-            PREFETCH
+            PREFETCH,
+            shardTracker
         );
         fileCache.put(switchKey, entry);
         fileCache.decRef(switchKey);
@@ -1421,7 +1456,7 @@ public class SwitchableIndexInputWrapperWholeFileTests extends TieredStorageBase
             assertTrue(viewResults.get() > 0);
             assertEquals(FullFileState.State.FULL, st.state());
             handle.close();
-            assertEquals("every worker's scope ended", 0, st.inFlightScopes());
+            assertEquals("every worker's scope ended", 0, st.tracker().openHolds());
         } finally {
             promoter.shutdown();
             assertTrue(terminate(promoter));

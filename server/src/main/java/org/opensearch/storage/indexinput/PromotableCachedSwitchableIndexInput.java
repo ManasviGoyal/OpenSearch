@@ -15,6 +15,7 @@ import org.opensearch.index.store.remote.filecache.FileCache;
 import org.opensearch.index.store.remote.utils.TransferManager;
 import org.opensearch.storage.prefetch.TieredStoragePrefetchSettings;
 import org.opensearch.storage.warmfullfile.FullFileState;
+import org.opensearch.storage.warmfullfile.ShardUseTracker;
 import org.opensearch.threadpool.ThreadPool;
 
 import java.io.IOException;
@@ -43,6 +44,35 @@ public class PromotableCachedSwitchableIndexInput extends CachedSwitchableIndexI
         ThreadPool threadPool,
         Supplier<TieredStoragePrefetchSettings> tieredStoragePrefetchSettingsSupplier
     ) throws IOException {
+        this(
+            fileCache,
+            fileName,
+            localDirectory,
+            remoteDirectory,
+            transferManager,
+            cacheFromRemote,
+            threadPool,
+            tieredStoragePrefetchSettingsSupplier,
+            new ShardUseTracker()
+        );
+    }
+
+    /**
+     * As the constructor above, for a file of a shard.
+     *
+     * @param tracker the tracker of the shard the file belongs to
+     */
+    public PromotableCachedSwitchableIndexInput(
+        FileCache fileCache,
+        String fileName,
+        FSDirectory localDirectory,
+        RemoteSegmentStoreDirectory remoteDirectory,
+        TransferManager transferManager,
+        boolean cacheFromRemote,
+        ThreadPool threadPool,
+        Supplier<TieredStoragePrefetchSettings> tieredStoragePrefetchSettingsSupplier,
+        ShardUseTracker tracker
+    ) throws IOException {
         super(
             fileCache,
             fileName,
@@ -62,7 +92,8 @@ public class PromotableCachedSwitchableIndexInput extends CachedSwitchableIndexI
             fileCache,
             fileName,
             switchableIndexInput.fileLength(),
-            getFilePath(localDirectory, fileName)
+            getFilePath(localDirectory, fileName),
+            tracker
         );
         if (cacheFromRemote) {
             // Created for a file that is already in the remote store: promotable from the start. A family created for a

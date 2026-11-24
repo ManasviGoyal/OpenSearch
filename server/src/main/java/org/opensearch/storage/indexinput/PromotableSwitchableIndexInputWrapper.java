@@ -109,23 +109,21 @@ public class PromotableSwitchableIndexInputWrapper extends SwitchableIndexInputW
 
     /**
      * A view of the family's whole-file mapping, or null when the handle must keep reading blocks: this thread is not
-     * one of a query pool, the family is not FULL, the mapping is not published, this thread is outside a query
-     * phase, the scope found the file dropped from the cache, or the mapping was closed under this read. Blocks are always valid, so every fallback is silent
+     * one of a query pool, its request is outside a query phase of the file's shard, the family is not FULL, the
+     * mapping is not published, or the mapping was closed under this read. Blocks are always valid, so every fallback is silent
      * except an unexpected I/O error, which is logged at DEBUG.
      */
     private IndexInput viewOrNull(String what, ViewCutter cutter) {
-        if (QUERY_THREAD.get() == false) {
+        // Only a read inside a query phase of this file's shard, on a thread of a query pool, is served from the whole
+        // file: the phase holds the shard, so the mapping is not closed under this view.
+        if (QUERY_THREAD.get() == false || manager == null || manager.holdFor(fullFileState) == null) {
             return null;
         }
         IndexInput master = fullFileState.localMaster(); // read the volatile once
         if (fullFileState.state() != FullFileState.State.FULL || master == null) {
             return null;
         }
-        // The scope holds a reference on the whole file and an in-flight count on the family until the search ends,
-        // so the cache does not evict the file under this view and a demotion does not unmap it.
-        if (manager == null || manager.searchPhases().holdsView(fullFileState) == false) {
-            return null;
-        }
+        fullFileState.touch(manager.relativeTimeInMillis());
         try {
             return cutter.cut(master);
         } catch (AlreadyClosedException e) {

@@ -1166,8 +1166,7 @@ public class Node implements Closeable {
                 compositeIndexSettings,
                 segmentReplicator::startReplication,
                 segmentReplicator::getSegmentReplicationStats,
-                dataFormatRegistry,
-                warmFullFileManager == null ? null : warmFullFileManager.searchPhases()
+                dataFormatRegistry
             );
 
             final IngestService ingestService = new IngestService(
