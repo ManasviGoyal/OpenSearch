@@ -67,6 +67,10 @@ import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.LongSupplier;
 import java.util.stream.Stream;
 
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.doAnswer;
+import static org.mockito.Mockito.spy;
+
 // CachedFullFileIndexInput (used by the pre-existing-entry tests) registers with a Cleaner whose daemon thread is never
 // stopped; the filter excludes that one thread from leak detection, as the other FileCache tests do.
 @ThreadLeakFilters(filters = CleanerDaemonThreadLeakFilter.class)
@@ -2441,6 +2445,77 @@ public class WarmFullFileManagerTests extends OpenSearchTestCase {
         try (Stream<Path> files = Files.list(dir)) {
             return files.map(file -> file.getFileName().toString()).filter(FileTypeUtils::isRetiredFile).sorted().toList();
         }
+    }
+
+    public void testAFailureRightAfterPublishingGivesBackTheSlotAndTheCacheReference() throws Exception {
+        // The cache throws while the entry of the family that just turned FULL is put in it, as it does when an
+        // eviction it triggers cannot delete a file. The family stays FULL and serves; the attempt's download slot
+        // and its reference on the entry are given back, so later promotions are not shut out and the file can be
+        // evicted.
+        String name = "_put_fails.faiss";
+        Path path = dir.resolve(name);
+        byte[] content = footeredContent(FILE_LENGTH);
+        FileCache fileCache = spy(newFileCache());
+        TransferManager tm = new TransferManager(new FixedContentStreamReader(content), fileCache, threadPool);
+        WarmFullFileManager mgr = newManager(fileCache, 1, 0.5);
+        FullFileState st = newStateFor(tm, fileCache, name, content);
+        doAnswer(invocation -> {
+            Object result = invocation.callRealMethod();
+            if (invocation.getArgument(1) instanceof PromotedWholeFileEntry) {
+                throw new IllegalStateException("simulated failure of an eviction listener");
+            }
+            return result;
+        }).when(fileCache).put(any(), any());
+
+        startPromotion(mgr, st);
+        awaitState(st, FullFileState.State.FULL);
+
+        assertEquals("the one slot is free again", 0L, mgr.counters().get("activeDownloads").longValue());
+        assertArrayEquals("the family serves", content, readAll(st.localMaster(), content.length));
+        assertBusy(
+            () -> assertEquals("no reference is left on the entry", Integer.valueOf(0), fileCache.getRef(path)),
+            10,
+            TimeUnit.SECONDS
+        );
+
+        // The slot is usable: another file is promoted through it.
+        FullFileState next = newStateFor(tm, fileCache, "_next.faiss", content);
+        startPromotion(mgr, next);
+        assertBusy(() -> assertEquals(FullFileState.State.FULL, next.state()), 30, TimeUnit.SECONDS);
+        assertEquals(0L, mgr.counters().get("declined.NO_SLOT").longValue());
+    }
+
+    public void testAFamilyDemotedBeforeItsEntryIsCachedLeavesNothingBehind() throws Exception {
+        // The extension is taken off the list in the instant between the family turning FULL and its entry being put
+        // in the cache. The release runs first and finds no entry; the promotion then drops the entry it puts, so no
+        // file, no cache entry and no counted bytes are left for a release that has already run.
+        String name = "_orphan.faiss";
+        Path path = dir.resolve(name);
+        byte[] content = footeredContent(FILE_LENGTH);
+        FileCache fileCache = spy(newFileCache());
+        TransferManager tm = new TransferManager(new FixedContentStreamReader(content), fileCache, threadPool);
+        WarmFullFileManager mgr = newManager(fileCache, 4, 0.5);
+        FullFileState st = newStateFor(tm, fileCache, name, content);
+        doAnswer(invocation -> {
+            if (invocation.getArgument(1) instanceof PromotedWholeFileEntry) {
+                assertEquals(FullFileState.State.FULL, st.state());
+                mgr.onExtensionsChanged(Set.of()); // demotes, and the release runs here, before the put
+                assertTrue(st.cleanupDone());
+            }
+            return invocation.callRealMethod();
+        }).when(fileCache).put(any(), any());
+
+        startPromotion(mgr, st);
+        assertBusy(() -> assertEquals(1L, mgr.counters().get("promoted").longValue()), 30, TimeUnit.SECONDS);
+        awaitPromotionThreadsIdle();
+
+        assertEquals(FullFileState.State.BLOCK, st.state());
+        assertNull("no entry is left in the cache", fileCache.get(path));
+        assertFalse("the file is deleted", Files.exists(path));
+        assertEquals(List.of(), retiredFiles());
+        assertEquals("no bytes are left counted", 0L, fileCache.usage());
+        assertEquals("the budget is back", 0L, mgr.reservedBytesPerSegment()[0]);
+        assertEquals(0L, mgr.counters().get("activeDownloads").longValue());
     }
 
     public void testABudgetShortfallEvictsAWholeFileAndTheRetryFits() throws Exception {

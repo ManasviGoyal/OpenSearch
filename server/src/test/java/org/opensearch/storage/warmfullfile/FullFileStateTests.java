@@ -184,6 +184,39 @@ public class FullFileStateTests extends OpenSearchTestCase {
         assertEquals("no reference is left behind", Integer.valueOf(0), f.fileCache.getRef(f.path));
     }
 
+    // ---------------- an entry put in the cache after the release ----------------
+
+    public void testAnEntryPutAfterTheReleaseStartedIsNotTheReleasesToDrop() throws Exception {
+        // The family turns FULL a moment before its entry is put in the cache. If it leaves FULL in between, its
+        // release may run without the entry; the family then says so, and whoever puts the entry drops it.
+        Fixture f = new Fixture();
+        assertTrue(f.st.onAccess(0));
+        PromotedWholeFileEntry entry = new PromotedWholeFileEntry(f.fileCache, f.path, f.master, f.st);
+        assertEquals(
+            FullFileState.Completion.FULL,
+            f.st.completePromotion(entry, f.executor, () -> false, f.budgetReleases::incrementAndGet, () -> {}, () -> {}, () -> {})
+        );
+        assertTrue("no release yet: the entry will be found", f.st.entryInstalled());
+
+        assertTrue(f.st.demote());
+        f.runCleanupOnce();
+        assertTrue(f.st.cleanupDone());
+
+        assertFalse("the release ran without the entry", f.st.entryInstalled());
+    }
+
+    public void testAnEntryPutBeforeTheReleaseIsDroppedByIt() throws Exception {
+        Fixture f = new Fixture();
+        f.goFull();
+        assertTrue(f.st.entryInstalled());
+
+        assertTrue(f.st.demote());
+        f.runCleanupOnce();
+
+        assertNull("dropped by the release", f.fileCache.get(f.path));
+        assertFalse(f.st.entryInstalled());
+    }
+
     // ---------------- uses before a promotion ----------------
 
     public void testAPromotionStartsOnTheThirdUseWhenEachComesAfterTheInterval() {

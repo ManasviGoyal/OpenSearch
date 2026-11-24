@@ -129,6 +129,25 @@ public class CompositeDirectoryTests extends BaseRemoteSegmentStoreDirectoryTest
         assertEquals("the lookup's reference was given back", Integer.valueOf(0), fileCache.getRef(key));
     }
 
+    public void testFileLengthOfAMissingTempFileFailsWithoutAWarningOrARemoteLookup() throws Exception {
+        // A temp file has no cache entry and no remote copy, so a missing one fails as the local directory reports it.
+        String missingTempFile = "missing_file.tmp";
+        try (MockLogAppender appender = MockLogAppender.createForLoggers(LogManager.getLogger(CompositeDirectory.class))) {
+            appender.addExpectation(
+                new MockLogAppender.UnseenEventExpectation(
+                    "no cache entry is reported",
+                    CompositeDirectory.class.getCanonicalName(),
+                    Level.WARN,
+                    "*has a cache entry but no local file*"
+                )
+            );
+            NoSuchFileException e = expectThrows(NoSuchFileException.class, () -> compositeDirectory.fileLength(missingTempFile));
+            assertTrue("the local directory's error: " + e.getMessage(), e.getMessage().contains(missingTempFile));
+            appender.assertAllExpectationsMatched();
+        }
+        assertNull("no cache entry was made", fileCache.getRef(getFilePath(missingTempFile)));
+    }
+
     public void testFileLength() throws IOException {
         // File present locally
         assertTrue(existsInLocalDirectory(FILE_PRESENT_LOCALLY));

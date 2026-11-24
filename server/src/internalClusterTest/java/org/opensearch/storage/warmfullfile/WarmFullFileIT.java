@@ -151,10 +151,10 @@ public class WarmFullFileIT extends WarmFullFileBaseIT {
         };
     }
 
-    public void testEnablingExtensionsAfterOpenAppliesOnReopen() throws Exception {
-        // The reader's handles are opened while the setting is empty, so their files have the existing entries, which
-        // cannot promote. Listing the extension afterwards applies to families created from then on: a reopen drops the
-        // entries, and the next search promotes.
+    public void testListingAnExtensionAfterOpenAppliesWithoutAReopen() throws Exception {
+        // The reader's handles are opened while the extension is not listed. A file that can be promoted gets a family
+        // all the same, which stays on blocks while the extension is off the list. Listing the extension afterwards
+        // applies to that family: the next searches promote the file, with no reopen.
         String warmNode = startCluster();
         createWarmIndex(INDEX_NAME);
         populateAndMergeToBlocks(INDEX_NAME, warmShard(INDEX_NAME, warmNode));
@@ -162,16 +162,14 @@ public class WarmFullFileIT extends WarmFullFileBaseIT {
         WarmShard warmShard = warmShard(INDEX_NAME, warmNode);
         waitForBlockMode(warmShard);
         String fdt = eligibleFdt(warmShard);
-        setFullFileExtensions(FDT_EXTENSION);
         for (int i = 0; i < 5; i++) {
             searchWithSource(INDEX_NAME);
-            assertNull("the entry created while the setting was empty carries no family", stateOf(warmShard, fdt));
+            assertEquals("not listed: the family stays on blocks", FullFileState.State.BLOCK, stateOf(warmShard, fdt));
             assertFalse(isPromoted(warmShard, fdt));
         }
+        assertEquals("nothing was requested while the extension was off", 0L, warmShard.manager.counters().get("requested").longValue());
 
-        reopenIndex(INDEX_NAME);
-        warmShard = warmShard(INDEX_NAME, warmNode);
-        waitForBlockMode(warmShard);
+        setFullFileExtensions(FDT_EXTENSION);
         searchUntilPromoted(INDEX_NAME, warmShard, fdt);
         assertEquals(FullFileState.State.FULL, stateOf(warmShard, fdt));
 
@@ -395,7 +393,7 @@ public class WarmFullFileIT extends WarmFullFileBaseIT {
             searchWithSource(SECOND_INDEX_NAME);
             assertFalse("second index promoted with the feature off", isPromoted(second, secondFdt));
             assertEquals(
-                "fdt was listed before, so its family exists and stays BLOCK",
+                "fdt can be promoted, so its family exists, and stays BLOCK while it is not listed",
                 FullFileState.State.BLOCK,
                 stateOf(second, secondFdt)
             );
@@ -439,8 +437,8 @@ public class WarmFullFileIT extends WarmFullFileBaseIT {
     /**
      * The setting is cleared, the index is closed and reopened while it is clear, and the extension is listed again:
      * the next searches promote the file with no further reopen. The family created by the reopen is promotable because
-     * the extension had been listed on the node before; the family that was demoted by the clear is gone with the reopen,
-     * so this is a fresh promotion.
+     * the file's extension can be promoted, whatever the setting lists; the family that was demoted by the clear is gone
+     * with the reopen, so this is a fresh promotion.
      */
     public void testListingExtensionAgainAfterReopenWhileClearPromotesWithoutAnotherReopen() throws Exception {
         String warmNode = startCluster();

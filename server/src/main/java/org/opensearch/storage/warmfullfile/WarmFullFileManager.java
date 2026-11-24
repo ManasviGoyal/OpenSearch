@@ -9,6 +9,7 @@ package org.opensearch.storage.warmfullfile;
 
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
+import org.apache.logging.log4j.message.ParameterizedMessage;
 import org.apache.lucene.codecs.CodecUtil;
 import org.apache.lucene.store.DataAccessHint;
 import org.apache.lucene.store.FSDirectory;
@@ -388,6 +389,8 @@ public class WarmFullFileManager {
         private IndexInput mapping;
         // Set once the family has taken the bytes, the reference and the mapping; only the slot is left to give back.
         private boolean published;
+        // The cache entry of the FULL period this attempt started, once the family has it.
+        private PromotedWholeFileEntry publishedEntry;
         private boolean reusedLocalFile;
         private long startedAt;
         // Told by the download loop, on its thread; read after the future completes. A promotion handed an entry
@@ -525,7 +528,8 @@ public class WarmFullFileManager {
                     bytesFromLocalBlocks.inc(reusedBytes.get());
                 }
                 // fetchBlobAsync releases its own reference on success; take the family's reference now.
-                if (fileCache.get(path) == null) {
+                final CachedIndexInput downloadEntry = fileCache.get(path);
+                if (downloadEntry == null) {
                     close();
                     abandonPromotion(DeclineReason.ENTRY_EVICTED, "entry evicted before FULL");
                     return;
@@ -581,10 +585,20 @@ public class WarmFullFileManager {
                 }
                 // The whole file is now an ordinary cache entry owned by the family's new entry: put under this
                 // attempt's reference, which keeps the key from eviction in between. A replacement is silent to the
-                // removal listener, so the download's own entry is closed here. The put's reference is given back with
-                // the attempt's, so the family holds none while FULL and a scope's reference is the only one.
-                closeQuietly(fileCache.put(path, st.entry()));
-                fileCache.decRef(path);
+                // removal listener, so the download's own entry is closed here. The put takes a reference of its own
+                // before it evicts for room, which is the step that can fail, so that reference is given back whether
+                // the put returns or throws; the family holds none while FULL.
+                try {
+                    fileCache.put(path, publishedEntry);
+                } finally {
+                    fileCache.decRef(path);
+                    closeQuietly(downloadEntry);
+                }
+                if (st.entryInstalled() == false) {
+                    // The family left FULL before the entry was in the cache, and its release has started without
+                    // it. Nothing else will drop this entry and delete its file, so that is done here.
+                    dropOrphanEntry(publishedEntry);
+                }
                 // Put in place now: until a query reads it, that is when it was last used.
                 st.touch(clock.getAsLong());
                 close(); // this gives back the attempt's reference and the slot
@@ -617,8 +631,10 @@ public class WarmFullFileManager {
                 demoteIfNoLongerEligible(st);
             } catch (Exception e) {
                 if (published) {
-                    // The family is FULL and serving; its reference, budget and slot are already settled.
+                    // The family is FULL and serving, and owns the budget and the mapping. What this attempt may still
+                    // hold, its slot and its reference on the cache entry, is given back here.
                     logger.warn("whole-file bookkeeping after publishing [{}] failed", path, e);
+                    close();
                     return;
                 }
                 close();
@@ -648,6 +664,7 @@ public class WarmFullFileManager {
             budgetHolders.add(st);
             Releasable reservation = bytes;
             PromotedWholeFileEntry entry = new PromotedWholeFileEntry(fileCache, path, mapping, st);
+            publishedEntry = entry;
             FullFileState.Completion completion = st.completePromotion(
                 entry,
                 executor,
@@ -715,6 +732,26 @@ public class WarmFullFileManager {
             if (holdsReference) {
                 holdsReference = false;
                 fileCache.decRef(path);
+            }
+        }
+
+        /**
+         * Drops a promoted entry whose family's release ran without it: out of the cache, if it is still the entry at
+         * the key, then its mapping closed, its file deleted and the bytes the cache counted for it given back. Each
+         * step does nothing if the release got to it first.
+         */
+        private void dropOrphanEntry(PromotedWholeFileEntry entry) {
+            try {
+                CachedIndexInput other = fileCache.compute(path, (key, existing) -> existing == entry ? null : existing);
+                if (other != null) {
+                    fileCache.decRef(path);
+                }
+                entry.closeMapping();
+            } catch (Exception e) {
+                logger.warn(() -> new ParameterizedMessage("failed to drop the whole-file entry of [{}] left by its release", path), e);
+            }
+            if (entry.deleteFile() && entry.takeOwed()) {
+                fileCache.releaseOwed(path, entry.length());
             }
         }
 
@@ -1104,11 +1141,11 @@ public class WarmFullFileManager {
 
     /**
      * This node's promotion counters, by name. Cumulative counters ({@code requested}, {@code started}, {@code reused},
-     * {@code promoted}, {@code demoted}, {@code downloadedBytes}, {@code partsFromLocalBlocks},
-     * {@code bytesFromLocalBlocks}, {@code promotedBytes}, {@code downloadMillis}, {@code declined.<reason>} with the
-     * totals {@code declined} and {@code failed}) never
+     * {@code promoted}, {@code demoted}, {@code evicted}, {@code evictedBytes}, {@code evictedForBudget},
+     * {@code downloadedBytes}, {@code partsFromLocalBlocks}, {@code bytesFromLocalBlocks}, {@code promotedBytes},
+     * {@code downloadMillis}, {@code declined.<reason>} with the totals {@code declined} and {@code failed}) never
      * decrease for the life of the node; {@code reservedBytes}, {@code activeDownloads},
-     * {@code familiesAwaitingHandleClose} and {@code bytesAwaitingHandleClose} describe the current moment. Read by
+     * {@code familiesAwaitingRelease} and {@code bytesAwaitingRelease} describe the current moment. Read by
      * tests and node-local code; it has no wire format and is not part of any API.
      *
      * @return an unmodifiable snapshot
@@ -1168,7 +1205,6 @@ public class WarmFullFileManager {
         return (length + partSize - 1) / partSize;
     }
 
-    /** Builds the download request by hand: ceil(length / partSize) parts at absolute offsets, last clipped, no zero tail. */
     /**
      * The whole-file download: block-sized, block-aligned parts written atomically, each copied from the block the
      * file cache already holds for it when there is one. Blocks carry no checksum of their own, so they are used only

@@ -523,6 +523,12 @@ class LRUCache<K, V> implements RefCountedCache<K, V> {
         final Iterator<Node<K, V>> iterator = lru.values().iterator();
         while (hasOverflowed() && iterator.hasNext()) {
             final Node<K, V> node = iterator.next();
+            // Evicting a value whose weight stays owed frees nothing until that weight is given back. Once the values
+            // still in the cache fit by themselves, the overflow is all owed weight: evicting another such value would
+            // only lose it, so it is passed over and the room is taken from values that free theirs at once.
+            if (owed > 0 && statsCounter.usage() <= capacity && owedWeigher.weightOf(node.value) > 0) {
+                continue;
+            }
             iterator.remove();
             // Notify the listener only if the entry was evicted
             data.remove(node.key, node);

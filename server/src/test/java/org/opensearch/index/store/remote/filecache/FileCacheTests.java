@@ -412,6 +412,40 @@ public class FileCacheTests extends OpenSearchTestCase {
         assertEquals(16 * MEGA_BYTES, fileCache.usage());
     }
 
+    public void testOneOverflowEvictsOneFileItsOwnerDeletesAndTakesTheRestFromOtherEntries() {
+        // Three idle files whose owners delete them are the least recently used entries, then two blocks. A new entry
+        // pushes the cache over. Evicting the first file frees nothing until its owner releases it, but its bytes are
+        // on their way back, so the other two are left alone and the room is made by evicting blocks.
+        FileCache fileCache = FileCacheFactory.createConcurrentLRUFileCache(24 * MEGA_BYTES, 1);
+        for (String name : List.of("w1", "w2", "w3")) {
+            fileCache.put(createPath(name), ownerReleasedEntry(4 * MEGA_BYTES, new AtomicBoolean()));
+            fileCache.decRef(createPath(name));
+        }
+        putAndDecRef(fileCache, 1, 4 * MEGA_BYTES);
+        putAndDecRef(fileCache, 2, 4 * MEGA_BYTES);
+        assertEquals(20 * MEGA_BYTES, fileCache.usage());
+
+        putAndDecRef(fileCache, 3, 8 * MEGA_BYTES);
+
+        assertNull("the least recently used file was evicted", fileCache.getRef(createPath("w1")));
+        assertNotNull("the second was left: the first one's bytes are on their way back", fileCache.getRef(createPath("w2")));
+        assertNotNull(fileCache.getRef(createPath("w3")));
+        assertNull("room was made from the blocks", fileCache.getRef(createPath("1")));
+        assertNull(fileCache.getRef(createPath("2")));
+        assertNotNull("the new entry stays", fileCache.getRef(createPath("3")));
+        assertEquals("two files, the new entry, and the bytes still owed", 20 * MEGA_BYTES, fileCache.usage());
+
+        // While those bytes are owed, another overflow evicts no further file of that kind.
+        putAndDecRef(fileCache, 4, 4 * MEGA_BYTES);
+        assertNotNull(fileCache.getRef(createPath("w2")));
+        assertNotNull(fileCache.getRef(createPath("w3")));
+
+        // Once they are released, the next overflow can evict the next such file.
+        fileCache.releaseOwed(createPath("w1"), 4 * MEGA_BYTES);
+        putAndDecRef(fileCache, 5, 12 * MEGA_BYTES);
+        assertNull("evicted, now that nothing is owed", fileCache.getRef(createPath("w2")));
+    }
+
     public void testUsageAtFullActiveCapacity() throws IOException {
         FileCache fileCache = FileCacheFactory.createConcurrentLRUFileCache(16 * MEGA_BYTES, 1);
         // Add some entries to cache

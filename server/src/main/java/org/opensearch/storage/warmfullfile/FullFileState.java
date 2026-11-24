@@ -128,6 +128,9 @@ public final class FullFileState {
     // Set when the family left FULL (closed, demoted or evicted by the cache) with a mapping still published: the
     // deferred unmap is owed exactly in that case.
     private volatile boolean mappingReleaseOwed;
+    // Set when this period's release has started, after which it no longer looks for the entry in the cache; guarded
+    // by releaseLock.
+    private boolean releaseStarted;
     // Set when the release could not delete the file; it is then run again by retryRelease().
     private volatile boolean releaseRetryNeeded;
     // Orders the transitions out of FULL (close, demote, eviction), the scheduling of the release and the start of a
@@ -369,6 +372,7 @@ public final class FullFileState {
             this.onCleanupDone = onCleanupDone;
             this.onEvictedByCache = onEvictedByCache;
             mappingReleaseOwed = false;
+            releaseStarted = false;
             releaseRetryNeeded = false;
             drainRequested.set(false);
             countedUses.clear();
@@ -592,6 +596,10 @@ public final class FullFileState {
         final boolean stopping = isStopping();
         releaseRetryNeeded = false;
         final PromotedWholeFileEntry current = entry;
+        synchronized (releaseLock) {
+            // From here on an entry put in the cache is not this release's to remove; see entryInstalled().
+            releaseStarted = true;
+        }
         if (stopping == false) {
             try {
                 // By value: a newer entry at the key belongs to a later family of the file and is left alone. Dropping
@@ -623,7 +631,7 @@ public final class FullFileState {
             }
             return;
         }
-        if (current.owedToCache()) {
+        if (current.takeOwed()) {
             fileCache.releaseOwed(fullFilePath, current.length());
         }
         Runnable release = budgetRelease;
@@ -634,6 +642,20 @@ public final class FullFileState {
         Runnable done = onCleanupDone;
         if (done != null) {
             done.run();
+        }
+    }
+
+    /**
+     * Called once the entry of the current FULL period has been put in the cache, which happens just after the family
+     * turns FULL. A family that left FULL in between may already have run its release, and that release found no
+     * entry to drop.
+     *
+     * @return true if the release has not started, so it will find the entry; false if the caller has to drop the
+     *         entry it just put, and delete its file, itself
+     */
+    boolean entryInstalled() {
+        synchronized (releaseLock) {
+            return releaseStarted == false;
         }
     }
 

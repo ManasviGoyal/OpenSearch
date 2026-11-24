@@ -219,6 +219,10 @@ public class CompositeDirectory extends FilterDirectory implements RemoteSyncLis
                 );
                 return localLength;
             } catch (NoSuchFileException e) {
+                if (entry == null) {
+                    // A temp file exists only locally: there is no remote copy to answer from.
+                    throw e;
+                }
                 // The remote store still has the file, so answer from there rather than fail the caller.
                 if (TransferManager.isDownloading(entry)) {
                     // Expected: the download writes elsewhere and puts the file in place when it is complete.

@@ -39,8 +39,8 @@ final class PromotedWholeFileEntry extends CachedFullFileIndexInput {
     // Where the cache moved the file when it dropped this entry; null while the entry is in the cache, and when there
     // was no file to move.
     private volatile Path retired;
-    // Set when the cache dropped this entry and so counts its bytes until they are released.
-    private volatile boolean owedToCache;
+    // Set when the cache dropped this entry and so counts its bytes; cleared by whoever gives them back.
+    private final AtomicBoolean owedToCache = new AtomicBoolean(false);
 
     /**
      * @param fileCache the node file cache
@@ -75,7 +75,7 @@ final class PromotedWholeFileEntry extends CachedFullFileIndexInput {
     @Override
     public void onFileRetired(Path retired) {
         this.retired = retired;
-        this.owedToCache = true;
+        this.owedToCache.set(true);
     }
 
     /**
@@ -89,7 +89,16 @@ final class PromotedWholeFileEntry extends CachedFullFileIndexInput {
 
     /** @return true if the cache dropped this entry and still counts its bytes */
     boolean owedToCache() {
-        return owedToCache;
+        return owedToCache.get();
+    }
+
+    /**
+     * Claims the bytes the cache still counts for this entry, for the caller to give back.
+     *
+     * @return true, once, if the cache counts them; the caller then releases them
+     */
+    boolean takeOwed() {
+        return owedToCache.compareAndSet(true, false);
     }
 
     /**

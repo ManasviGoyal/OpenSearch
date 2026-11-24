@@ -34,9 +34,9 @@ import static org.hamcrest.Matchers.greaterThan;
 import static org.hamcrest.Matchers.greaterThanOrEqualTo;
 
 /**
- * A promoted whole file as a file cache entry: the budget caps admission and the cache decides what leaves. A
- * declined promotion evicts nothing, and clearing the file cache drops a promoted file under its open reader, which
- * answers from blocks with the same results and promotes the file again on its next searches.
+ * Promoted whole files that share one cache segment's budget. A promotion that does not fit is declined and evicts the
+ * whole file used longest ago to make room, and clearing the file cache drops a promoted file under its open reader.
+ * An evicted file answers from blocks with the same results and is promoted again by its next searches.
  *
  * <p>Uses doc-values files ({@code .dvd}). The whole-file budget is one per file cache segment, and a file lands in
  * the segment its path hashes to, so the second index's merged segment is named so that its {@code .dvd} shares the
@@ -74,7 +74,7 @@ public class WarmFullFileEvictionIT extends WarmFullFileBaseIT {
             .build();
     }
 
-    public void testABudgetDeclineEvictsNothingAndClearingTheCacheDropsAWholeFileUnderItsReader() throws Exception {
+    public void testAFullBudgetEvictsTheWholeFileUsedLongestAgoAndClearingTheCacheDropsOneUnderItsReader() throws Exception {
         String warmNode = startCluster();
         createKeywordIndex(INDEX_A);
         indexKeywordDocs(INDEX_A, 0, DOCS);
@@ -109,42 +109,57 @@ public class WarmFullFileEvictionIT extends WarmFullFileBaseIT {
         assertAdmissibleLength(dvdB, lengthB, budget);
         assertThat("the budget must not hold both files", lengthA + lengthB, greaterThan(budget));
         Path wholeFileA = a.directory.getFilePath(dvdA);
+        Path wholeFileB = b.directory.getFilePath(dvdB);
         WarmFullFileManager manager = a.manager;
 
-        // A promotes. Searches on B ask for B's promotion, which the budget declines; nothing is evicted for it, since
-        // which whole files leave is the cache's decision, and A keeps serving its whole file.
+        // A promotes. B's first promotion finds the budget full: it is declined, and A, the only other whole file of
+        // the segment, is evicted to make room. B is promoted by its next searches once A's release has given the
+        // budget back.
         searchUntilPromoted(INDEX_A, a, dvdA);
         String fingerprintA = fingerprint(INDEX_A);
         FullFileState familyA = requireFamilyState(a, dvdA);
-        assertBusy(() -> {
-            searchKeywords(INDEX_B);
-            assertThat(manager.counters().get("declined.BUDGET_EXCEEDED"), greaterThanOrEqualTo(1L));
-        }, WAIT_TIMEOUT.seconds(), TimeUnit.SECONDS);
-        String fingerprintB = fingerprint(INDEX_B);
-        assertEquals(0L, manager.counters().get("evicted").longValue());
-        assertEquals(FullFileState.State.FULL, familyA.state());
-        assertEquals(FullFileState.State.BLOCK, stateOf(b, dvdB));
-        assertEquals(lengthA, manager.counters().get("reservedBytes").longValue());
-
-        // Clearing A's file cache drops its whole file, an unreferenced entry between searches: A's reads go back to
-        // blocks with the same results, its mapping is released under its open reader, and its budget goes back.
-        ClearIndicesCacheResponse cleared = client().admin().indices().prepareClearCache(INDEX_A).setFileCache(true).get();
-        assertEquals(cleared.toString(), 0, cleared.getFailedShards());
+        searchUntilPromoted(INDEX_B, b, dvdB);
+        FullFileState familyB = requireFamilyState(b, dvdB);
+        assertThat(manager.counters().get("declined.BUDGET_EXCEEDED"), greaterThanOrEqualTo(1L));
+        assertEquals(1L, manager.counters().get("evictedForBudget").longValue());
         assertEquals(1L, manager.counters().get("evicted").longValue());
         assertEquals(lengthA, manager.counters().get("evictedBytes").longValue());
         assertEquals(FullFileState.State.BLOCK, familyA.state());
         assertBusy(() -> {
             assertTrue("A's mapping released under its open reader", familyA.cleanupDone());
             assertFalse("A's whole file deleted", Files.exists(wholeFileA));
-            assertEquals("A's budget given back", 0L, manager.counters().get("reservedBytes").longValue());
+            assertEquals("only B holds budget", lengthB, manager.counters().get("reservedBytes").longValue());
         }, DOWNLOAD_TIMEOUT.seconds(), TimeUnit.SECONDS);
-        assertEquals("A answers from blocks", fingerprintA, fingerprint(INDEX_A));
-        assertEquals(fingerprintB, fingerprint(INDEX_B));
+        String fingerprintB = fingerprint(INDEX_B);
 
-        // A's next searches promote it again.
-        searchUntilPromoted(INDEX_A, a, dvdA);
+        // Clearing B's file cache drops its whole file, an unreferenced entry between searches: its mapping is released
+        // under its open reader and its budget goes back. Nothing is evicted for the budget this time.
+        ClearIndicesCacheResponse cleared = client().admin().indices().prepareClearCache(INDEX_B).setFileCache(true).get();
+        assertEquals(cleared.toString(), 0, cleared.getFailedShards());
+        assertEquals(2L, manager.counters().get("evicted").longValue());
+        assertEquals(lengthA + lengthB, manager.counters().get("evictedBytes").longValue());
+        assertEquals(1L, manager.counters().get("evictedForBudget").longValue());
+        assertEquals(FullFileState.State.BLOCK, familyB.state());
+        assertBusy(() -> {
+            assertTrue("B's mapping released under its open reader", familyB.cleanupDone());
+            assertFalse("B's whole file deleted", Files.exists(wholeFileB));
+            assertEquals("B's budget given back", 0L, manager.counters().get("reservedBytes").longValue());
+        }, DOWNLOAD_TIMEOUT.seconds(), TimeUnit.SECONDS);
+
+        // B answers the same from blocks, and its next searches promote it again.
+        assertEquals(fingerprintB, fingerprint(INDEX_B));
+        searchUntilPromoted(INDEX_B, b, dvdB);
         // The promotion is counted just after the family turns FULL.
-        assertBusy(() -> assertEquals(2L, manager.counters().get("promoted").longValue()), WAIT_TIMEOUT.seconds(), TimeUnit.SECONDS);
+        assertBusy(() -> assertEquals(3L, manager.counters().get("promoted").longValue()), WAIT_TIMEOUT.seconds(), TimeUnit.SECONDS);
+        assertEquals(fingerprintB, fingerprint(INDEX_B));
+        assertEquals(FullFileState.State.FULL, familyB.state());
+
+        // A, evicted for the budget, answers the same from blocks. Its searches ask for its whole file again, which
+        // takes the budget back from B the same way.
+        assertEquals(fingerprintA, fingerprint(INDEX_A));
+        searchUntilPromoted(INDEX_A, a, dvdA);
+        assertEquals(2L, manager.counters().get("evictedForBudget").longValue());
+        assertEquals(FullFileState.State.BLOCK, familyB.state());
         assertEquals(fingerprintA, fingerprint(INDEX_A));
         assertEquals(FullFileState.State.FULL, familyA.state());
 

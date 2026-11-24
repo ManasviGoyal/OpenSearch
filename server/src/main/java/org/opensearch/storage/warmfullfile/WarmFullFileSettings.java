@@ -79,7 +79,7 @@ public class WarmFullFileSettings {
      */
     public static final Setting<List<String>> EXTENSIONS = Setting.listSetting(
         "tiering.service.full_file.extensions",
-        List.of("faiss", "veq"),
+        List.copyOf(new TreeSet<>(PROMOTABLE_EXTENSIONS)),
         Function.identity(),
         WarmFullFileSettings::rejectExtensionsThatCannotBePromoted,
         Setting.Property.Dynamic,
@@ -267,11 +267,6 @@ public class WarmFullFileSettings {
         }
     }
 
-    /**
-     * Registers a listener for the eligible extensions, called once now with the current set and again after every
-     * update, with the normalized set.
-     * @param listener receives the eligible extensions
-     */
     /** Lower-cases, strips and drops blanks and leading dots, as {@link #getExtensions()} documents. */
     private static Set<String> normalize(List<String> values) {
         return values.stream()
@@ -282,6 +277,11 @@ public class WarmFullFileSettings {
             .collect(Collectors.toUnmodifiableSet());
     }
 
+    /**
+     * Registers a listener for the eligible extensions, called once now with the current set and again after every
+     * update, with the normalized set.
+     * @param listener receives the eligible extensions
+     */
     public void addListener(Consumer<Set<String>> listener) {
         listeners.add(listener);
         listener.accept(extensions);

@@ -601,8 +601,8 @@ public class TieredDirectoryTests extends TieredStorageBaseTestCase {
 
     public void testAPromotableFileOpenedWhileItsExtensionIsOffTheListStillGetsAPromotableFamily() throws Exception {
         // The setting has the extension off the list when the file is opened. The file still gets the promotable
-        // entry, because its extension can be promoted, so putting the extension back applies to that family without
-        // a reopen. The family stays BLOCK and submits nothing while the extension is off the list.
+        // entry, because its extension can be promoted. Its family stays BLOCK and submits nothing while the extension
+        // is off the list, and putting the extension back leaves that same family in place.
         populateData();
         ClusterSettings clusterSettings = newClusterSettings();
         WarmFullFileSettings settings = new WarmFullFileSettings(clusterSettings);
@@ -615,14 +615,15 @@ public class TieredDirectoryTests extends TieredStorageBaseTestCase {
 
         IndexInput handle = dir.openInput(FILE_PRESENT_IN_REMOTE_ONLY, IOContext.DEFAULT);
         assertEquals(PromotableCachedSwitchableIndexInput.class, entryClassOf(FILE_PRESENT_IN_REMOTE_ONLY));
-        assertEquals(FullFileState.State.BLOCK, familyStateOf(FILE_PRESENT_IN_REMOTE_ONLY).state());
+        FullFileState family = familyStateOf(FILE_PRESENT_IN_REMOTE_ONLY);
+        assertEquals(FullFileState.State.BLOCK, family.state());
         IndexInput clone = handle.clone();
         assertEquals("no promotion submitted while the extension is off the list", 0, executor.submitted.get());
-        assertEquals(FullFileState.State.BLOCK, familyStateOf(FILE_PRESENT_IN_REMOTE_ONLY).state());
+        assertEquals(FullFileState.State.BLOCK, family.state());
 
         setExtensions(clusterSettings, "si");
-        assertTrue("back on the list: the same family is eligible again", manager.isExtensionEligible("si"));
-        assertEquals(PromotableCachedSwitchableIndexInput.class, entryClassOf(FILE_PRESENT_IN_REMOTE_ONLY));
+        assertTrue("back on the list", manager.isExtensionEligible("si"));
+        assertSame("the family made while the extension was off the list", family, familyStateOf(FILE_PRESENT_IN_REMOTE_ONLY));
         IOUtils.close(clone, handle);
     }
 

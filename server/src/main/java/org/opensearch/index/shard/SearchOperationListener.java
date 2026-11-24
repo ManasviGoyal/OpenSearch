@@ -182,8 +182,9 @@ public interface SearchOperationListener {
     /**
      * Lets a listener wrap the executor that a search context's searcher hands its tasks to, such as the slices of a
      * concurrent segment search or the per-leaf tasks a query submits through the searcher's task executor. Called
-     * once per search context, before its searcher is built, and only when the searcher is given an executor. A
-     * listener that wraps must run every task it is handed, or pass it on.
+     * once for every search context that has an executor, before its searcher is built. The searcher uses the result
+     * only when concurrent segment search is on for that context. A listener that wraps must run every task it is
+     * handed, or pass it on.
      *
      * @param shard    the shard the search context is for
      * @param executor the executor the searcher would use
