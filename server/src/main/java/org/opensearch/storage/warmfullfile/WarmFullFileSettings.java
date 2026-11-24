@@ -102,6 +102,60 @@ public class WarmFullFileSettings {
         Setting.Property.NodeScope
     );
 
+    /**
+     * Node-level, dynamic setting: how many times a file must be used by queries, while it is served from blocks,
+     * before it is promoted. Together with {@link #PROMOTION_USE_INTERVAL} and {@link #PROMOTION_USE_WINDOW} it keeps
+     * one burst of queries from downloading every file it touches. One means the first use promotes.
+     */
+    public static final Setting<Integer> PROMOTION_USES = Setting.intSetting(
+        "tiering.service.full_file.promotion.uses",
+        3,
+        1,
+        Setting.Property.Dynamic,
+        Setting.Property.NodeScope
+    );
+
+    /**
+     * Node-level, dynamic setting: the least time between two uses of a file that both count toward
+     * {@link #PROMOTION_USES}. A use that comes sooner after the last counted one counts for nothing.
+     */
+    public static final Setting<TimeValue> PROMOTION_USE_INTERVAL = Setting.timeSetting(
+        "tiering.service.full_file.promotion.use_interval",
+        TimeValue.timeValueSeconds(5),
+        TimeValue.ZERO,
+        Setting.Property.Dynamic,
+        Setting.Property.NodeScope
+    );
+
+    /**
+     * Node-level, dynamic setting: the longest time the uses counted toward {@link #PROMOTION_USES} may span. Uses
+     * older than this no longer count. It has to leave room for the uses at {@link #PROMOTION_USE_INTERVAL} apart, or
+     * no file is ever promoted.
+     */
+    public static final Setting<TimeValue> PROMOTION_USE_WINDOW = Setting.timeSetting(
+        "tiering.service.full_file.promotion.use_window",
+        TimeValue.timeValueMinutes(10),
+        TimeValue.ZERO,
+        Setting.Property.Dynamic,
+        Setting.Property.NodeScope
+    );
+
+    /**
+     * Receives the rule for when a file used by queries is promoted.
+     *
+     * @opensearch.experimental
+     */
+    @ExperimentalApi
+    @FunctionalInterface
+    public interface PromotionRuleListener {
+        /**
+         * @param uses     {@link #PROMOTION_USES}
+         * @param interval {@link #PROMOTION_USE_INTERVAL}
+         * @param window   {@link #PROMOTION_USE_WINDOW}
+         */
+        void onPromotionRule(int uses, TimeValue interval, TimeValue window);
+    }
+
     private volatile Set<String> extensions;
     private final List<Consumer<Set<String>>> listeners = new CopyOnWriteArrayList<>();
     private final IntSupplier downloadPoolSize;
@@ -111,6 +165,10 @@ public class WarmFullFileSettings {
     private final List<DoubleConsumer> budgetFractionListeners = new CopyOnWriteArrayList<>();
     private volatile TimeValue evictionBackoff;
     private final List<Consumer<TimeValue>> evictionBackoffListeners = new CopyOnWriteArrayList<>();
+    private volatile int promotionUses;
+    private volatile TimeValue promotionUseInterval;
+    private volatile TimeValue promotionUseWindow;
+    private final List<PromotionRuleListener> promotionRuleListeners = new CopyOnWriteArrayList<>();
 
     /**
      * Creates a new WarmFullFileSettings instance and registers the dynamic update consumers. The download cap is not
@@ -136,6 +194,21 @@ public class WarmFullFileSettings {
         clusterSettings.addSettingsUpdateConsumer(BUDGET_FRACTION, this::setBudgetFraction);
         setEvictionBackoff(clusterSettings.get(EVICTION_BACKOFF));
         clusterSettings.addSettingsUpdateConsumer(EVICTION_BACKOFF, this::setEvictionBackoff);
+        promotionUses = clusterSettings.get(PROMOTION_USES);
+        promotionUseInterval = clusterSettings.get(PROMOTION_USE_INTERVAL);
+        promotionUseWindow = clusterSettings.get(PROMOTION_USE_WINDOW);
+        clusterSettings.addSettingsUpdateConsumer(PROMOTION_USES, value -> {
+            promotionUses = value;
+            tellPromotionRuleListeners();
+        });
+        clusterSettings.addSettingsUpdateConsumer(PROMOTION_USE_INTERVAL, value -> {
+            promotionUseInterval = value;
+            tellPromotionRuleListeners();
+        });
+        clusterSettings.addSettingsUpdateConsumer(PROMOTION_USE_WINDOW, value -> {
+            promotionUseWindow = value;
+            tellPromotionRuleListeners();
+        });
     }
 
     /**
@@ -232,6 +305,30 @@ public class WarmFullFileSettings {
 
     public TimeValue getEvictionBackoff() {
         return evictionBackoff;
+    }
+
+    /** Registers a listener for the promotion rule and calls it with the current one. */
+    public void addPromotionRuleListener(PromotionRuleListener listener) {
+        promotionRuleListeners.add(listener);
+        listener.onPromotionRule(promotionUses, promotionUseInterval, promotionUseWindow);
+    }
+
+    private void tellPromotionRuleListeners() {
+        for (PromotionRuleListener listener : promotionRuleListeners) {
+            listener.onPromotionRule(promotionUses, promotionUseInterval, promotionUseWindow);
+        }
+    }
+
+    public int getPromotionUses() {
+        return promotionUses;
+    }
+
+    public TimeValue getPromotionUseInterval() {
+        return promotionUseInterval;
+    }
+
+    public TimeValue getPromotionUseWindow() {
+        return promotionUseWindow;
     }
 
     /**

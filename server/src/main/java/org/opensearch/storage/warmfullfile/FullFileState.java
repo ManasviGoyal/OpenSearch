@@ -20,6 +20,7 @@ import org.opensearch.index.store.remote.filecache.FileCache;
 import org.opensearch.index.store.remote.utils.TransferManager;
 
 import java.nio.file.Path;
+import java.util.ArrayDeque;
 import java.util.concurrent.Executor;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -97,6 +98,12 @@ public final class FullFileState {
         CANCELLED.cancel("family closed");
     }
     private volatile long retryAt;
+    // The uses of the file while it was served from blocks that count toward its promotion, oldest first; guarded by
+    // releaseLock. Emptied when the family turns FULL.
+    private final ArrayDeque<Long> countedUses = new ArrayDeque<>();
+    // The time of the newest counted use, read without the lock to drop the uses that come too soon after it.
+    private volatile long lastCountedUseMillis = NO_USE;
+    private static final long NO_USE = Long.MIN_VALUE;
     // The cache's evictions of this family's whole file that followed one another closely, and when the wait set by
     // the last one ends; guarded by releaseLock.
     private int evictionsInARow;
@@ -224,20 +231,53 @@ public final class FullFileState {
     }
 
     /**
-     * The trigger: a clone or slice of a handle finds the family in BLOCK. Moves it to PROMOTING when the retry time has
-     * passed and no previous mapping is still waiting for its release (a promotion in that window would map the file a
-     * second time). The state and the retry time are read without the lock first, so the lock is taken only when a
-     * promotion is about to start.
-     *
-     * @param nowMillis the current monotonic time
-     * @return true if this call moved the family to PROMOTING; the caller then promotes it or abandons the promotion
+     * The trigger with no use rule: the first use of a family that may be promoted starts the promotion. See
+     * {@link #onAccess(long, int, long, long)}.
      */
     boolean onAccess(long nowMillis) {
+        return onAccess(nowMillis, 1, 0, Long.MAX_VALUE);
+    }
+
+    /**
+     * The trigger: a query's clone or slice of a handle finds the family in BLOCK, which is one use of the file. Moves
+     * the family to PROMOTING once it has been used {@code usesNeeded} times, each at least {@code minGapMillis} after
+     * the one before and all within {@code windowMillis}, so that one burst of queries does not download every file
+     * it touches. A use counts only while the family may be promoted: the retry time has passed and no previous
+     * mapping is still waiting for its release (a promotion in that window would map the file a second time). Uses
+     * already counted are kept if the promotion they start is abandoned, so its retry needs no new ones.
+     *
+     * <p>The state, the retry time and the time of the last counted use are read without the lock first, so the lock
+     * is taken only for a use that can count.
+     *
+     * @param nowMillis    the current monotonic time
+     * @param usesNeeded   how many uses start a promotion, at least one
+     * @param minGapMillis the least time between two uses that both count
+     * @param windowMillis the longest time the counted uses may span
+     * @return true if this call moved the family to PROMOTING; the caller then promotes it or abandons the promotion
+     */
+    boolean onAccess(long nowMillis, int usesNeeded, long minGapMillis, long windowMillis) {
         if (state.get() != State.BLOCK || nowMillis < retryAt) {
+            return false;
+        }
+        final long lastCounted = lastCountedUseMillis;
+        if (usesNeeded > 1 && lastCounted != NO_USE && nowMillis - lastCounted < minGapMillis) {
             return false;
         }
         synchronized (releaseLock) {
             if (state.get() != State.BLOCK || nowMillis < retryAt || isMappingReleasePending()) {
+                return false;
+            }
+            while (countedUses.isEmpty() == false && nowMillis - countedUses.peekFirst() > windowMillis) {
+                countedUses.pollFirst();
+            }
+            if (countedUses.isEmpty() || nowMillis - countedUses.peekLast() >= minGapMillis) {
+                countedUses.addLast(nowMillis);
+                lastCountedUseMillis = nowMillis;
+                while (countedUses.size() > usesNeeded) {
+                    countedUses.pollFirst();
+                }
+            }
+            if (countedUses.size() < usesNeeded) {
                 return false;
             }
             state.set(State.PROMOTING);
@@ -331,6 +371,8 @@ public final class FullFileState {
             mappingReleaseOwed = false;
             releaseRetryNeeded = false;
             drainRequested.set(false);
+            countedUses.clear();
+            lastCountedUseMillis = NO_USE;
             cleanupScheduled.set(false);
             cleanupDone = false;
             this.entry = entry;

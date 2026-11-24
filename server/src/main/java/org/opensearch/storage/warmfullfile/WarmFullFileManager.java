@@ -170,6 +170,11 @@ public class WarmFullFileManager {
     private final CounterMetric evictedForBudget = new CounterMetric();
     // The wait after the first eviction of a whole file before it can be promoted again; see EVICTION_BACKOFF.
     private volatile long evictionBackoffMillis = WarmFullFileSettings.EVICTION_BACKOFF.getDefault(Settings.EMPTY).millis();
+    // The rule for when a file used by queries is promoted; see WarmFullFileSettings.PROMOTION_USES. Until the settings
+    // say otherwise, the first use promotes.
+    private volatile int promotionUses = 1;
+    private volatile long promotionUseIntervalMillis = 0;
+    private volatile long promotionUseWindowMillis = Long.MAX_VALUE;
     // The node's thread context, which carries the marker of the query phase a thread's request is inside.
     private final ThreadContext threadContext;
     // The capacity of one file cache segment; the budget cap is the configured fraction of it.
@@ -305,10 +310,11 @@ public class WarmFullFileManager {
     }
 
     /**
-     * Called by a promotable handle on each clone or slice served from blocks. Requests a promotion at most once per
-     * BLOCK period: only for a read inside a query phase, only when the file is in remote (block) mode, only while
-     * the setting still lists its extension, and only for the thread whose {@link FullFileState#onAccess} moves the
-     * family to PROMOTING (which also enforces BLOCK, the retry time and a pending release). Does that transition
+     * Called by a promotable handle on each clone or slice served from blocks, which is one use of the file. Requests
+     * a promotion at most once per BLOCK period: only for a read inside a query phase, only when the file is in remote
+     * (block) mode, only while the setting still lists its extension, and only for the thread whose
+     * {@link FullFileState#onAccess} moves the family to PROMOTING (which also enforces BLOCK, the retry time, a
+     * pending release and the number of uses the promotion rule asks for). Does that transition
      * and an executor submit and nothing else; {@link #promote} never runs on the caller's thread.
      *
      * @param st the family's whole-file promotion state
@@ -329,7 +335,7 @@ public class WarmFullFileManager {
         if (isExtensionEligible(WarmFullFileSettings.extensionOf(st.fileName())) == false) {
             return;
         }
-        if (st.onAccess(clock.getAsLong())) {
+        if (st.onAccess(clock.getAsLong(), promotionUses, promotionUseIntervalMillis, promotionUseWindowMillis)) {
             // Once per promotion attempt, not per clone or slice. The thread name shows what started it.
             logger.debug("whole-file promotion requested for {} on thread [{}]", st.fullFilePath(), Thread.currentThread().getName());
             try {
@@ -963,6 +969,16 @@ public class WarmFullFileManager {
             st.tracker().openHolds(),
             delay
         );
+    }
+
+    /**
+     * Applies a new promotion rule from {@link WarmFullFileSettings#PROMOTION_USES} and its two companions. It applies
+     * to uses from now on; the uses a file has already counted are kept.
+     */
+    public void onPromotionRuleChanged(int uses, TimeValue interval, TimeValue window) {
+        promotionUses = Math.max(1, uses);
+        promotionUseIntervalMillis = interval.millis();
+        promotionUseWindowMillis = window.millis();
     }
 
     /**

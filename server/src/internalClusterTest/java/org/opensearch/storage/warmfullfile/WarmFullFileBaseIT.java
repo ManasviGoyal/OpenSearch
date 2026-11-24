@@ -126,6 +126,8 @@ public abstract class WarmFullFileBaseIT extends RemoteStoreBaseIntegTestCase {
             .put(Node.NODE_SEARCH_CACHE_SIZE_SETTING.getKey(), CACHE_SIZE.toString())
             // no wait after an eviction, so a test that evicts a whole file can promote it again at once
             .put(WarmFullFileSettings.EVICTION_BACKOFF.getKey(), "0s")
+            // the first use by a query promotes, so a test does not wait out the use interval for every promotion
+            .put(WarmFullFileSettings.PROMOTION_USES.getKey(), 1)
             .build();
     }
 

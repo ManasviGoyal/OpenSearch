@@ -184,6 +184,87 @@ public class FullFileStateTests extends OpenSearchTestCase {
         assertEquals("no reference is left behind", Integer.valueOf(0), f.fileCache.getRef(f.path));
     }
 
+    // ---------------- uses before a promotion ----------------
+
+    public void testAPromotionStartsOnTheThirdUseWhenEachComesAfterTheInterval() {
+        FullFileState st = newState();
+        long gap = 5_000;
+        long window = 600_000;
+
+        assertFalse("first use", st.onAccess(0, 3, gap, window));
+        assertFalse("too soon after the first: not counted", st.onAccess(1_000, 3, gap, window));
+        assertFalse("too soon after the first: not counted", st.onAccess(4_999, 3, gap, window));
+        assertFalse("second use", st.onAccess(5_000, 3, gap, window));
+        assertFalse("too soon after the second", st.onAccess(9_999, 3, gap, window));
+        assertEquals(FullFileState.State.BLOCK, st.state());
+
+        assertTrue("third use", st.onAccess(10_000, 3, gap, window));
+        assertEquals(FullFileState.State.PROMOTING, st.state());
+    }
+
+    public void testOneBurstOfUsesDoesNotStartAPromotion() {
+        // Any number of uses within the interval is one use.
+        FullFileState st = newState();
+        for (long now = 0; now < 5_000; now += 10) {
+            assertFalse(st.onAccess(now, 3, 5_000, 600_000));
+        }
+        assertEquals(FullFileState.State.BLOCK, st.state());
+    }
+
+    public void testUsesOlderThanTheWindowNoLongerCount() {
+        FullFileState st = newState();
+        long gap = 5_000;
+        long window = 600_000;
+        assertFalse(st.onAccess(0, 3, gap, window));
+        assertFalse(st.onAccess(10_000, 3, gap, window));
+
+        // The first use is more than the window old by now, so this one is the second, not the third.
+        assertFalse(st.onAccess(600_001, 3, gap, window));
+        assertTrue("the third within the window", st.onAccess(606_001, 3, gap, window));
+    }
+
+    public void testTheRetryOfAnAbandonedPromotionNeedsNoNewUses() {
+        // The uses are kept when the promotion they started is declined, so its retry starts on the next use.
+        FullFileState st = newState();
+        long gap = 5_000;
+        long window = 600_000;
+        assertFalse(st.onAccess(0, 3, gap, window));
+        assertFalse(st.onAccess(5_000, 3, gap, window));
+        assertTrue(st.onAccess(10_000, 3, gap, window));
+        assertTrue(st.abandonPromotion(15_000));
+
+        assertFalse("before the retry time", st.onAccess(14_999, 3, gap, window));
+        assertTrue("at the retry time", st.onAccess(15_000, 3, gap, window));
+    }
+
+    public void testAUseDoesNotCountWhileThePromotionIsPutOff() {
+        // A file the cache evicted waits out its backoff, and the uses in that time count for nothing.
+        FullFileState st = newState();
+        st.backOffAfterEviction(0, 30_000, 600_000, 600_000);
+        assertFalse(st.onAccess(10_000, 2, 5_000, 600_000));
+        assertFalse(st.onAccess(20_000, 2, 5_000, 600_000));
+
+        assertFalse("the first use that counts", st.onAccess(30_000, 2, 5_000, 600_000));
+        assertTrue(st.onAccess(35_000, 2, 5_000, 600_000));
+    }
+
+    public void testANewFullPeriodStartsCountingUsesAgain() throws Exception {
+        Fixture f = new Fixture();
+        assertFalse(f.st.onAccess(0, 2, 5_000, 600_000));
+        assertTrue(f.st.onAccess(5_000, 2, 5_000, 600_000));
+        assertEquals(FullFileState.Completion.FULL, f.complete(f.master));
+        assertTrue(f.st.demote());
+        f.runCleanupOnce();
+
+        assertFalse("the uses of the earlier period are gone", f.st.onAccess(10_000, 2, 5_000, 600_000));
+        assertTrue(f.st.onAccess(15_000, 2, 5_000, 600_000));
+    }
+
+    public void testWithNoUseRuleTheFirstUsePromotes() {
+        FullFileState st = newState();
+        assertTrue(st.onAccess(0));
+    }
+
     // ---------------- backoff after eviction ----------------
 
     public void testEachEvictionInARowDoublesTheWaitUpToTheCap() {

@@ -205,6 +205,47 @@ public class WarmFullFileSettingsTests extends OpenSearchTestCase {
         );
     }
 
+    public void testPromotionRuleDefaultsAndRegistration() {
+        WarmFullFileSettings settings = new WarmFullFileSettings(clusterService.getClusterSettings());
+        assertEquals(3, settings.getPromotionUses());
+        assertEquals(TimeValue.timeValueSeconds(5), settings.getPromotionUseInterval());
+        assertEquals(TimeValue.timeValueMinutes(10), settings.getPromotionUseWindow());
+        for (Setting<?> setting : List.of(
+            WarmFullFileSettings.PROMOTION_USES,
+            WarmFullFileSettings.PROMOTION_USE_INTERVAL,
+            WarmFullFileSettings.PROMOTION_USE_WINDOW
+        )) {
+            assertTrue(setting.getKey(), BUILT_IN_CLUSTER_SETTINGS.contains(setting));
+            assertTrue(setting.getKey(), setting.isDynamic());
+        }
+    }
+
+    public void testPromotionRuleListenerSeesTheCurrentRuleAndEveryUpdate() {
+        WarmFullFileSettings settings = new WarmFullFileSettings(clusterService.getClusterSettings());
+        List<String> seen = new ArrayList<>();
+        settings.addPromotionRuleListener((uses, interval, window) -> seen.add(uses + "/" + interval + "/" + window));
+        assertEquals("called once on registration with the defaults", List.of("3/5s/10m"), seen);
+
+        clusterService.getClusterSettings().applySettings(Settings.builder().put(WarmFullFileSettings.PROMOTION_USES.getKey(), 1).build());
+        clusterService.getClusterSettings()
+            .applySettings(
+                Settings.builder()
+                    .put(WarmFullFileSettings.PROMOTION_USES.getKey(), 1)
+                    .put(WarmFullFileSettings.PROMOTION_USE_INTERVAL.getKey(), "1s")
+                    .build()
+            );
+        assertEquals(List.of("3/5s/10m", "1/5s/10m", "1/1s/10m"), seen);
+        assertEquals(1, settings.getPromotionUses());
+        assertEquals(TimeValue.timeValueSeconds(1), settings.getPromotionUseInterval());
+    }
+
+    public void testPromotionUsesIsAtLeastOne() {
+        expectThrows(
+            IllegalArgumentException.class,
+            () -> WarmFullFileSettings.PROMOTION_USES.get(Settings.builder().put(WarmFullFileSettings.PROMOTION_USES.getKey(), 0).build())
+        );
+    }
+
     public void testBudgetFractionIsBoundedToTheUnitInterval() {
         expectThrows(
             IllegalArgumentException.class,

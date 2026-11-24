@@ -963,6 +963,9 @@ public final class ClusterSettings extends AbstractScopedSettings {
                 WarmFullFileSettings.MAX_CONCURRENT_DOWNLOADS,
                 WarmFullFileSettings.BUDGET_FRACTION,
                 WarmFullFileSettings.EVICTION_BACKOFF,
+                WarmFullFileSettings.PROMOTION_USES,
+                WarmFullFileSettings.PROMOTION_USE_INTERVAL,
+                WarmFullFileSettings.PROMOTION_USE_WINDOW,
                 SearchIndexPruningSettings.ENABLED,
                 SearchIndexPruningSettings.MIN_SHARDS,
                 SearchIndexPruningSettings.FIELDS

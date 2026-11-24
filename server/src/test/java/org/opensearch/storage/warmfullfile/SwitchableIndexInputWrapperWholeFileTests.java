@@ -24,6 +24,7 @@ import org.apache.lucene.store.RandomAccessInput;
 import org.opensearch.common.lucene.store.ByteArrayIndexInput;
 import org.opensearch.common.lucene.store.InputStreamIndexInput;
 import org.opensearch.common.settings.Settings;
+import org.opensearch.common.unit.TimeValue;
 import org.opensearch.common.util.concurrent.OpenSearchExecutors;
 import org.opensearch.common.util.concurrent.OpenSearchThreadPoolExecutor;
 import org.opensearch.common.util.concurrent.ThreadContext;
@@ -493,6 +494,45 @@ public class SwitchableIndexInputWrapperWholeFileTests extends TieredStorageBase
         assertEquals(FullFileState.State.PROMOTING, st.state());
         IOUtils.close(otherInputs);
         IOUtils.close(outsideClone, outsideSlice, searchClone, handle);
+    }
+
+    public void testABurstOfQueriesRequestsNoPromotionAndSpacedUsesDo() throws IOException {
+        // With the promotion rule set, a file is promoted on its third use, each at least the interval after the one
+        // before. Every clone and slice of one burst of queries together is one use, so a burst promotes nothing,
+        // and so evicts nothing to make room either.
+        SwitchableIndexInput in = remoteModeInput();
+        FullFileState st = stateFor(in);
+        AtomicLong clock = new AtomicLong(1_000);
+        RecordingExecutor exec = new RecordingExecutor();
+        WarmFullFileManager manager = manager(exec, clock);
+        manager.onPromotionRuleChanged(3, TimeValue.timeValueSeconds(5), TimeValue.timeValueMinutes(10));
+        SwitchableIndexInputWrapper handle = new PromotableSwitchableIndexInputWrapper("h", in, st, manager);
+        List<IndexInput> cut = new ArrayList<>();
+
+        for (int query = 0; query < 20; query++) {
+            enterScope();
+            cut.add(handle.clone());
+            cut.add(handle.slice("s", 0, Math.min(16, in.length())));
+            exitScope();
+            clock.addAndGet(100);
+        }
+        assertEquals("a burst is one use", 0, exec.submitted.get());
+        assertEquals(FullFileState.State.BLOCK, st.state());
+
+        clock.set(1_000 + 5_000);
+        enterScope();
+        cut.add(handle.clone());
+        exitScope();
+        assertEquals("the second use", 0, exec.submitted.get());
+
+        clock.addAndGet(5_000);
+        enterScope();
+        cut.add(handle.clone());
+        exitScope();
+        assertEquals("the third use requests the promotion", 1, exec.submitted.get());
+        assertEquals(FullFileState.State.PROMOTING, st.state());
+        IOUtils.close(cut);
+        handle.close();
     }
 
     public void testNoRequestBeforeRetryAt() throws IOException {
