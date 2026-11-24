@@ -2487,8 +2487,10 @@ public class WarmFullFileManagerTests extends OpenSearchTestCase {
         }
     }
 
-    public void testABudgetDeclineIsAnOrdinaryDeclineAndEvictsNothing() throws Exception {
-        // The budget caps admission; which whole files leave is the cache's decision.
+    public void testABudgetShortfallEvictsAWholeFileAndTheRetryFits() throws Exception {
+        // The budget has room for one whole file and holds one. A second file does not fit: the first is evicted to
+        // make room, and the second is declined for now, since the room comes back only with the release, and retried
+        // soon.
         byte[] content = footeredContent(FILE_LENGTH);
         FileCache fileCache = newFileCache();
         TransferManager tm = new TransferManager(new FixedContentStreamReader(content), fileCache, threadPool);
@@ -2502,13 +2504,107 @@ public class WarmFullFileManagerTests extends OpenSearchTestCase {
         FullFileState b = newStateFor(tm, fileCache, "_b.faiss", content);
         startPromotion(mgr, b);
         awaitState(b, FullFileState.State.BLOCK);
-        assertEquals(1L, mgr.counters().get("declined.BUDGET_EXCEEDED").longValue());
-        assertEquals("an ordinary decline", 2_000 + WarmFullFileManager.RETRY_DELAY_MILLIS, b.retryAt());
-        assertEquals(0L, mgr.counters().get("evicted").longValue());
-        assertEquals(FullFileState.State.FULL, a.state());
-        assertEquals(content.length, mgr.reservedBytesPerSegment()[0]);
 
-        // Raising the fraction admits the declined file on its retry.
+        assertEquals(1L, mgr.counters().get("declined.BUDGET_EXCEEDED").longValue());
+        assertEquals("retried soon: room is on its way", 2_000 + WarmFullFileManager.NO_SLOT_RETRY_DELAY_MILLIS, b.retryAt());
+        assertEquals("the file in the way was evicted", FullFileState.State.BLOCK, a.state());
+        assertEquals(1L, mgr.counters().get("evictedForBudget").longValue());
+        assertEquals(1L, mgr.counters().get("evicted").longValue());
+        assertBusy(() -> assertTrue(a.cleanupDone()), 10, TimeUnit.SECONDS);
+        assertEquals("its budget is back", 0L, mgr.reservedBytesPerSegment()[0]);
+
+        clock.addAndGet(WarmFullFileManager.NO_SLOT_RETRY_DELAY_MILLIS);
+        startPromotion(mgr, b);
+        awaitState(b, FullFileState.State.FULL);
+        assertEquals(content.length, mgr.reservedBytesPerSegment()[0]);
+        assertEquals("nothing more was evicted for it", 1L, mgr.counters().get("evictedForBudget").longValue());
+    }
+
+    public void testABudgetShortfallEvictsTheLeastRecentlyUsedWholeFile() throws Exception {
+        // Room for two whole files, both taken. The one a query used last stays; the other makes room for a third.
+        byte[] content = footeredContent(FILE_LENGTH);
+        FileCache fileCache = newFileCache();
+        TransferManager tm = new TransferManager(new FixedContentStreamReader(content), fileCache, threadPool);
+        AtomicLong clock = new AtomicLong(1_000);
+        WarmFullFileManager mgr = newManager(fileCache, clock::get, 4, 0.001);
+        FullFileState older = newStateFor(tm, fileCache, "_older.faiss", content);
+        startPromotion(mgr, older);
+        awaitState(older, FullFileState.State.FULL);
+        clock.addAndGet(10_000);
+        FullFileState newer = newStateFor(tm, fileCache, "_newer.faiss", content);
+        startPromotion(mgr, newer);
+        awaitState(newer, FullFileState.State.FULL);
+        // A query reads the file that was promoted first, so it is now the one used last.
+        clock.addAndGet(10_000);
+        older.touch(clock.get());
+
+        FullFileState third = newStateFor(tm, fileCache, "_third.faiss", content);
+        startPromotion(mgr, third);
+        awaitState(third, FullFileState.State.BLOCK);
+
+        assertEquals("the file used longest ago was evicted", FullFileState.State.BLOCK, newer.state());
+        assertEquals("the file used last stays", FullFileState.State.FULL, older.state());
+        assertEquals(1L, mgr.counters().get("evictedForBudget").longValue());
+    }
+
+    public void testBytesOfAPendingReleaseCountAsRoomAndNothingMoreIsEvicted() throws Exception {
+        // Room for two whole files, both taken. One is evicted by the cache while a query is open on its shard, so
+        // its release, and its budget, wait for that query. A third file does not fit yet, but enough bytes are
+        // already on their way back: the other whole file is left alone, and the third is admitted after the release.
+        byte[] content = footeredContent(FILE_LENGTH);
+        FileCache fileCache = newFileCache();
+        TransferManager tm = new TransferManager(new FixedContentStreamReader(content), fileCache, threadPool);
+        AtomicLong clock = new AtomicLong(1_000);
+        WarmFullFileManager mgr = newManager(fileCache, clock::get, 4, 0.001);
+        FullFileState leaving = newStateFor(tm, fileCache, "_leaving.faiss", content);
+        startPromotion(mgr, leaving);
+        awaitState(leaving, FullFileState.State.FULL);
+        FullFileState staying = newStateFor(tm, fileCache, "_staying.faiss", content);
+        startPromotion(mgr, staying);
+        awaitState(staying, FullFileState.State.FULL);
+        openQuery(leaving);
+        fileCache.remove(leaving.fullFilePath());
+        assertEquals(FullFileState.State.BLOCK, leaving.state());
+        assertEquals("the budget of both is still held", 2L * content.length, mgr.reservedBytesPerSegment()[0]);
+
+        FullFileState third = newStateFor(tm, fileCache, "_third.faiss", content);
+        startPromotion(mgr, third);
+        awaitState(third, FullFileState.State.BLOCK);
+
+        assertEquals("retried soon", clock.get() + WarmFullFileManager.NO_SLOT_RETRY_DELAY_MILLIS, third.retryAt());
+        assertEquals("nothing was evicted for it", 0L, mgr.counters().get("evictedForBudget").longValue());
+        assertEquals(FullFileState.State.FULL, staying.state());
+
+        closeQuery(leaving);
+        assertBusy(() -> assertTrue(leaving.cleanupDone()), 10, TimeUnit.SECONDS);
+        clock.addAndGet(WarmFullFileManager.NO_SLOT_RETRY_DELAY_MILLIS);
+        startPromotion(mgr, third);
+        awaitState(third, FullFileState.State.FULL);
+        assertEquals(FullFileState.State.FULL, staying.state());
+        assertEquals(2L * content.length, mgr.reservedBytesPerSegment()[0]);
+    }
+
+    public void testAFileLargerThanTheBudgetEvictsNothing() throws Exception {
+        // No eviction could make the file fit, so none is made: an ordinary decline. Raising the fraction admits the
+        // file on its retry.
+        byte[] content = footeredContent(FILE_LENGTH);
+        FileCache fileCache = newFileCache();
+        TransferManager tm = new TransferManager(new FixedContentStreamReader(content), fileCache, threadPool);
+        AtomicLong clock = new AtomicLong(1_000);
+        WarmFullFileManager mgr = newTightBudgetManager(fileCache, clock::get);
+        FullFileState a = newStateFor(tm, fileCache, "_a.faiss", content);
+        startPromotion(mgr, a);
+        awaitState(a, FullFileState.State.FULL);
+        mgr.onBudgetFractionChanged(0.0001); // less than one file from here on
+
+        FullFileState b = newStateFor(tm, fileCache, "_b.faiss", content);
+        startPromotion(mgr, b);
+        awaitState(b, FullFileState.State.BLOCK);
+
+        assertEquals("an ordinary decline", clock.get() + WarmFullFileManager.RETRY_DELAY_MILLIS, b.retryAt());
+        assertEquals(0L, mgr.counters().get("evictedForBudget").longValue());
+        assertEquals(FullFileState.State.FULL, a.state());
+
         mgr.onBudgetFractionChanged(1.0);
         clock.addAndGet(WarmFullFileManager.RETRY_DELAY_MILLIS);
         startPromotion(mgr, b);

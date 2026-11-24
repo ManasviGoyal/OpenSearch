@@ -391,6 +391,11 @@ public final class FullFileState {
         }
     }
 
+    /** @return when the whole file was last used by a view, or put in place (monotonic millis) */
+    long lastUseMillis() {
+        return lastTouchMillis.get();
+    }
+
     /**
      * The handle a download of this family runs under, created on first use. Once the family has closed this is an
      * already cancelled handle, so a download started under it fails before its first remote read.

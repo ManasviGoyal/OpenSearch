@@ -111,7 +111,7 @@ public class WarmFullFilePerSegmentBudgetTests extends OpenSearchTestCase {
         assertBusy(() -> assertEquals(state, st.state()), 10, TimeUnit.SECONDS);
     }
 
-    /** Promotes whole files into the target segment until the next one would exceed the budget; returns the admitted ones. */
+    /** Promotes whole files into the target segment until the next one would exceed the budget; returns them. */
     private List<FullFileState> fillTargetSegmentToBudget() throws Exception {
         int admitted = (int) (cap / FILE_LENGTH);
         assertTrue("the budget must hold at least one file", admitted >= 1);
@@ -128,16 +128,6 @@ public class WarmFullFilePerSegmentBudgetTests extends OpenSearchTestCase {
         assertEquals(admitted * FILE_LENGTH, manager.reservedBytesPerSegment()[target]);
         assertEquals("one read per part per file", admitted * (FILE_LENGTH / PART_SIZE), reader.readCount());
 
-        // The next file in the same segment would push the segment past half its capacity: declined.
-        int readsBefore = reader.readCount();
-        FullFileState declined = newState(names.get(admitted));
-        assertTrue(declined.onAccess(manager.relativeTimeInMillis()));
-        manager.promote(declined);
-        assertEquals(FullFileState.State.BLOCK, declined.state());
-        assertEquals(clock.get() + WarmFullFileManager.RETRY_DELAY_MILLIS, declined.retryAt());
-        assertNull("nothing published for the declined file", declined.localMaster());
-        assertEquals("no read for the declined file", readsBefore, reader.readCount());
-        assertNull("no cache entry for the declined file", fileCache.get(declined.fullFilePath()));
         return full;
     }
 
@@ -159,6 +149,39 @@ public class WarmFullFilePerSegmentBudgetTests extends OpenSearchTestCase {
             fileCache.decRef(st.fullFilePath());
             assertEquals("the family holds no reference", Integer.valueOf(0), fileCache.getRef(st.fullFilePath()));
         }
+    }
+
+    public void testTheNextFileInAFullSegmentMakesRoomByEvictingTheLeastRecentlyUsedOne() throws Exception {
+        // The next file in the same segment would push the segment past half its capacity. It is declined for now,
+        // nothing is read for it, and the whole file used longest ago is evicted to make room for its retry.
+        List<FullFileState> full = fillTargetSegmentToBudget();
+        clock.addAndGet(5_000);
+        for (FullFileState used : full.subList(1, full.size())) {
+            used.touch(clock.get());
+        }
+        String name = wholeFileNamesInTargetSegment(full.size() + 1).get(full.size());
+        int readsBefore = reader.readCount();
+
+        FullFileState next = newState(name);
+        assertTrue(next.onAccess(manager.relativeTimeInMillis()));
+        manager.promote(next);
+
+        assertEquals(FullFileState.State.BLOCK, next.state());
+        assertEquals(clock.get() + WarmFullFileManager.NO_SLOT_RETRY_DELAY_MILLIS, next.retryAt());
+        assertNull("nothing published for the declined file", next.localMaster());
+        assertEquals("no read for the declined file", readsBefore, reader.readCount());
+        assertNull("no cache entry for the declined file", fileCache.get(next.fullFilePath()));
+        assertEquals("the file used longest ago left", FullFileState.State.BLOCK, full.get(0).state());
+        for (FullFileState used : full.subList(1, full.size())) {
+            assertEquals(FullFileState.State.FULL, used.state());
+        }
+        assertEquals(1L, manager.counters().get("evictedForBudget").longValue());
+
+        clock.addAndGet(WarmFullFileManager.NO_SLOT_RETRY_DELAY_MILLIS);
+        assertTrue(next.onAccess(manager.relativeTimeInMillis()));
+        manager.promote(next);
+        awaitState(next, FullFileState.State.FULL);
+        assertTrue("whole-file bytes stay within the budget", manager.reservedBytesPerSegment()[target] <= cap);
     }
 
     public void testBlockFetchIntoFullBudgetSegmentStillSucceeds() throws Exception {

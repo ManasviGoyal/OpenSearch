@@ -42,6 +42,7 @@ import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.Comparator;
 import java.util.EnumMap;
 import java.util.EnumSet;
 import java.util.LinkedHashMap;
@@ -162,6 +163,11 @@ public class WarmFullFileManager {
     private final CounterMetric notMmapAfterDownload = new CounterMetric();
     // The families currently FULL on this node, so a settings change can find the ones to demote.
     private final Set<FullFileState> fullFamilies = ConcurrentHashMap.newKeySet();
+    // The families whose whole file holds budget: from the publish until the release has given the bytes back. The
+    // FULL ones are the files an admission may evict to make room; the others are already on their way out.
+    private final Set<FullFileState> budgetHolders = ConcurrentHashMap.newKeySet();
+    // Whole files evicted by an admission that did not fit its segment's budget.
+    private final CounterMetric evictedForBudget = new CounterMetric();
     // The wait after the first eviction of a whole file before it can be promoted again; see EVICTION_BACKOFF.
     private volatile long evictionBackoffMillis = WarmFullFileSettings.EVICTION_BACKOFF.getDefault(Settings.EMPTY).millis();
     // The node's thread context, which carries the marker of the query phase a thread's request is inside.
@@ -422,8 +428,19 @@ public class WarmFullFileManager {
                 holdsSlot = true;
                 bytes = budget.reserve(segment, length);
                 if (bytes == null) {
+                    // The budget comes back only once an evicted file's release has deleted it, so this attempt is
+                    // declined either way; with room on its way the next one comes soon.
+                    final boolean roomIsComing = makeRoom(segment, length);
                     close();
-                    abandonPromotion(DeclineReason.BUDGET_EXCEEDED, "per-segment whole-file budget exceeded");
+                    if (roomIsComing) {
+                        abandonPromotion(
+                            DeclineReason.BUDGET_EXCEEDED,
+                            "per-segment whole-file budget exceeded; room is being made",
+                            clock.getAsLong() + NO_SLOT_RETRY_DELAY_MILLIS
+                        );
+                    } else {
+                        abandonPromotion(DeclineReason.BUDGET_EXCEEDED, "per-segment whole-file budget exceeded");
+                    }
                     return;
                 }
 
@@ -568,6 +585,8 @@ public class WarmFullFileManager {
                 // the attempt's, so the family holds none while FULL and a scope's reference is the only one.
                 closeQuietly(fileCache.put(path, st.entry()));
                 fileCache.decRef(path);
+                // Put in place now: until a query reads it, that is when it was last used.
+                st.touch(clock.getAsLong());
                 close(); // this gives back the attempt's reference and the slot
                 final long elapsedMillis = clock.getAsLong() - startedAt;
                 promoted.inc();
@@ -627,6 +646,7 @@ public class WarmFullFileManager {
             // Registered before the publish: a close right after it schedules the teardown, which must find the family
             // in the registry to take it out again.
             fullFamilies.add(st);
+            budgetHolders.add(st);
             Releasable reservation = bytes;
             PromotedWholeFileEntry entry = new PromotedWholeFileEntry(fileCache, path, mapping, st);
             FullFileState.Completion completion = st.completePromotion(
@@ -638,6 +658,7 @@ public class WarmFullFileManager {
                 () -> {
                     awaitingRelease.remove(st);
                     fullFamilies.remove(st);
+                    budgetHolders.remove(st);
                 },
                 () -> onEvictedByCache(st)
             );
@@ -651,6 +672,7 @@ public class WarmFullFileManager {
                 case NOT_PROMOTING -> {
                     // The family closed during the download or the publish; nothing was installed.
                     fullFamilies.remove(st);
+                    budgetHolders.remove(st);
                     abandonPromotion(DeclineReason.FAMILY_CLOSED, "family closed during publish");
                     return false;
                 }
@@ -855,6 +877,68 @@ public class WarmFullFileManager {
     @Nullable
     public PhaseHold holdFor(FullFileState st) {
         return WarmQueryPhaseListener.holdOf(threadContext, st.tracker());
+    }
+
+    /**
+     * Makes room in a cache segment's whole-file budget for a file of {@code length} bytes that did not fit: evicts
+     * the least recently used whole files of the segment until enough bytes are on their way back. The bytes of files
+     * that have already left FULL and whose release has not finished count as on their way back, so the retry of an
+     * admission that made room does not evict again for the same shortfall. Nothing is evicted when no eviction could
+     * make the file fit.
+     *
+     * @return true if enough bytes are on their way back for a later attempt to fit
+     */
+    private boolean makeRoom(int segment, long length) {
+        final long shortfall = budget.reserved(segment) + length - budget.capPerSegment();
+        if (shortfall <= 0) {
+            return true; // room was made between the failed reservation and here
+        }
+        long comingBack = 0;
+        long evictableBytes = 0;
+        final List<FullFileState> evictable = new ArrayList<>();
+        for (FullFileState holder : budgetHolders) {
+            if (fileCache.segmentIndexFor(holder.fullFilePath()) != segment) {
+                continue;
+            }
+            if (holder.state() == FullFileState.State.FULL) {
+                evictable.add(holder);
+                evictableBytes += holder.fileLength();
+            } else if (holder.cleanupDone() == false) {
+                comingBack += holder.fileLength();
+            }
+        }
+        if (comingBack >= shortfall) {
+            return true;
+        }
+        if (comingBack + evictableBytes < shortfall) {
+            return false; // the rest is held by downloads in flight, or the file is larger than the budget
+        }
+        evictable.sort(Comparator.comparingLong(FullFileState::lastUseMillis));
+        for (FullFileState candidate : evictable) {
+            if (comingBack >= shortfall) {
+                break;
+            }
+            if (evictForBudget(candidate)) {
+                comingBack += candidate.fileLength();
+            }
+        }
+        return comingBack >= shortfall;
+    }
+
+    /** Drops a FULL family's whole file from the cache, as the cache's own eviction would; true if the family left FULL. */
+    private boolean evictForBudget(FullFileState st) {
+        final PromotedWholeFileEntry entry = st.entry();
+        final Path key = st.fullFilePath();
+        // By value: an entry of another family at the key is left alone.
+        CachedIndexInput other = fileCache.compute(key, (path, existing) -> existing == entry ? null : existing);
+        if (other != null) {
+            fileCache.decRef(key);
+        }
+        if (st.state() == FullFileState.State.FULL) {
+            return false;
+        }
+        evictedForBudget.inc();
+        return true;
     }
 
     /**
@@ -1067,6 +1151,7 @@ public class WarmFullFileManager {
         counters.put("demoted", demoted.count());
         counters.put("evicted", evicted.count());
         counters.put("evictedBytes", evictedBytes.count());
+        counters.put("evictedForBudget", evictedForBudget.count());
         counters.put("blocksRemoved", blocksRemoved.count());
         counters.put("downloadedBytes", downloadedBytes.count());
         counters.put("partsFromLocalBlocks", partsFromLocalBlocks.count());

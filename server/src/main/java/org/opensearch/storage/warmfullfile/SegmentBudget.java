@@ -54,6 +54,11 @@ final class SegmentBudget {
         }
     }
 
+    /** @return the whole-file bytes reserved in {@code segment} now */
+    long reserved(int segment) {
+        return reserved.get(segment);
+    }
+
     /** @return the most whole-file bytes one segment may hold */
     long capPerSegment() {
         return capPerSegment;
