@@ -150,6 +150,56 @@ public class WarmFullFileSettingsTests extends OpenSearchTestCase {
         assertEquals("clearing the setting reverts to the default set", Set.of("faiss", "veq"), seen.get(seen.size() - 1));
     }
 
+    public void testOnlyTheKnnGraphAndCodeFilesCanBePromoted() {
+        assertEquals(Set.of("faiss", "veq"), WarmFullFileSettings.PROMOTABLE_EXTENSIONS);
+        assertTrue(WarmFullFileSettings.isPromotable("faiss"));
+        assertTrue(WarmFullFileSettings.isPromotable("veq"));
+        assertFalse(WarmFullFileSettings.isPromotable("fdt"));
+        assertFalse(WarmFullFileSettings.isPromotable(null));
+    }
+
+    public void testTheSettingCanNarrowThePromotableExtensionsAndNotAddToThem() {
+        // A list that names an extension which cannot be promoted is rejected as a whole, and what was in force stays.
+        WarmFullFileSettings settings = new WarmFullFileSettings(clusterService.getClusterSettings());
+        String key = WarmFullFileSettings.EXTENSIONS.getKey();
+
+        clusterService.getClusterSettings().applySettings(Settings.builder().putList(key, List.of("faiss")).build());
+        assertEquals("narrowed", Set.of("faiss"), settings.getExtensions());
+
+        IllegalArgumentException e = expectThrows(
+            IllegalArgumentException.class,
+            () -> WarmFullFileSettings.EXTENSIONS.get(Settings.builder().putList(key, List.of("veq", ".FDT", "dvd")).build())
+        );
+        assertTrue(e.getMessage(), e.getMessage().contains("[dvd, fdt]"));
+        assertTrue(e.getMessage(), e.getMessage().contains("[faiss, veq]"));
+        expectThrows(
+            IllegalArgumentException.class,
+            () -> clusterService.getClusterSettings().applySettings(Settings.builder().putList(key, List.of("fdt")).build())
+        );
+        assertEquals("the rejected list changed nothing", Set.of("faiss"), settings.getExtensions());
+    }
+
+    public void testATestCanAddPromotableExtensionsAndRestoreTheRealOnes() {
+        try {
+            PromotableExtensionsOverride.use("fdt");
+            assertTrue(WarmFullFileSettings.isPromotable("fdt"));
+            assertTrue("the real ones stay", WarmFullFileSettings.isPromotable("faiss"));
+            WarmFullFileSettings settings = new WarmFullFileSettings(clusterService.getClusterSettings());
+            clusterService.getClusterSettings()
+                .applySettings(Settings.builder().putList(WarmFullFileSettings.EXTENSIONS.getKey(), List.of("fdt", "faiss")).build());
+            assertEquals(Set.of("fdt", "faiss"), settings.getExtensions());
+        } finally {
+            PromotableExtensionsOverride.restore();
+        }
+        assertFalse(WarmFullFileSettings.isPromotable("fdt"));
+        expectThrows(
+            IllegalArgumentException.class,
+            () -> WarmFullFileSettings.EXTENSIONS.get(
+                Settings.builder().putList(WarmFullFileSettings.EXTENSIONS.getKey(), List.of("fdt")).build()
+            )
+        );
+    }
+
     public void testBudgetFractionDefaultsToHalfAndIsRegistered() {
         WarmFullFileSettings settings = new WarmFullFileSettings(clusterService.getClusterSettings());
         assertEquals(0.5, settings.getBudgetFraction(), 0.0);

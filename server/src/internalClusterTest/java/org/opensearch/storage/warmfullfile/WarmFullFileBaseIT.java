@@ -47,6 +47,8 @@ import org.opensearch.storage.indexinput.PromotableCachedSwitchableIndexInput;
 import org.opensearch.storage.utils.DirectoryUtils;
 import org.opensearch.test.InternalTestCluster;
 import org.opensearch.test.OpenSearchIntegTestCase;
+import org.junit.AfterClass;
+import org.junit.BeforeClass;
 
 import java.io.IOException;
 import java.nio.file.Files;
@@ -117,6 +119,20 @@ public abstract class WarmFullFileBaseIT extends RemoteStoreBaseIntegTestCase {
     @Override
     protected Settings featureFlagSettings() {
         return Settings.builder().put(FeatureFlags.WRITABLE_WARM_INDEX_EXPERIMENTAL_FLAG, true).build();
+    }
+
+    /**
+     * The server cannot write k-NN graph and code files, so these tests promote stored-fields and doc-values files
+     * instead. The override applies to every node the suite starts, restarted ones included.
+     */
+    @BeforeClass
+    public static void makeTestExtensionsPromotable() {
+        WarmFullFileSettings.setPromotableExtensions(Set.of("fdt", "dvd", "faiss", "veq"));
+    }
+
+    @AfterClass
+    public static void restorePromotableExtensions() {
+        WarmFullFileSettings.setPromotableExtensions(null);
     }
 
     @Override

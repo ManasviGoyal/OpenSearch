@@ -36,8 +36,10 @@ import org.opensearch.storage.indexinput.SwitchableIndexInput;
 import org.opensearch.storage.indexinput.SwitchableIndexInputWrapper;
 import org.opensearch.storage.prefetch.TieredStoragePrefetchSettings;
 import org.opensearch.storage.warmfullfile.FullFileState;
+import org.opensearch.storage.warmfullfile.PromotableExtensionsOverride;
 import org.opensearch.storage.warmfullfile.WarmFullFileManager;
 import org.opensearch.storage.warmfullfile.WarmFullFileSettings;
+import org.junit.After;
 import org.junit.Before;
 
 import java.io.IOException;
@@ -84,6 +86,11 @@ public class TieredDirectoryTests extends TieredStorageBaseTestCase {
     private static final String NON_EXISTENT_FILE = "non_existent_file";
     private static final String TEMP_FILE = "temp_file.tmp";
 
+    @After
+    public void restorePromotableExtensions() {
+        PromotableExtensionsOverride.restore();
+    }
+
     @Before
     public void setup() throws IOException {
         setupRemoteSegmentStoreDirectory();
@@ -93,8 +100,9 @@ public class TieredDirectoryTests extends TieredStorageBaseTestCase {
         removeExtraFSFiles();
         int concurrencyLevel = randomIntBetween(1, 2);
         fileCache = FileCacheFactory.createConcurrentLRUFileCache(FILE_CACHE_CAPACITY, concurrencyLevel);
-        // The fixture files' extensions are listed, so their entries carry a family; the files fit in one block, so no
-        // handle is eligible and nothing promotes.
+        // The fixture files' extensions are made promotable and listed, so their entries carry a family; the files fit
+        // in one block, so no handle is eligible and nothing promotes.
+        PromotableExtensionsOverride.use("cfe", "si");
         WarmFullFileManager manager = recordingManager(new RecordingExecutor());
         manager.onExtensionsChanged(Set.of("cfe", "si"));
         tieredDirectory = new TieredDirectory(
@@ -564,10 +572,10 @@ public class TieredDirectoryTests extends TieredStorageBaseTestCase {
         );
     }
 
-    public void testExtensionUpdateAppliesToFamiliesCreatedAfterwards() throws Exception {
-        // The entry type is chosen when the family is created: a file whose extension is not listed gets the existing
-        // entry, and listing the extension later leaves a live entry as it is. A family created after the update is
-        // promotable, but the fixture file fits in one block, so its handles still stay on blocks and submit nothing.
+    public void testAFileThatCannotBePromotedGetsTheExistingEntryWhateverTheSettingLists() throws Exception {
+        // Which files can be promoted is fixed, and the setting can only narrow it: a list naming another extension is
+        // rejected. A file of such an extension gets the existing entry, with no family.
+        PromotableExtensionsOverride.use("cfe");
         populateData();
         ClusterSettings clusterSettings = newClusterSettings();
         WarmFullFileSettings settings = new WarmFullFileSettings(clusterSettings);
@@ -575,41 +583,26 @@ public class TieredDirectoryTests extends TieredStorageBaseTestCase {
         WarmFullFileManager manager = recordingManager(executor);
         settings.addListener(manager::onExtensionsChanged);
         TieredDirectory dir = directoryWith(manager);
-        long length = remoteSegmentStoreDirectory.fileLength(FILE_PRESENT_IN_REMOTE_ONLY);
-        assertTrue("fixture file must fit in one block", length > 0 && length <= ONE_BLOCK_BYTES);
 
-        IndexInput before = dir.openInput(FILE_PRESENT_IN_REMOTE_ONLY, IOContext.DEFAULT);
+        expectThrows(IllegalArgumentException.class, () -> setExtensions(clusterSettings, "si", "cfe"));
+        setExtensions(clusterSettings, "cfe");
+        assertFalse("not promotable, so not eligible", manager.isExtensionEligible("si"));
+        assertTrue(manager.isExtensionEligible("cfe"));
+
+        IndexInput handle = dir.openInput(FILE_PRESENT_IN_REMOTE_ONLY, IOContext.DEFAULT);
         assertEquals(CachedSwitchableIndexInput.class, entryClassOf(FILE_PRESENT_IN_REMOTE_ONLY));
-        setExtensions(clusterSettings, "si");
-        assertTrue(manager.isExtensionEligible("si"));
-        IndexInput after = dir.openInput(FILE_PRESENT_IN_REMOTE_ONLY, IOContext.DEFAULT);
-        assertEquals("the live entry is kept", CachedSwitchableIndexInput.class, entryClassOf(FILE_PRESENT_IN_REMOTE_ONLY));
         assertNull("the existing entry carries no family", familyStateOf(FILE_PRESENT_IN_REMOTE_ONLY));
-        assertEquals(SwitchableIndexInputWrapper.class, before.getClass());
-        assertEquals(SwitchableIndexInputWrapper.class, after.getClass());
-        IOUtils.close(before, after);
-
-        // Dropping the entry, as a shard close does, and opening again creates a promotable family.
-        fileCache.remove(getFilePathSwitchable(localDirectory, FILE_PRESENT_IN_REMOTE_ONLY));
-        IndexInput recreated = dir.openInput(FILE_PRESENT_IN_REMOTE_ONLY, IOContext.DEFAULT);
-        assertEquals(PromotableCachedSwitchableIndexInput.class, entryClassOf(FILE_PRESENT_IN_REMOTE_ONLY));
-        assertTrue(getSwitchableIndexInputFromWrapper(recreated).hasSwitchedToRemote());
-        assertEquals(FullFileState.State.BLOCK, familyStateOf(FILE_PRESENT_IN_REMOTE_ONLY).state());
-        assertEquals("one block or less: the existing wrapper", SwitchableIndexInputWrapper.class, recreated.getClass());
-        IndexInput clone = recreated.clone();
-        IndexInput slice = recreated.slice("s", 0, Math.min(16, length));
+        assertEquals(SwitchableIndexInputWrapper.class, handle.getClass());
+        IndexInput clone = handle.clone();
         assertEquals(SwitchableIndexInputWrapper.class, clone.getClass());
-        assertEquals(SwitchableIndexInputWrapper.class, slice.getClass());
-        assertEquals("no promotion submitted by any handle", 0, executor.submitted.get());
-        assertEquals(FullFileState.State.BLOCK, familyStateOf(FILE_PRESENT_IN_REMOTE_ONLY).state());
-        IOUtils.close(slice, clone, recreated);
+        assertEquals("no promotion submitted", 0, executor.submitted.get());
+        IOUtils.close(clone, handle);
     }
 
-    public void testAnExtensionListedBeforeKeepsCreatingPromotableFamiliesWhileClear() throws Exception {
-        // Listing an extension and clearing it again: a file of that extension opened while the list is clear still gets
-        // the promotable entry, because the extension has been listed on this node, so listing it again applies to that
-        // family without a reopen. The family stays BLOCK and submits nothing while the list is clear. A file whose
-        // extension was never listed still gets the existing entry.
+    public void testAPromotableFileOpenedWhileItsExtensionIsOffTheListStillGetsAPromotableFamily() throws Exception {
+        // The setting has the extension off the list when the file is opened. The file still gets the promotable
+        // entry, because its extension can be promoted, so putting the extension back applies to that family without
+        // a reopen. The family stays BLOCK and submits nothing while the extension is off the list.
         populateData();
         ClusterSettings clusterSettings = newClusterSettings();
         WarmFullFileSettings settings = new WarmFullFileSettings(clusterSettings);
@@ -617,30 +610,27 @@ public class TieredDirectoryTests extends TieredStorageBaseTestCase {
         WarmFullFileManager manager = recordingManager(executor);
         settings.addListener(manager::onExtensionsChanged);
         TieredDirectory dir = directoryWith(manager);
-        setExtensions(clusterSettings, "si");
         setExtensions(clusterSettings);
         assertFalse(manager.isExtensionEligible("si"));
-        assertTrue(manager.hasBeenEligible("si"));
-        assertFalse(manager.hasBeenEligible("cfe"));
 
         IndexInput handle = dir.openInput(FILE_PRESENT_IN_REMOTE_ONLY, IOContext.DEFAULT);
         assertEquals(PromotableCachedSwitchableIndexInput.class, entryClassOf(FILE_PRESENT_IN_REMOTE_ONLY));
         assertEquals(FullFileState.State.BLOCK, familyStateOf(FILE_PRESENT_IN_REMOTE_ONLY).state());
         IndexInput clone = handle.clone();
-        assertEquals("no promotion submitted while the list is clear", 0, executor.submitted.get());
+        assertEquals("no promotion submitted while the extension is off the list", 0, executor.submitted.get());
         assertEquals(FullFileState.State.BLOCK, familyStateOf(FILE_PRESENT_IN_REMOTE_ONLY).state());
-        IOUtils.close(clone, handle);
 
-        String neverListed = "_3.cfe";
-        dir.createOutput(neverListed, IOContext.DEFAULT).close();
-        assertEquals(CachedSwitchableIndexInput.class, entryClassOf(neverListed));
-        assertNull("the existing entry carries no family", familyStateOf(neverListed));
+        setExtensions(clusterSettings, "si");
+        assertTrue("back on the list: the same family is eligible again", manager.isExtensionEligible("si"));
+        assertEquals(PromotableCachedSwitchableIndexInput.class, entryClassOf(FILE_PRESENT_IN_REMOTE_ONLY));
+        IOUtils.close(clone, handle);
     }
 
-    public void testFeatureOffNeverPromotesEvenWithManager() throws Exception {
-        // A live manager with no listed extensions: every file this directory creates gets the existing entry, which
-        // carries no family, and the existing wrapper, whose clones and slices are existing wrappers too; nothing is
-        // submitted.
+    public void testFilesThatCannotBePromotedNeverPromoteEvenWithManager() throws Exception {
+        // A live manager, and fixture files whose extensions are not the k-NN ones: every file this directory creates
+        // gets the existing entry, which carries no family, and the existing wrapper, whose clones and slices are
+        // existing wrappers too; nothing is submitted.
+        PromotableExtensionsOverride.restore();
         populateData();
         RecordingExecutor executor = new RecordingExecutor();
         TieredDirectory dir = directoryWith(recordingManager(executor));

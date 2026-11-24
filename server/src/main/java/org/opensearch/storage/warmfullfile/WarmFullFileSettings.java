@@ -16,6 +16,7 @@ import org.opensearch.common.util.concurrent.OpenSearchExecutors;
 import java.util.List;
 import java.util.Locale;
 import java.util.Set;
+import java.util.TreeSet;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.function.Consumer;
 import java.util.function.DoubleConsumer;
@@ -44,18 +45,62 @@ import java.util.stream.Collectors;
 public class WarmFullFileSettings {
 
     /**
+     * The extensions whose files can be promoted to a whole local file: the k-NN graph and code files.
+     * {@link #EXTENSIONS} can take one of them off, and cannot add another.
+     */
+    public static final Set<String> PROMOTABLE_EXTENSIONS = Set.of("faiss", "veq");
+
+    // What isPromotable answers from. Only tests replace it: the server has no k-NN plugin to write such files with.
+    private static volatile Set<String> promotableExtensions = PROMOTABLE_EXTENSIONS;
+
+    /**
+     * @param extension a file extension without the leading dot
+     * @return whether a file of that extension can ever be promoted, whatever {@link #EXTENSIONS} lists at the moment
+     */
+    public static boolean isPromotable(String extension) {
+        return extension != null && promotableExtensions.contains(extension);
+    }
+
+    /**
+     * Replaces the extensions {@link #isPromotable} answers yes for, for every node in this JVM.
+     *
+     * @param extensions the extensions to use; null restores {@link #PROMOTABLE_EXTENSIONS}
+     */
+    static void setPromotableExtensions(Set<String> extensions) {
+        promotableExtensions = extensions == null ? PROMOTABLE_EXTENSIONS : Set.copyOf(extensions);
+    }
+
+    /**
      * Node-level, dynamic setting listing the file extensions eligible for whole-file promotion.
      * Values are the extension only, without a leading dot (for example {@code faiss}, {@code veq}).
-     * Defaults to the k-NN graph and code files. Setting an empty list disables the feature; removing the setting
+     * Defaults to the k-NN graph and code files, and can only narrow that: a list naming an extension that is not one
+     * of {@link #PROMOTABLE_EXTENSIONS} is rejected. Setting an empty list disables the feature; removing the setting
      * restores the default. Taking an extension off the list demotes its promoted files (see the class comment).
      */
     public static final Setting<List<String>> EXTENSIONS = Setting.listSetting(
         "tiering.service.full_file.extensions",
         List.of("faiss", "veq"),
         Function.identity(),
+        WarmFullFileSettings::rejectExtensionsThatCannotBePromoted,
         Setting.Property.Dynamic,
         Setting.Property.NodeScope
     );
+
+    private static void rejectExtensionsThatCannotBePromoted(List<String> values) {
+        final Set<String> rejected = normalize(values).stream()
+            .filter(extension -> isPromotable(extension) == false)
+            .collect(Collectors.toCollection(TreeSet::new));
+        if (rejected.isEmpty() == false) {
+            throw new IllegalArgumentException(
+                "["
+                    + "tiering.service.full_file.extensions"
+                    + "] can list only "
+                    + new TreeSet<>(promotableExtensions)
+                    + ", the extensions of the files that can be promoted to whole files, but got "
+                    + rejected
+            );
+        }
+    }
 
     /**
      * Node-level, dynamic setting for how many whole-file downloads may run at once on this node. Each download holds
