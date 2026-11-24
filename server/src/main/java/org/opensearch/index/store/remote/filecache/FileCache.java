@@ -134,11 +134,6 @@ public class FileCache implements RefCountedCache<Path, CachedIndexInput> {
         theCache.remove(filePath);
     }
 
-    @Override
-    public boolean removeIfEvictable(final Path filePath) {
-        return theCache.removeIfEvictable(filePath);
-    }
-
     /**
      * Stops counting the bytes of a file whose entry the cache dropped while its owner still had to delete it; see
      * {@link CachedIndexInput#isFileReleasedByOwner()}. Called by the owner once the file is deleted.
