@@ -11,6 +11,7 @@ import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.common.settings.ClusterSettings;
 import org.opensearch.common.settings.Setting;
 import org.opensearch.common.settings.Settings;
+import org.opensearch.common.unit.TimeValue;
 import org.opensearch.common.util.concurrent.OpenSearchExecutors;
 import org.opensearch.test.ClusterServiceUtils;
 import org.opensearch.test.OpenSearchTestCase;
@@ -170,6 +171,38 @@ public class WarmFullFileSettingsTests extends OpenSearchTestCase {
         clusterService.getClusterSettings()
             .applySettings(Settings.builder().putNull(WarmFullFileSettings.BUDGET_FRACTION.getKey()).build());
         assertEquals("clearing the setting reverts to the default", 0.5, settings.getBudgetFraction(), 0.0);
+    }
+
+    public void testEvictionBackoffDefaultsToThirtySecondsAndIsRegistered() {
+        WarmFullFileSettings settings = new WarmFullFileSettings(clusterService.getClusterSettings());
+        assertEquals(TimeValue.timeValueSeconds(30), settings.getEvictionBackoff());
+        assertTrue(BUILT_IN_CLUSTER_SETTINGS.contains(WarmFullFileSettings.EVICTION_BACKOFF));
+        assertTrue(WarmFullFileSettings.EVICTION_BACKOFF.isDynamic());
+    }
+
+    public void testEvictionBackoffListenerSeesTheCurrentValueAndEveryUpdate() {
+        WarmFullFileSettings settings = new WarmFullFileSettings(clusterService.getClusterSettings());
+        List<TimeValue> seen = new ArrayList<>();
+        settings.addEvictionBackoffListener(seen::add);
+        assertEquals(List.of(TimeValue.timeValueSeconds(30)), seen);
+
+        String key = WarmFullFileSettings.EVICTION_BACKOFF.getKey();
+        clusterService.getClusterSettings().applySettings(Settings.builder().put(key, "0s").build());
+        clusterService.getClusterSettings().applySettings(Settings.builder().put(key, "2m").build());
+        assertEquals(List.of(TimeValue.timeValueSeconds(30), TimeValue.ZERO, TimeValue.timeValueMinutes(2)), seen);
+        assertEquals(TimeValue.timeValueMinutes(2), settings.getEvictionBackoff());
+
+        clusterService.getClusterSettings().applySettings(Settings.builder().putNull(key).build());
+        assertEquals("clearing the setting reverts to the default", TimeValue.timeValueSeconds(30), settings.getEvictionBackoff());
+    }
+
+    public void testEvictionBackoffCannotBeNegative() {
+        expectThrows(
+            IllegalArgumentException.class,
+            () -> WarmFullFileSettings.EVICTION_BACKOFF.get(
+                Settings.builder().put(WarmFullFileSettings.EVICTION_BACKOFF.getKey(), "-1s").build()
+            )
+        );
     }
 
     public void testBudgetFractionIsBoundedToTheUnitInterval() {

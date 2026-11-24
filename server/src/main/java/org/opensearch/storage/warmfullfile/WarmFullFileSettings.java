@@ -10,6 +10,7 @@ package org.opensearch.storage.warmfullfile;
 import org.opensearch.common.annotation.ExperimentalApi;
 import org.opensearch.common.settings.ClusterSettings;
 import org.opensearch.common.settings.Setting;
+import org.opensearch.common.unit.TimeValue;
 import org.opensearch.common.util.concurrent.OpenSearchExecutors;
 
 import java.util.List;
@@ -87,6 +88,20 @@ public class WarmFullFileSettings {
         Setting.Property.NodeScope
     );
 
+    /**
+     * Node-level, dynamic setting: how long a whole file the cache has evicted waits before it can be promoted again.
+     * The wait doubles with each further eviction of the same file, up to ten minutes, and starts over once the file
+     * has gone ten minutes without being evicted. It bounds how often a file that keeps losing its place in the cache
+     * is downloaded again. Zero turns the wait off.
+     */
+    public static final Setting<TimeValue> EVICTION_BACKOFF = Setting.timeSetting(
+        "tiering.service.full_file.eviction_backoff",
+        TimeValue.timeValueSeconds(30),
+        TimeValue.ZERO,
+        Setting.Property.Dynamic,
+        Setting.Property.NodeScope
+    );
+
     private volatile Set<String> extensions;
     private final List<Consumer<Set<String>>> listeners = new CopyOnWriteArrayList<>();
     private final IntSupplier downloadPoolSize;
@@ -94,6 +109,8 @@ public class WarmFullFileSettings {
     private final List<IntConsumer> maxConcurrentDownloadsListeners = new CopyOnWriteArrayList<>();
     private volatile double budgetFraction;
     private final List<DoubleConsumer> budgetFractionListeners = new CopyOnWriteArrayList<>();
+    private volatile TimeValue evictionBackoff;
+    private final List<Consumer<TimeValue>> evictionBackoffListeners = new CopyOnWriteArrayList<>();
 
     /**
      * Creates a new WarmFullFileSettings instance and registers the dynamic update consumers. The download cap is not
@@ -117,6 +134,8 @@ public class WarmFullFileSettings {
         clusterSettings.addSettingsUpdateConsumer(MAX_CONCURRENT_DOWNLOADS, this::setMaxConcurrentDownloads);
         setBudgetFraction(clusterSettings.get(BUDGET_FRACTION));
         clusterSettings.addSettingsUpdateConsumer(BUDGET_FRACTION, this::setBudgetFraction);
+        setEvictionBackoff(clusterSettings.get(EVICTION_BACKOFF));
+        clusterSettings.addSettingsUpdateConsumer(EVICTION_BACKOFF, this::setEvictionBackoff);
     }
 
     /**
@@ -195,6 +214,24 @@ public class WarmFullFileSettings {
 
     public double getBudgetFraction() {
         return budgetFraction;
+    }
+
+    /** Applies a new eviction backoff and tells the listeners. */
+    public void setEvictionBackoff(TimeValue value) {
+        this.evictionBackoff = value;
+        for (Consumer<TimeValue> listener : evictionBackoffListeners) {
+            listener.accept(value);
+        }
+    }
+
+    /** Registers a listener for the eviction backoff and calls it with the current value. */
+    public void addEvictionBackoffListener(Consumer<TimeValue> listener) {
+        evictionBackoffListeners.add(listener);
+        listener.accept(evictionBackoff);
+    }
+
+    public TimeValue getEvictionBackoff() {
+        return evictionBackoff;
     }
 
     /**

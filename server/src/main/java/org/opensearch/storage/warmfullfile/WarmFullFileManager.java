@@ -22,6 +22,8 @@ import org.opensearch.common.Nullable;
 import org.opensearch.common.annotation.ExperimentalApi;
 import org.opensearch.common.lease.Releasable;
 import org.opensearch.common.metrics.CounterMetric;
+import org.opensearch.common.settings.Settings;
+import org.opensearch.common.unit.TimeValue;
 import org.opensearch.common.util.CancellableThreads;
 import org.opensearch.common.util.concurrent.ThreadContext;
 import org.opensearch.index.store.FsDirectoryFactory;
@@ -125,6 +127,10 @@ public class WarmFullFileManager {
     static final long NO_SLOT_RETRY_DELAY_MILLIS = 5_000L;
     /** Whole-file bytes admitted per cache segment must stay at or below this fraction of the segment's capacity. */
     static final double DEFAULT_BUDGET_FRACTION = 0.5;
+    /** The longest wait before a whole file the cache keeps evicting can be promoted again. */
+    static final long MAX_EVICTION_BACKOFF_MILLIS = 600_000L;
+    /** An eviction this long after the previous one of the same file starts the backoff again. */
+    static final long EVICTION_BACKOFF_QUIET_MILLIS = 600_000L;
 
     /**
      * Largest file that may be promoted: strictly below Lucene's default mmap chunk size (16 GiB on 64-bit JVMs), so the
@@ -156,6 +162,8 @@ public class WarmFullFileManager {
     private final CounterMetric notMmapAfterDownload = new CounterMetric();
     // The families currently FULL on this node, so a settings change can find the ones to demote.
     private final Set<FullFileState> fullFamilies = ConcurrentHashMap.newKeySet();
+    // The wait after the first eviction of a whole file before it can be promoted again; see EVICTION_BACKOFF.
+    private volatile long evictionBackoffMillis = WarmFullFileSettings.EVICTION_BACKOFF.getDefault(Settings.EMPTY).millis();
     // The node's thread context, which carries the marker of the query phase a thread's request is inside.
     private final ThreadContext threadContext;
     // The capacity of one file cache segment; the budget cap is the configured fraction of it.
@@ -852,17 +860,33 @@ public class WarmFullFileManager {
     /**
      * Called by a family's teardown when the file cache dropped its whole file while it was FULL, by eviction under
      * pressure, a prune, a clear or an explicit remove. The family is already demoted; its mapping is released once
-     * the scopes reading it end, and its next access promotes it again.
+     * the query phases open on its shard end. The eviction puts off its next promotion, for longer each time the same
+     * file is evicted again, so a file that keeps losing its place in the cache is not downloaded over and over.
      */
     private void onEvictedByCache(FullFileState st) {
         fullFamilies.remove(st);
         evicted.inc();
         evictedBytes.inc(st.fileLength());
-        logger.info(
-            "the file cache dropped the whole file of [{}]; it is served from blocks and its mapping is released once the {} query phase(s) open on its shard end",
-            st.fullFilePath(),
-            st.tracker().openHolds()
+        long delay = st.backOffAfterEviction(
+            clock.getAsLong(),
+            evictionBackoffMillis,
+            MAX_EVICTION_BACKOFF_MILLIS,
+            EVICTION_BACKOFF_QUIET_MILLIS
         );
+        logger.info(
+            "the file cache dropped the whole file of [{}]; it is served from blocks, its mapping is released once the {} query phase(s) open on its shard end, and it is not promoted again for {} ms",
+            st.fullFilePath(),
+            st.tracker().openHolds(),
+            delay
+        );
+    }
+
+    /**
+     * Applies a new wait from {@link WarmFullFileSettings#EVICTION_BACKOFF}. It applies to evictions from now on; a
+     * wait already set on a file is left as it is.
+     */
+    public void onEvictionBackoffChanged(TimeValue backoff) {
+        evictionBackoffMillis = backoff.millis();
     }
 
     /**

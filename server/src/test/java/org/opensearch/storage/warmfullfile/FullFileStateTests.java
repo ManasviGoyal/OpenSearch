@@ -184,6 +184,50 @@ public class FullFileStateTests extends OpenSearchTestCase {
         assertEquals("no reference is left behind", Integer.valueOf(0), f.fileCache.getRef(f.path));
     }
 
+    // ---------------- backoff after eviction ----------------
+
+    public void testEachEvictionInARowDoublesTheWaitUpToTheCap() {
+        FullFileState st = newState();
+        long first = 30_000;
+        long max = 100_000;
+        long quiet = 600_000;
+
+        assertEquals(30_000, st.backOffAfterEviction(1_000, first, max, quiet));
+        assertEquals(1_000 + 30_000, st.retryAt());
+        assertFalse("not before the wait is over", st.onAccess(1_000 + 29_999));
+
+        assertEquals(60_000, st.backOffAfterEviction(40_000, first, max, quiet));
+        assertEquals(40_000 + 60_000, st.retryAt());
+        assertEquals("capped", 100_000, st.backOffAfterEviction(110_000, first, max, quiet));
+        assertEquals(100_000, st.backOffAfterEviction(220_000, first, max, quiet));
+        assertEquals(220_000 + 100_000, st.retryAt());
+        assertTrue("once the wait is over", st.onAccess(320_000));
+    }
+
+    public void testAnEvictionAfterAQuietSpellStartsTheWaitAgain() {
+        FullFileState st = newState();
+        long first = 30_000;
+        long max = 600_000;
+        long quiet = 600_000;
+        assertEquals(30_000, st.backOffAfterEviction(0, first, max, quiet));
+        assertEquals(60_000, st.backOffAfterEviction(100_000, first, max, quiet));
+
+        assertEquals("ten minutes without an eviction", 30_000, st.backOffAfterEviction(100_000 + quiet, first, max, quiet));
+        assertEquals(60_000, st.backOffAfterEviction(100_000 + quiet + 1, first, max, quiet));
+    }
+
+    public void testNoWaitWhenTheBackoffIsOffAndALaterRetryTimeIsKept() {
+        FullFileState st = newState();
+        assertEquals(0, st.backOffAfterEviction(5_000, 0, 600_000, 600_000));
+        assertEquals(5_000, st.retryAt());
+
+        // A promotion declined for good is not brought back by an eviction.
+        assertTrue(st.onAccess(5_000));
+        assertTrue(st.abandonPromotion(Long.MAX_VALUE));
+        st.backOffAfterEviction(6_000, 30_000, 600_000, 600_000);
+        assertEquals(Long.MAX_VALUE, st.retryAt());
+    }
+
     // ---------------- removal by the cache ----------------
 
     public void testTheCacheDroppingAFullFileDemotesItAndReleasesItOffThread() throws Exception {

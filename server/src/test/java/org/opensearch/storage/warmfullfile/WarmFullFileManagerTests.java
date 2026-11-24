@@ -22,6 +22,7 @@ import org.apache.lucene.store.MMapDirectory;
 import org.apache.lucene.store.NIOFSDirectory;
 import org.opensearch.common.lucene.store.ByteArrayIndexInput;
 import org.opensearch.common.settings.Settings;
+import org.opensearch.common.unit.TimeValue;
 import org.opensearch.common.util.concurrent.ThreadContext;
 import org.opensearch.index.store.remote.file.CleanerDaemonThreadLeakFilter;
 import org.opensearch.index.store.remote.filecache.CachedFullFileIndexInput;
@@ -270,6 +271,8 @@ public class WarmFullFileManagerTests extends OpenSearchTestCase {
     /** Tells the manager the setting lists {@code faiss}, as the settings listener does in production. */
     private static WarmFullFileManager withFaissEligible(WarmFullFileManager manager) {
         manager.onExtensionsChanged(Set.of("faiss"));
+        // No wait after an eviction, unless a test sets one.
+        manager.onEvictionBackoffChanged(TimeValue.ZERO);
         return manager;
     }
 
@@ -2328,6 +2331,39 @@ public class WarmFullFileManagerTests extends OpenSearchTestCase {
     /** A one-segment manager with room for one footered {@link #FILE_LENGTH} whole file and not two. */
     private WarmFullFileManager newTightBudgetManager(FileCache fileCache, LongSupplier clock) {
         return newManager(fileCache, clock, 4, 0.0005);
+    }
+
+    public void testAnEvictedFileIsNotPromotedAgainBeforeItsBackoffAndWaitsLongerEachTime() throws Exception {
+        // The cache evicts a whole file: the family cannot be promoted again until the backoff has passed. Evicted
+        // again soon after, it waits twice as long.
+        String name = "_backoff.faiss";
+        Path path = dir.resolve(name);
+        byte[] content = footeredContent(FILE_LENGTH);
+        FileCache fileCache = newFileCache();
+        TransferManager tm = new TransferManager(new FixedContentStreamReader(content), fileCache, threadPool);
+        AtomicLong clock = new AtomicLong(1_000_000);
+        WarmFullFileManager mgr = newManager(fileCache, clock::get, 4, 0.5);
+        mgr.onEvictionBackoffChanged(TimeValue.timeValueSeconds(30));
+        FullFileState st = newStateFor(tm, fileCache, name, content);
+        startPromotion(mgr, st);
+        awaitState(st, FullFileState.State.FULL);
+
+        fileCache.remove(path);
+        assertBusy(() -> assertTrue(st.cleanupDone()), 10, TimeUnit.SECONDS);
+        assertEquals(clock.get() + 30_000, st.retryAt());
+        assertFalse("not promoted again right after the eviction", st.onAccess(clock.get()));
+        clock.addAndGet(29_999);
+        assertFalse(st.onAccess(clock.get()));
+
+        clock.addAndGet(1);
+        startPromotion(mgr, st);
+        awaitState(st, FullFileState.State.FULL);
+        assertEquals(2L, mgr.counters().get("promoted").longValue());
+
+        fileCache.remove(path);
+        assertBusy(() -> assertTrue(st.cleanupDone()), 10, TimeUnit.SECONDS);
+        assertEquals("the second eviction in a row waits twice as long", clock.get() + 60_000, st.retryAt());
+        assertEquals(2L, mgr.counters().get("evicted").longValue());
     }
 
     public void testAPromotedFileIsAnUnreferencedEntryThatCachePressureEvicts() throws Exception {

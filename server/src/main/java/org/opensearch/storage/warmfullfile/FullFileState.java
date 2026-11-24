@@ -97,6 +97,10 @@ public final class FullFileState {
         CANCELLED.cancel("family closed");
     }
     private volatile long retryAt;
+    // The cache's evictions of this family's whole file that followed one another closely, and when the last one was;
+    // guarded by releaseLock.
+    private int evictionsInARow;
+    private long lastEvictionMillis;
     // Set when a whole file assembled partly from this family's local blocks failed its checksum: the next download
     // reads every part from the remote store, since one of those blocks is corrupt and nothing says which.
     private volatile boolean localBlocksSuspect;
@@ -333,6 +337,28 @@ public final class FullFileState {
             localMaster.set(entry.mapping());
             state.set(State.FULL);
             return Completion.FULL;
+        }
+    }
+
+    /**
+     * Counts an eviction of the whole file by the cache and puts off the next promotion: by {@code firstDelayMillis}
+     * after the first eviction, twice as long after each one that follows, and never longer than
+     * {@code maxDelayMillis}. An eviction that comes {@code quietMillis} or more after the previous one starts the
+     * count again. A retry time already further away is kept.
+     *
+     * @param nowMillis the current monotonic time
+     * @return the delay applied, in millis
+     */
+    long backOffAfterEviction(long nowMillis, long firstDelayMillis, long maxDelayMillis, long quietMillis) {
+        synchronized (releaseLock) {
+            if (evictionsInARow > 0 && nowMillis - lastEvictionMillis >= quietMillis) {
+                evictionsInARow = 0;
+            }
+            evictionsInARow++;
+            lastEvictionMillis = nowMillis;
+            long delay = firstDelayMillis <= 0 ? 0 : Math.min(maxDelayMillis, firstDelayMillis << Math.min(evictionsInARow - 1, 30));
+            retryAt = Math.max(retryAt, nowMillis + delay);
+            return delay;
         }
     }
 
