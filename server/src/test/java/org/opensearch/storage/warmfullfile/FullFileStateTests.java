@@ -211,9 +211,28 @@ public class FullFileStateTests extends OpenSearchTestCase {
         long quiet = 600_000;
         assertEquals(30_000, st.backOffAfterEviction(0, first, max, quiet));
         assertEquals(60_000, st.backOffAfterEviction(100_000, first, max, quiet));
+        long waitEnded = 100_000 + 60_000;
 
-        assertEquals("ten minutes without an eviction", 30_000, st.backOffAfterEviction(100_000 + quiet, first, max, quiet));
-        assertEquals(60_000, st.backOffAfterEviction(100_000 + quiet + 1, first, max, quiet));
+        assertEquals("one millisecond short of quiet", 120_000, st.backOffAfterEviction(waitEnded + quiet - 1, first, max, quiet));
+        waitEnded = waitEnded + quiet - 1 + 120_000;
+        assertEquals("ten minutes past the end of the wait", 30_000, st.backOffAfterEviction(waitEnded + quiet, first, max, quiet));
+    }
+
+    public void testAFileEvictedAsSoonAsItsWaitEndsStaysAtTheCap() {
+        // A file that is promoted and evicted again every time its wait ends keeps the longest wait. The wait is not
+        // counted as a quiet spell, however long it is.
+        FullFileState st = newState();
+        long first = 30_000;
+        long max = 600_000;
+        long quiet = 600_000;
+        long now = 0;
+        long delay = 0;
+        for (int eviction = 0; eviction < 12; eviction++) {
+            delay = st.backOffAfterEviction(now, first, max, quiet);
+            now += delay + 60_000; // the wait, then a minute to be promoted and evicted again
+        }
+        assertEquals(max, delay);
+        assertEquals("and the next one too", max, st.backOffAfterEviction(now, first, max, quiet));
     }
 
     public void testNoWaitWhenTheBackoffIsOffAndALaterRetryTimeIsKept() {

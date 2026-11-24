@@ -129,7 +129,7 @@ public class WarmFullFileManager {
     static final double DEFAULT_BUDGET_FRACTION = 0.5;
     /** The longest wait before a whole file the cache keeps evicting can be promoted again. */
     static final long MAX_EVICTION_BACKOFF_MILLIS = 600_000L;
-    /** An eviction this long after the previous one of the same file starts the backoff again. */
+    /** An eviction this long after the previous wait of the same file ended starts the backoff again. */
     static final long EVICTION_BACKOFF_QUIET_MILLIS = 600_000L;
 
     /**

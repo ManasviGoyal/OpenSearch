@@ -91,7 +91,7 @@ public class WarmFullFileSettings {
     /**
      * Node-level, dynamic setting: how long a whole file the cache has evicted waits before it can be promoted again.
      * The wait doubles with each further eviction of the same file, up to ten minutes, and starts over once the file
-     * has gone ten minutes without being evicted. It bounds how often a file that keeps losing its place in the cache
+     * has gone ten minutes past the end of a wait without being evicted. It bounds how often a file that keeps losing its place in the cache
      * is downloaded again. Zero turns the wait off.
      */
     public static final Setting<TimeValue> EVICTION_BACKOFF = Setting.timeSetting(
