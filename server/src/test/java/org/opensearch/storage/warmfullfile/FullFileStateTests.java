@@ -24,20 +24,21 @@ import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Deque;
 import java.util.List;
-import java.util.concurrent.AbstractExecutorService;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CyclicBarrier;
 import java.util.concurrent.Executor;
 import java.util.concurrent.ExecutorService;
-import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Consumer;
 import java.util.stream.Stream;
 
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.when;
 
 @ThreadLeakFilters(filters = CleanerDaemonThreadLeakFilter.class)
 public class FullFileStateTests extends OpenSearchTestCase {
@@ -857,39 +858,8 @@ public class FullFileStateTests extends OpenSearchTestCase {
         // The pool the release runs on is shut down by the time a queued release runs: treated like a stopping node.
         Fixture f = new Fixture();
         List<Runnable> queued = new ArrayList<>();
-        AtomicBoolean shutdown = new AtomicBoolean();
-        ExecutorService pool = new AbstractExecutorService() {
-            @Override
-            public void execute(Runnable command) {
-                queued.add(command);
-            }
-
-            @Override
-            public void shutdown() {
-                shutdown.set(true);
-            }
-
-            @Override
-            public List<Runnable> shutdownNow() {
-                shutdown.set(true);
-                return List.of();
-            }
-
-            @Override
-            public boolean isShutdown() {
-                return shutdown.get();
-            }
-
-            @Override
-            public boolean isTerminated() {
-                return false;
-            }
-
-            @Override
-            public boolean awaitTermination(long timeout, TimeUnit unit) {
-                return false;
-            }
-        };
+        ExecutorService pool = mock(ExecutorService.class);
+        doAnswer(invocation -> queued.add(invocation.getArgument(0))).when(pool).execute(any(Runnable.class));
         assertTrue(f.st.onAccess(0));
         PromotedWholeFileEntry entry = new PromotedWholeFileEntry(f.fileCache, f.path, f.master, f.st);
         assertEquals(
@@ -909,7 +879,7 @@ public class FullFileStateTests extends OpenSearchTestCase {
 
         assertTrue(f.st.demote());
         assertEquals("the release is queued", 1, queued.size());
-        pool.shutdown();
+        when(pool.isShutdown()).thenReturn(true);
         queued.get(0).run();
 
         verify(f.master).close();
